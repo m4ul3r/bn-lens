@@ -94,6 +94,15 @@ impl MarksList {
 
     fn build(ctx: &Ctx) -> Vec<Mark> {
         let mut items = ctx.bn.marks();
+        // A function-scoped tag has no address of its own — fill it from the
+        // function's entry so it sorts and displays with a real address.
+        for m in &mut items {
+            if m.addr.is_empty() {
+                if let Some(addr) = ctx.addr_by_name.get(&m.func) {
+                    m.addr = addr.clone();
+                }
+            }
+        }
         items.sort_by(|a, b| {
             rank(&a.kind).cmp(&rank(&b.kind)).then(
                 parse_hex(&a.addr)
@@ -134,18 +143,31 @@ impl MarksList {
         self.sel = (self.sel as i64 + delta).clamp(0, len - 1) as usize;
     }
 
-    /// The decompile target for the selected mark: its function, else the address
-    /// (bn resolves an interior address to the containing function).
-    fn current_target(&self) -> Option<String> {
+    fn selected(&self) -> Option<&Mark> {
         let rows = self.filtered();
-        rows.get(self.sel).map(|&i| {
-            let it = &self.items[i];
-            if it.func.is_empty() {
-                it.addr.clone()
-            } else {
-                it.func.clone()
-            }
-        })
+        rows.get(self.sel).map(|&i| &self.items[i])
+    }
+
+    /// `Enter`: a code mark (has a function) opens that function's decompile; a
+    /// data-address mark (no function — e.g. a comment on a global) opens its
+    /// xrefs instead, since `bn decompile <data addr>` wouldn't resolve.
+    fn open_action(&self) -> Action {
+        match self.selected() {
+            Some(m) if !m.func.is_empty() => Action::OpenDecompile(m.func.clone()),
+            Some(m) if !m.addr.is_empty() => Action::OpenXrefs(m.addr.clone()),
+            _ => Action::None,
+        }
+    }
+
+    /// `x`: cross-reference the mark. A code mark xrefs its containing function
+    /// (callers — refs to a single interior instruction are usually empty); a
+    /// data mark xrefs the address (who references this global).
+    fn xref_action(&self) -> Action {
+        match self.selected() {
+            Some(m) if !m.func.is_empty() => Action::OpenXrefs(m.func.clone()),
+            Some(m) if !m.addr.is_empty() => Action::OpenXrefs(m.addr.clone()),
+            _ => Action::None,
+        }
     }
 
     pub fn on_key(&mut self, k: KeyEvent) -> Action {
@@ -154,9 +176,7 @@ impl MarksList {
             match k.code {
                 KeyCode::Enter => {
                     self.mode = Mode::Normal;
-                    if let Some(t) = self.current_target() {
-                        return Action::OpenDecompile(t);
-                    }
+                    return self.open_action();
                 }
                 KeyCode::Tab => self.mode = Mode::Normal,
                 KeyCode::Esc => {
@@ -201,16 +221,8 @@ impl MarksList {
                 self.mode = Mode::Search;
                 self.sel = 0;
             }
-            KeyCode::Enter => {
-                if let Some(t) = self.current_target() {
-                    return Action::OpenDecompile(t);
-                }
-            }
-            KeyCode::Char('x') => {
-                if let Some(t) = self.current_target() {
-                    return Action::OpenXrefs(t);
-                }
-            }
+            KeyCode::Enter => return self.open_action(),
+            KeyCode::Char('x') => return self.xref_action(),
             _ => {}
         }
         Action::None

@@ -153,16 +153,21 @@ struct TagListJson {
     items: Vec<TagItemJson>,
 }
 
+// Fields are `Option<String>`, not `#[serde(default)] String`: bn emits an
+// explicit `null` (not an absent field) for `function` on a comment/tag outside
+// any function, and for `address` on a function-scoped tag. `#[serde(default)]`
+// fills only *absent* fields, so a bare `String` would error on `null` and abort
+// the whole `Vec` — silently dropping every mark. `Option` absorbs the null.
 #[derive(Deserialize)]
 struct TagItemJson {
     #[serde(default)]
-    address: String,
+    address: Option<String>,
     #[serde(default, rename = "type")]
-    type_name: String,
+    type_name: Option<String>,
     #[serde(default)]
-    data: String,
+    data: Option<String>,
     #[serde(default)]
-    function: String,
+    function: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -174,11 +179,11 @@ struct CommentListJson {
 #[derive(Deserialize)]
 struct CommentItemJson {
     #[serde(default)]
-    address: String,
+    address: Option<String>,
     #[serde(default)]
-    comment: String,
+    comment: Option<String>,
     #[serde(default)]
-    function: String,
+    function: Option<String>,
 }
 
 /// A unique temp path for a `--out` capture (`bn-lens-<pid>-<seq>.out`), so
@@ -211,6 +216,29 @@ fn parse_local_list_json(text: &str) -> Vec<LocalVariable> {
     serde_json::from_str::<LocalListJson>(text)
         .map(|listing| listing.locals)
         .unwrap_or_default()
+}
+
+/// Push a [`Mark`] from optional JSON fields, keeping it if it has *either* an
+/// address or a containing function (a function-scoped tag has a null address;
+/// a data-address comment has a null function). Fully-empty entries are dropped.
+fn push_mark(
+    marks: &mut Vec<Mark>,
+    addr: Option<String>,
+    kind: String,
+    text: Option<String>,
+    func: Option<String>,
+) {
+    let addr = addr.unwrap_or_default();
+    let func = func.unwrap_or_default();
+    if addr.is_empty() && func.is_empty() {
+        return;
+    }
+    marks.push(Mark {
+        addr,
+        kind,
+        text: text.unwrap_or_default(),
+        func,
+    });
 }
 
 impl Bn {
@@ -333,31 +361,23 @@ impl Bn {
         let comments = self.run_out(&["comment", "list", "--format", "json"]);
         if let Ok(list) = serde_json::from_str::<CommentListJson>(&comments) {
             for c in list.items {
-                if !c.address.is_empty() {
-                    marks.push(Mark {
-                        addr: c.address,
-                        kind: "comment".into(),
-                        text: c.comment,
-                        func: c.function,
-                    });
-                }
+                push_mark(
+                    &mut marks,
+                    c.address,
+                    "comment".into(),
+                    c.comment,
+                    c.function,
+                );
             }
         }
         let tags = self.run_out(&["tag", "list", "--format", "json"]);
         if let Ok(list) = serde_json::from_str::<TagListJson>(&tags) {
             for t in list.items {
-                if !t.address.is_empty() {
-                    marks.push(Mark {
-                        addr: t.address,
-                        kind: if t.type_name.is_empty() {
-                            "tag".into()
-                        } else {
-                            t.type_name
-                        },
-                        text: t.data,
-                        func: t.function,
-                    });
-                }
+                let kind = t
+                    .type_name
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "tag".into());
+                push_mark(&mut marks, t.address, kind, t.data, t.function);
             }
         }
         marks
@@ -637,7 +657,48 @@ pub fn newest_live(bin: &str, exclude: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_local_list_json;
+    use super::{parse_local_list_json, push_mark, CommentListJson, TagListJson};
+
+    #[test]
+    fn mark_json_survives_null_function_and_address() {
+        // A comment on a data address serializes `"function": null`; a
+        // function-scoped tag serializes `"address": null`. Neither may abort
+        // deserialization of the whole list.
+        let comments = r#"{"items":[
+            {"address":"0x1000","comment":"in a func","function":"parse"},
+            {"address":"0x4152a0","comment":"on a global","function":null}
+        ]}"#;
+        let c = serde_json::from_str::<CommentListJson>(comments).expect("null function parses");
+        let mut marks = Vec::new();
+        for it in c.items {
+            push_mark(
+                &mut marks,
+                it.address,
+                "comment".into(),
+                it.comment,
+                it.function,
+            );
+        }
+        assert_eq!(marks.len(), 2, "both comments kept despite a null function");
+        assert_eq!(marks[1].func, ""); // null → empty, still navigable by address
+
+        let tags = r#"{"items":[
+            {"address":null,"type":"Bookmarks","data":"whole fn","function":"parse"},
+            {"address":"0x2000","type":"Important","data":null,"function":null}
+        ]}"#;
+        let t = serde_json::from_str::<TagListJson>(tags).expect("null address/data parses");
+        let mut tmarks = Vec::new();
+        for it in t.items {
+            let kind = it
+                .type_name
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "tag".into());
+            push_mark(&mut tmarks, it.address, kind, it.data, it.function);
+        }
+        assert_eq!(tmarks.len(), 2);
+        assert_eq!(tmarks[0].addr, ""); // function-scoped tag: null address, kept via function
+        assert_eq!(tmarks[0].func, "parse");
+    }
 
     #[test]
     fn parses_structured_stack_locals_without_losing_types() {
