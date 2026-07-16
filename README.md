@@ -63,6 +63,11 @@ pane and open **bn lens beside it** (`alt+d`).
 The picker's **`recent`** section keeps a live list of what you opened (`▸`) and what the agent
 referenced in its pane (`◆`) — a shared map of where you both are.
 
+The list pane has two views, switched from the **`bn lens` menu** (`m`, or click the title): **Symbols**
+(functions + data — the default) and **Strings** (every recovered string; **`p`** peeks where it's
+used — the **pseudo-C statement** at each code site, grouped by function; `Enter`/`x` opens the full
+xrefs listing).
+
 ## Keyboard shortcuts
 
 Press **`?` anywhere** for the complete, scrollable shortcut guide. The status bars show only the
@@ -73,6 +78,8 @@ most useful keys for the current mode.
 | key | action |
 |-----|--------|
 | `?` | open the global shortcut guide |
+| `m` / click **`bn lens`** | open the view menu — switch **Symbols ↔ Strings**, refresh, switch bn, help, quit |
+| `^R` | refresh the function list from the live bn instance |
 | `j`/`k` `g`/`G` `^D`/`^U` | move (skips the section delimiters) |
 | `/` | search — type to filter, `↑`/`↓` pick, `Enter` opens the top hit, `Tab` keeps the filter, `Esc` cancels |
 | `Enter` / `x` | decompile / xrefs the selected function |
@@ -90,7 +97,11 @@ most useful keys for the current mode.
 | `g` / `Enter` | act on the hotspot: goto a function/code address, peek data, show a local's type |
 | `p` | peek bytes (symbolizes pointers; strings resolve to their `.rodata` address) |
 | `x` | xrefs of the hotspot (`Enter` on a caller lands on the *use*) |
-| `r` | rename a local (live; persist to disk with `bn save`) |
+| `r` | rename (live) — the selected **local**, a selected **function** hotspot, or the function in view; persist with `bn save` |
+| `;` | comment (live) — an address (disasm/hotspot) or the function's doc comment |
+| `t` | bookmark the address/function (a `Bookmarks` tag, live) |
+| `^R` | refresh from the live bn instance (pick up the agent's renames/edits) |
+| `S` | inspect the recovered stack frame; select slots and jump to local uses |
 | `i` / `I` | cycle view: **decompile → MLIL → disassembly** (forward / back) |
 | `/` then `n`/`N` | find in function |
 | `V` then `a` | visual-select a range, then **ask the agent** |
@@ -108,8 +119,8 @@ most useful keys for the current mode.
 ## Design & internals
 
 See [`DESIGN.md`](DESIGN.md). Rust + `ratatui`/`crossterm`, focused modules, unit-tested token/hotspot
-helpers, one-way data flow. Read-only except one deliberate mutation (local rename). `cargo test` runs
-the suite.
+helpers, one-way data flow. Writes are a narrow, annotation-only surface (rename / comment / bookmark),
+all live in the bn instance and never auto-saved to disk. `cargo test` runs the suite.
 
 ## License
 

@@ -81,11 +81,13 @@ fn is_data_symbol(ctx: &Ctx, token: &str) -> bool {
 /// globals (peek), and 0x-addresses that land inside a mapped section (peek, or
 /// goto if the section is executable). Constants/offsets outside sections stay
 /// inert, while known locals and string literals get their own hotspot kinds.
+///
+/// The function currently in view is promoted too (so its signature name on
+/// line 1 is click/`x`/`r`-able); `act_primary` no-ops the self-goto.
 pub(super) fn build_spans(
     lines: &[Line],
     ctx: &Ctx,
     locals: &HashMap<String, String>,
-    current: Option<&str>,
 ) -> Vec<Hotspot> {
     let mut hotspots = Vec::new();
     for (line, segments) in lines.iter().enumerate() {
@@ -93,7 +95,7 @@ pub(super) fn build_spans(
         for segment in segments {
             let len = segment.text.chars().count();
             match segment.kind {
-                Tok::Name if Some(segment.text.as_str()) != current => {
+                Tok::Name => {
                     let (kind, code) = if ctx.func_names.contains(&segment.text) {
                         (Some(HotKind::Func), true)
                     } else if is_data_symbol(ctx, &segment.text) {

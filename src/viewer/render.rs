@@ -15,6 +15,10 @@ impl Viewer {
     pub fn render(&mut self, area: Rect, buffer: &mut Buffer, ctx: &Ctx) {
         let height = area.height as usize;
         let width = area.width as usize;
+        let stack_panel = self.stack_view.panel_rect(area);
+        let code_width = stack_panel
+            .map(|panel| panel.x.saturating_sub(area.x) as usize)
+            .unwrap_or(width);
         let body_height = height.saturating_sub(3);
         self.cline = self.cline.min(self.lines.len().saturating_sub(1));
         if self.cline < self.top {
@@ -26,11 +30,17 @@ impl Viewer {
         let candidate = self.cur_span();
         // A popup is modal: recede the backdrop so no selection styling spills
         // around the box.
-        let modal = !matches!(self.popup, Popup::None);
-        let active_local = candidate.and_then(|index| {
-            let span = &self.spans[index];
-            (span.kind == HotKind::Local).then(|| span.target.clone())
-        });
+        let modal = !matches!(self.popup, Popup::None) || self.stack_view.is_modal(area);
+        let active_local = self
+            .stack_view
+            .selected_name()
+            .map(str::to_string)
+            .or_else(|| {
+                candidate.and_then(|index| {
+                    let span = &self.spans[index];
+                    (span.kind == HotKind::Local).then(|| span.target.clone())
+                })
+            });
         let (visual_low, visual_high) = if self.vmode {
             (self.vanchor.min(self.cline), self.vanchor.max(self.cline))
         } else {
@@ -52,7 +62,7 @@ impl Viewer {
                 area.x,
                 area.y + 1,
                 format!(" /{query}"),
-                width,
+                code_width,
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -62,7 +72,7 @@ impl Viewer {
                 area.x,
                 area.y + 1,
                 &self.status,
-                width,
+                code_width,
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
@@ -75,7 +85,7 @@ impl Viewer {
                     " ● VISUAL · {} lines selected",
                     visual_high - visual_low + 1
                 ),
-                width,
+                code_width,
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -103,15 +113,17 @@ impl Viewer {
                 format!("   {}/{}", self.cline + 1, self.lines.len()),
                 dim,
             ));
-            crate::ui::put_spans(buffer, area.x, area.y + 1, width, &location);
+            crate::ui::put_spans(buffer, area.x, area.y + 1, code_width, &location);
         }
 
-        let hint = if self.search_input.is_some() {
+        let hint = if self.stack_view.is_open() {
+            " stack · j/k slots · Enter jump · r rename · S/q close · ? help"
+        } else if self.search_input.is_some() {
             " type to find · Enter jump · Esc cancel · ? help"
         } else if self.vmode {
             " j/k extend · a ask · Esc cancel · ? help"
         } else {
-            " j/k move · Tab hotspot · g act · a ask · / find · b back · ? help · q list"
+            " j/k move · Tab hotspot · g act · r/;/t edit · a ask · / find · b back · ? help · q list"
         };
         crate::ui::render_bar(
             buffer,
@@ -134,7 +146,7 @@ impl Viewer {
             .collect();
 
         let bottom = area.y + area.height.saturating_sub(1);
-        let right = area.x + area.width;
+        let right = area.x + code_width as u16;
         let mut y = area.y + 2;
         let mut line = self.top;
         while y < bottom && line < self.lines.len() {
@@ -263,6 +275,9 @@ impl Viewer {
         }
 
         self.render_popup(area, buffer, ctx);
+        if matches!(self.popup, Popup::None) && self.stack_view.is_open() {
+            self.stack_view.render(area, buffer, &self.name);
+        }
     }
 
     fn render_popup(&self, area: Rect, buffer: &mut Buffer, ctx: &Ctx) {
@@ -348,19 +363,17 @@ impl Viewer {
                 old,
                 buf: input,
                 err,
+                scope,
             } => {
                 let box_width = (area.width.saturating_sub(6)).clamp(46, 90);
                 let box_height = 7u16;
                 let box_x = area.x + (area.width.saturating_sub(box_width)) / 2;
                 let box_y = area.y + (area.height.saturating_sub(box_height)) / 2;
-                crate::ui::draw_box(
-                    buffer,
-                    box_x,
-                    box_y,
-                    box_width,
-                    box_height,
-                    "rename local  (live in the bn instance)",
-                );
+                let title = match scope {
+                    super::RenameScope::Local => "rename local  (live in the bn instance)",
+                    super::RenameScope::Symbol => "rename function  (live in the bn instance)",
+                };
+                crate::ui::draw_box(buffer, box_x, box_y, box_width, box_height, title);
                 buffer.set_stringn(
                     box_x + 2,
                     box_y + 2,
@@ -392,6 +405,65 @@ impl Viewer {
                     Style::default().add_modifier(Modifier::DIM),
                 );
             }
+            Popup::Comment { target, buf: input } => {
+                self.render_input_box(
+                    area,
+                    buffer,
+                    "comment  (live in the bn instance)",
+                    &format!("comment {}", target.label()),
+                    input,
+                    " Enter set · Esc cancel · ? help ",
+                );
+            }
+            Popup::Tag { target, buf: input } => {
+                self.render_input_box(
+                    area,
+                    buffer,
+                    "bookmark  (Bookmarks tag, live)",
+                    &format!("bookmark {}  ·  optional note", target.label()),
+                    input,
+                    " Enter add · Esc cancel · ? help ",
+                );
+            }
         }
+    }
+
+    /// A one-line text-entry modal: title box, a cyan target line, the input,
+    /// and a dim footer. Shared by the comment and tag popups.
+    fn render_input_box(
+        &self,
+        area: Rect,
+        buffer: &mut Buffer,
+        title: &str,
+        target_line: &str,
+        input: &str,
+        footer: &str,
+    ) {
+        let box_width = (area.width.saturating_sub(6)).clamp(46, 100);
+        let box_height = 7u16;
+        let box_x = area.x + (area.width.saturating_sub(box_width)) / 2;
+        let box_y = area.y + (area.height.saturating_sub(box_height)) / 2;
+        crate::ui::draw_box(buffer, box_x, box_y, box_width, box_height, title);
+        buffer.set_stringn(
+            box_x + 2,
+            box_y + 2,
+            target_line,
+            (box_width - 4) as usize,
+            Style::default().fg(Color::Cyan),
+        );
+        buffer.set_stringn(
+            box_x + 2,
+            box_y + 3,
+            format!("> {input}"),
+            (box_width - 4) as usize,
+            Style::default(),
+        );
+        buffer.set_stringn(
+            box_x + 2,
+            box_y + box_height - 1,
+            footer,
+            (box_width - 4) as usize,
+            Style::default().add_modifier(Modifier::DIM),
+        );
     }
 }

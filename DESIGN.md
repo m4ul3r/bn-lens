@@ -25,11 +25,14 @@ the code is split into small typed modules with unit tests.
 | `syntax.rs` | pure pseudo-C tokenizer → `(text, kind)` runs (**unit-tested**; replaces pygments) |
 | `theme.rs` | token-kind → colour |
 | `help.rs` | global, scrollable `where / key / action` shortcut reference |
-| `picker.rs` | the function list: filter, vim nav, colours, mouse |
+| `menu.rs` | the `bn lens` title dropdown: switch view (Symbols/Strings) + global actions |
+| `picker.rs` | the **Symbols** list (functions + data): filter, vim nav, colours, mouse |
+| `strings.rs` | the **Strings** list: recovered text, filter, `Enter`/`x` to xref its uses |
 | `viewer.rs` | code-viewer state model and load lifecycle |
-| `viewer/actions.rs` | navigation and data-backed actions: goto/peek/xrefs/rename |
+| `viewer/actions.rs` | navigation and data-backed actions: goto/peek/xrefs/rename/comment/tag |
 | `viewer/input.rs` | keyboard/mouse modes, search, view cycling, and agent asks |
 | `viewer/render.rs` | wrapped code rendering, hotspot styling, and modal layouts |
+| `viewer/stack.rs` | stack-frame model, navigation, and responsive panel/modal rendering |
 | `viewer/hotspots.rs` | pure token promotion, identifier validation, and dump symbolization |
 | `switch.rs` | ranger-style instance/target switcher (miller columns + live target-info preview) |
 
@@ -47,6 +50,18 @@ opens immediately; the agent scan on the ~1s poll). Non-function addresses are a
 (`j/k/g/G/^D/^U`) skips the delimiters; `Enter` decompile, `x` xrefs, `s` sections, mouse wheel/click.
 `/` search filters the full list live and ranks best-match first (`↑`/`↓` pick, `Enter` opens the top
 hit, `Tab` commits the filter to the list); the recent subsection shows only when unfiltered.
+
+**Views + the title menu** — the list pane has two top-level views: **Symbols** (functions + data, the
+default `picker.rs`) and **Strings** (`strings.rs`, an address-ordered list of recovered text where
+`p` peeks a **usage popup** — it parses `bn xrefs` on the string's address, decompiles each
+referencing function once (`--addresses`), and shows the **pseudo-C statement** at each callsite
+(grouped by function; falling back to the disassembled instruction when a site maps to no decompiled
+line), plus any data refs; `Enter`/`x` opens the full navigable xrefs listing instead). Clicking the
+` bn lens ` title (or `m`) opens a small **dropdown** (`menu.rs`) that switches view and reaches the
+global actions (Refresh, Switch bn, Help, Quit); a click on the title toggles it, a click on an entry
+or click-away dismisses it. `app.rs` owns an `AppView` enum and routes keys/mouse/render to the active
+list; the Strings list is built lazily on first switch and re-pulled by the same refresh path as the
+picker. Views share the `Viewer` for anything they open.
 
 **Sections** — `s` (in the picker or viewer) opens a scrollable popup of the `bn sections` table
 (address range, size, perms, semantics, name) with a `w+x` summary line up top — quick orientation and
@@ -68,6 +83,14 @@ escape rendering matches the decompile, so even a multi-line literal resolves). 
 dispatch on its kind. Peek resolves internal symbols on-demand via `bn xrefs` and **symbolizes the hex
 dump** (`+off→name` for any 8-byte value that is a known symbol address). `/`+`n`/`N` find in function,
 `b` back (nav stack), `q` to the list.
+
+**Stack inspector** — `S` consumes structured `bn local list --format json` data rather than parsing
+decompiler text: stable local IDs, full types, stack/register provenance, signed frame offsets, and
+`span_to_next` slot spans. Slots render high-to-low with saved/compiler entries dimmed and overlapping
+offsets grouped. The selected code local seeds the stack selection; stack selection highlights all
+rendered uses, `Enter` jumps to the first use, and `r` reuses local rename. At 120+ columns it is a
+side panel beside the code; narrower terminals get a centered modal. Slot span is labeled separately
+from type size because recovered spacing can include alignment/padding.
 
 **Views** — `i`/`I` cycle the current function through **decompile → MLIL → disassembly** (forward /
 back; `bn decompile` / `bn il --view mlil` / `bn disasm`). The three code views + the xrefs view are a
@@ -119,18 +142,39 @@ needs the binary pre-built (as above), since local linking skips build steps.
 block comments, hex/number handling, plain-text address/name tokenizing). The TUI itself is dogfooded
 in a herdr pane.
 
-## Mutation (deliberately narrow)
+## Mutation (a narrow, annotation-only surface)
 
-The lens was read-only by construction until **local rename** (`r` on a Local hotspot) — the *only*
-write path, a deliberate relaxation of the old read-only pillar. The new name is validated as a C
-identifier (spaces/invalid rejected inline). It calls `bn local rename`, which mutates the **live bn
-instance in-memory** — immediately visible to every `bn` command against that instance. It does **not**
-`bn save`: persisting to the on-disk `.bndb` is a separate, deliberate step (388 ms+ and it scales with
-binary size). And it does **not** re-decompile — a local rename is just an identifier swap, so the
-on-screen tokens/locals/spans are retexted in place (`apply_local_rename`), taking the operation from
-~860 ms (rename + save + decompile + local-list) down to the single ~200 ms mutation call.
+The lens was read-only by construction until **local rename**; the write surface is now four
+annotation actions, all live in the bn instance, none auto-saved:
+
+- **`r` rename** — context-aware. A selected **Local** hotspot renames the local; a selected **Func**
+  hotspot (or, with no useful hotspot, the function in view) renames the **function**. The new name is
+  validated as a C identifier (spaces/invalid rejected inline).
+- **`;` comment** — targets a concrete address when one is resolvable (a selected Addr hotspot, or the
+  address leading a disasm/MLIL line), else the current function's doc comment (`bn comment set
+  --function`). After a set, the current view reloads so an inline note renders.
+- **`t` bookmark** — a `Bookmarks` tag (with an optional note) on the address or function.
+
+Each shells out to a `bn … --summary` mutation and checks `"success": true`. All mutate the **live bn
+instance in-memory** — immediately visible to every `bn` command against that instance — and **none
+call `bn save`**: persisting to the on-disk `.bndb` is a separate, deliberate step (388 ms+, scales
+with binary size; see `TODO.md`).
+
+**Two apply strategies.** A **local** rename is just an identifier swap, so tokens/locals/spans are
+retexted in place (`apply_local_rename`, no re-decompile) — ~200 ms vs. the old ~860 ms. A **function**
+rename changes name maps and every callsite, so it can't be patched locally: the viewer returns
+`Exit::Reload` and the app rebuilds `Ctx` and reloads the viewer. `^R` triggers the same ctx rebuild
+manually, so edits the **agent** made to the shared instance (renames, new symbols) show up on demand
+— `Picker::refresh` re-syncs the function list while preserving the recent/opens history.
+
+The rebuild (~1s of sequential `bn` calls) runs on a **worker thread** so the UI keeps drawing: the
+event loop shows a centered bottom banner counting elapsed seconds, ticks at 100 ms for a smooth
+counter, and swallows input until the new `Ctx` arrives over a channel and is swapped in. The current
+function's own signature name is a `Func` hotspot too (so it's click/`x`/`r`-able); `act_primary`
+no-ops the degenerate self-goto.
 
 ## Non-goals (kept deliberately)
 
 Not a Binary Ninja clone — the justification is *headless* + *agent pairing*, not decompiler-feature
-parity. Resist creep toward types/structs/graph editing (beyond the narrow local-rename above).
+parity. The write surface stays limited to **naming and annotation** (rename / comment / bookmark);
+resist creep toward types/structs/graph editing.

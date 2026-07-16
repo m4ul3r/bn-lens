@@ -10,7 +10,9 @@ use ratatui::text::Span;
 #[derive(Clone, Copy)]
 pub enum HelpContext {
     Picker,
+    Strings,
     Viewer,
+    Stack,
     Switcher,
 }
 
@@ -18,7 +20,9 @@ impl HelpContext {
     fn label(self) -> &'static str {
         match self {
             Self::Picker => "picker",
+            Self::Strings => "strings",
             Self::Viewer => "viewer",
+            Self::Stack => "stack view",
             Self::Switcher => "switch bn",
         }
     }
@@ -26,15 +30,21 @@ impl HelpContext {
     fn section(self) -> &'static str {
         match self {
             Self::Picker => "PICKER",
+            Self::Strings => "STRINGS",
             Self::Viewer => "VIEWER",
+            Self::Stack => "STACK VIEW",
             Self::Switcher => "SWITCH BN",
         }
     }
 
     fn matches(self, scope: &str) -> bool {
         match self {
-            Self::Picker => scope.starts_with("PICKER"),
-            Self::Viewer => scope.starts_with("VIEWER") || scope == "VISUAL",
+            Self::Picker => scope.starts_with("PICKER") || scope == "LIST",
+            Self::Strings => scope == "STRINGS" || scope == "LIST",
+            Self::Viewer => {
+                scope.starts_with("VIEWER") || scope == "VISUAL" || scope == "STACK VIEW"
+            }
+            Self::Stack => scope == "STACK VIEW",
             Self::Switcher => scope == "SWITCH BN",
         }
     }
@@ -55,6 +65,21 @@ const LINES: &[HelpLine] = &[
         scope: "ANYWHERE",
         key: "?",
         action: "open this shortcut guide",
+    },
+    HelpLine::Entry {
+        scope: "ANYWHERE",
+        key: "^R",
+        action: "refresh from the live bn instance",
+    },
+    HelpLine::Entry {
+        scope: "LIST",
+        key: "m  ·  click title",
+        action: "open the bn lens view menu",
+    },
+    HelpLine::Entry {
+        scope: "MENU",
+        key: "j/k · Enter · Esc",
+        action: "pick view/action · choose · close",
     },
     HelpLine::Entry {
         scope: "HELP",
@@ -128,6 +153,32 @@ const LINES: &[HelpLine] = &[
         key: "Esc",
         action: "restore previous filter",
     },
+    HelpLine::Section("STRINGS"),
+    HelpLine::Entry {
+        scope: "STRINGS",
+        key: "j/k  ^D/^U  gg/G",
+        action: "move / page / ends",
+    },
+    HelpLine::Entry {
+        scope: "STRINGS",
+        key: "/",
+        action: "filter by content or address",
+    },
+    HelpLine::Entry {
+        scope: "STRINGS",
+        key: "p",
+        action: "peek where it's used (pseudo-C statement at each site)",
+    },
+    HelpLine::Entry {
+        scope: "STRINGS",
+        key: "Enter / x",
+        action: "open the full xrefs listing",
+    },
+    HelpLine::Entry {
+        scope: "STRINGS",
+        key: "m / q",
+        action: "view menu / quit",
+    },
     HelpLine::Section("VIEWER"),
     HelpLine::Entry {
         scope: "VIEWER",
@@ -162,7 +213,17 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "VIEWER",
         key: "r",
-        action: "rename local",
+        action: "rename local / function",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: ";",
+        action: "comment (address or function)",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "t",
+        action: "bookmark (Bookmarks tag)",
     },
     HelpLine::Entry {
         scope: "VIEWER",
@@ -183,6 +244,11 @@ const LINES: &[HelpLine] = &[
         scope: "VIEWER",
         key: "a",
         action: "ask agent about cursor line",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "S",
+        action: "open stack-frame inspector",
     },
     HelpLine::Entry {
         scope: "VIEWER",
@@ -240,6 +306,32 @@ const LINES: &[HelpLine] = &[
         scope: "RENAME",
         key: "type / Bksp",
         action: "edit; Enter rename; Esc cancel",
+    },
+    HelpLine::Entry {
+        scope: "COMMENT",
+        key: "type / Bksp",
+        action: "edit; Enter set; Esc cancel",
+    },
+    HelpLine::Entry {
+        scope: "BOOKMARK",
+        key: "type / Bksp",
+        action: "optional note; Enter add; Esc cancel",
+    },
+    HelpLine::Section("STACK VIEW"),
+    HelpLine::Entry {
+        scope: "STACK VIEW",
+        key: "j/k  PgDn/Up",
+        action: "select a recovered stack slot",
+    },
+    HelpLine::Entry {
+        scope: "STACK VIEW",
+        key: "Enter / r",
+        action: "jump to use / rename local",
+    },
+    HelpLine::Entry {
+        scope: "STACK VIEW",
+        key: "S/q/Esc",
+        action: "close inspector",
     },
     HelpLine::Section("SWITCH BN"),
     HelpLine::Entry {
@@ -431,5 +523,16 @@ mod tests {
 
         help.on_key(key(KeyCode::Char('?')));
         assert!(!help.is_open());
+    }
+
+    #[test]
+    fn stack_help_opens_at_stack_section() {
+        let mut help = Help::default();
+        help.open(HelpContext::Stack);
+
+        assert!(matches!(
+            LINES.get(help.offset),
+            Some(HelpLine::Section("STACK VIEW"))
+        ));
     }
 }

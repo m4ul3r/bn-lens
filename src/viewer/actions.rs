@@ -1,7 +1,7 @@
 //! Viewer actions that load data or change navigation state.
 
 use super::hotspots::{build_spans, ellipsize, symbolize_dump};
-use super::{Exit, Frame, HotKind, Popup, View, Viewer};
+use super::{AnnTarget, Exit, Frame, HotKind, Popup, RenameScope, View, Viewer};
 use crate::ctx::Ctx;
 use crate::syntax::Tok;
 
@@ -16,7 +16,13 @@ impl Viewer {
         match span.kind {
             HotKind::Func => {
                 let target = span.target.clone();
-                self.goto_to(ctx, target);
+                // The signature name is a hotspot for x/r, but g on it is a
+                // self-goto — nothing to navigate to.
+                if self.view.is_code() && target == self.name {
+                    self.status = format!(" {}   (x xrefs · r rename · ; comment)", self.name);
+                } else {
+                    self.goto_to(ctx, target);
+                }
             }
             HotKind::Addr if span.code => {
                 let target = span.target.clone();
@@ -56,20 +62,87 @@ impl Viewer {
         self.status = format!(" {name} : {ty}   (local · r to rename)");
     }
 
-    /// `r` on a selected local: open the rename dialog.
+    /// `r`: rename. A selected Local → local rename; a selected Func hotspot →
+    /// that function; otherwise the function currently in view.
     pub(super) fn open_rename(&mut self) {
-        let Some(index) = self.cur_span() else {
-            return;
+        let (old, scope) = match self.cur_span() {
+            Some(index) if self.spans[index].kind == HotKind::Local => {
+                (self.spans[index].target.clone(), RenameScope::Local)
+            }
+            Some(index) if self.spans[index].kind == HotKind::Func => {
+                (self.spans[index].target.clone(), RenameScope::Symbol)
+            }
+            _ if self.view.is_code() => (self.name.clone(), RenameScope::Symbol),
+            _ => {
+                self.status = " ✗ nothing renamable here".into();
+                return;
+            }
         };
-        if self.spans[index].kind != HotKind::Local {
-            self.status = " ✗ rename applies to a selected local".into();
-            return;
-        }
         self.popup = Popup::Rename {
-            old: self.spans[index].target.clone(),
+            old,
             buf: String::new(),
             err: String::new(),
+            scope,
         };
+    }
+
+    /// `;`: comment. Targets a concrete address (selected Addr hotspot, or the
+    /// address that leads a disasm/MLIL line), else the function doc comment.
+    pub(super) fn open_comment(&mut self) {
+        if !self.view.is_code() {
+            self.status = " ✗ comments apply in a code view".into();
+            return;
+        }
+        self.popup = Popup::Comment {
+            target: self.ann_target(),
+            buf: String::new(),
+        };
+    }
+
+    /// `t`: bookmark/tag. Same target resolution as [`open_comment`].
+    pub(super) fn open_tag(&mut self) {
+        if !self.view.is_code() {
+            self.status = " ✗ tags apply in a code view".into();
+            return;
+        }
+        self.popup = Popup::Tag {
+            target: self.ann_target(),
+            buf: String::new(),
+        };
+    }
+
+    /// Resolve where a comment/tag should land from the current selection/line.
+    fn ann_target(&self) -> AnnTarget {
+        if let Some(index) = self.cur_span() {
+            if self.spans[index].kind == HotKind::Addr {
+                return AnnTarget::Addr(self.spans[index].target.clone());
+            }
+        }
+        if let Some(addr) = self.line_leading_addr() {
+            return AnnTarget::Addr(addr);
+        }
+        AnnTarget::Func(self.name.clone())
+    }
+
+    /// The address that leads the current disasm/MLIL line, if any. Disasm emits
+    /// bare hex runs (`0043274c  …`); normalize to `0x…`. Decompile has no
+    /// per-line address, so this returns None there.
+    fn line_leading_addr(&self) -> Option<String> {
+        if !matches!(self.view, View::Disasm | View::Mlil) {
+            return None;
+        }
+        let token = self.lines.get(self.cline)?.iter().find_map(|segment| {
+            let text = segment.text.trim();
+            (!text.is_empty()).then_some(text)
+        })?;
+        if let Some(hex) = token.strip_prefix("0x") {
+            (hex.len() >= 4 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+                .then(|| token.to_string())
+        } else if token.len() >= 6 && token.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(format!("0x{token}"))
+        } else {
+            None
+        }
     }
 
     /// Reflect a completed local rename in place — no re-decompile. A local
@@ -86,8 +159,8 @@ impl Viewer {
         if let Some(ty) = self.locals.remove(old) {
             self.locals.insert(new.to_string(), ty);
         }
-        let current = self.view.is_code().then(|| self.name.clone());
-        self.spans = build_spans(&self.lines, ctx, &self.locals, current.as_deref());
+        self.stack_view.rename(old, new);
+        self.spans = build_spans(&self.lines, ctx, &self.locals);
     }
 
     /// Navigate to `target` (a function name or code address), pushing the nav

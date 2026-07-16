@@ -86,6 +86,53 @@ pub struct Func {
     pub name: String,
 }
 
+/// One Binary Ninja local/parameter. Stack variables use a signed frame offset
+/// in `storage`; `span_to_next` is the recovered slot span, not the type width.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct LocalVariable {
+    #[serde(default)]
+    pub local_id: String,
+    pub name: String,
+    #[serde(rename = "type", default)]
+    pub type_name: String,
+    #[serde(default)]
+    pub source_type: String,
+    #[serde(default)]
+    pub storage: i64,
+    #[serde(default)]
+    pub span_to_next: Option<u64>,
+    #[serde(default)]
+    pub is_parameter: bool,
+}
+
+impl LocalVariable {
+    pub fn is_stack(&self) -> bool {
+        self.source_type == "StackVariableSourceType"
+    }
+
+    pub fn is_synthetic(&self) -> bool {
+        self.name.starts_with("__") || (self.type_name == "void" && self.name.starts_with("arg_"))
+    }
+}
+
+#[derive(Deserialize)]
+struct LocalListJson {
+    #[serde(default)]
+    locals: Vec<LocalVariable>,
+}
+
+/// A `--summary` mutation payload reports `"success": true` when the write
+/// applied and verified. Both spacings appear depending on formatter.
+fn mutation_ok(out: &str) -> bool {
+    out.contains("\"success\": true") || out.contains("\"success\":true")
+}
+
+fn parse_local_list_json(text: &str) -> Vec<LocalVariable> {
+    serde_json::from_str::<LocalListJson>(text)
+        .map(|listing| listing.locals)
+        .unwrap_or_default()
+}
+
 impl Bn {
     pub fn new(bin: String, instance: Option<String>, target: Option<String>) -> Self {
         Bn { bin, instance, target }
@@ -220,6 +267,13 @@ impl Bn {
         std::fs::read_to_string(&tmp).unwrap_or_else(|_| "(no output)".into())
     }
 
+    /// Decompile with each pseudo-C line prefixed by its 8-hex address column
+    /// (`bn decompile --addresses`), via `--out`. Lets a caller map a use
+    /// address back to the statement it belongs to.
+    pub fn decompile_addr(&self, name: &str) -> String {
+        self.run_out(&["decompile", name, "--addresses"])
+    }
+
     /// IL dump at a given level (`hlil`/`mlil`/`llil`), via `--out`.
     pub fn il(&self, name: &str, level: &str) -> String {
         let out = self.run_out(&["il", name, "--view", level]);
@@ -238,6 +292,14 @@ impl Bn {
         } else {
             out
         }
+    }
+
+    /// `n` instructions in address-linear order starting *exactly* at `addr`
+    /// (unlike `--count`, which slices from the containing function's start).
+    /// Used to show the single instruction at an xref callsite.
+    pub fn disasm_linear(&self, addr: &str, n: usize) -> String {
+        let count = n.to_string();
+        self.run(&["disasm", addr, "--linear", &count])
     }
 
     /// Xrefs (small; stdout is fine).
@@ -298,21 +360,10 @@ impl Bn {
         out
     }
 
-    /// Locals + params of a function: name -> type (from `local list`).
-    pub fn local_list(&self, func: &str) -> HashMap<String, String> {
-        let out = self.run_out(&["local", "list", func]);
-        let mut m = HashMap::new();
-        for line in out.lines() {
-            // entries are indented ("  name   type   [id: …]"); headers are not
-            if !line.starts_with("  ") {
-                continue;
-            }
-            let mut it = line.split_whitespace();
-            if let (Some(name), Some(ty)) = (it.next(), it.next()) {
-                m.insert(name.to_string(), ty.to_string());
-            }
-        }
-        m
+    /// Structured locals + params from `bn local list --format json`.
+    pub fn local_list(&self, func: &str) -> Vec<LocalVariable> {
+        let out = self.run_out(&["local", "list", func, "--format", "json"]);
+        parse_local_list_json(&out)
     }
 
     /// Rename a local (`variable` = name or stable id). Returns true on a verified
@@ -320,7 +371,38 @@ impl Bn {
     /// `.bndb` is a separate, deliberate `bn save` (not done per-rename).
     pub fn local_rename(&self, func: &str, old: &str, new: &str) -> bool {
         let out = self.run(&["local", "rename", func, old, new, "--summary"]);
-        out.contains("\"success\": true") || out.contains("\"success\":true")
+        mutation_ok(&out)
+    }
+
+    /// Rename a function symbol (`ident` = name or address). Live in-memory,
+    /// like [`local_rename`]; not persisted until a deliberate `bn save`.
+    pub fn symbol_rename(&self, ident: &str, new: &str) -> bool {
+        let out = self.run(&["rename", ident, new, "--kind", "function", "--summary"]);
+        mutation_ok(&out)
+    }
+
+    /// Set an address comment (the note shown on that line).
+    pub fn comment_set_addr(&self, addr: &str, text: &str) -> bool {
+        let out = self.run(&["comment", "set", addr, text, "--summary"]);
+        mutation_ok(&out)
+    }
+
+    /// Set a function's documentation comment (shown atop the function).
+    pub fn comment_set_func(&self, func: &str, text: &str) -> bool {
+        let out = self.run(&["comment", "set", "--function", func, text, "--summary"]);
+        mutation_ok(&out)
+    }
+
+    /// Add a tag of `ty` (e.g. `Bookmarks`) at an address, with optional note.
+    pub fn tag_add_addr(&self, addr: &str, ty: &str, data: &str) -> bool {
+        let out = self.run(&["tag", "add", addr, "--type", ty, "--data", data, "--summary"]);
+        mutation_ok(&out)
+    }
+
+    /// Add a tag of `ty` on a whole function, with optional note.
+    pub fn tag_add_func(&self, func: &str, ty: &str, data: &str) -> bool {
+        let out = self.run(&["tag", "add", "--function", func, "--type", ty, "--data", data, "--summary"]);
+        mutation_ok(&out)
     }
 
     /// Hex+ASCII dump of `length` bytes at `addr`.
@@ -378,4 +460,42 @@ pub fn newest_live(bin: &str, exclude: Option<&str>) -> Option<String> {
     }
     live.sort_by(|a, b| b.started_at.cmp(&a.started_at));
     live.into_iter().next().map(|i| i.instance_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_local_list_json;
+
+    #[test]
+    fn parses_structured_stack_locals_without_losing_types() {
+        let json = r#"{
+            "function": {"address": "0x401000", "name": "main"},
+            "locals": [
+                {
+                    "local_id": "0x401000:local:stack:-24:0:1",
+                    "name": "handler",
+                    "type": "int32_t (*)(int32_t, char**)",
+                    "source_type": "StackVariableSourceType",
+                    "storage": -24,
+                    "span_to_next": 16,
+                    "is_parameter": false
+                },
+                {
+                    "local_id": "0x401000:param:reg:4:0:2",
+                    "name": "argc",
+                    "type": "int32_t",
+                    "source_type": "RegisterVariableSourceType",
+                    "storage": 4,
+                    "is_parameter": true
+                }
+            ]
+        }"#;
+        let locals = parse_local_list_json(json);
+        assert_eq!(locals.len(), 2);
+        assert!(locals[0].is_stack());
+        assert_eq!(locals[0].storage, -24);
+        assert_eq!(locals[0].span_to_next, Some(16));
+        assert_eq!(locals[0].type_name, "int32_t (*)(int32_t, char**)");
+        assert!(!locals[1].is_stack());
+    }
 }

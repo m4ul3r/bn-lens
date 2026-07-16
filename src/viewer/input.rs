@@ -1,6 +1,7 @@
 //! Keyboard and mouse handling for the code viewer.
 
 use super::hotspots::valid_ident;
+use super::stack::StackAction;
 use super::{Exit, Popup, View, Viewer};
 use crate::ctx::Ctx;
 use crate::herdr;
@@ -18,11 +19,20 @@ impl Viewer {
                 self.peek_key(key);
                 return Exit::Stay;
             }
-            Popup::Rename { .. } => {
-                self.rename_key(key, ctx);
+            Popup::Rename { .. } => return self.rename_key(key, ctx),
+            Popup::Comment { .. } => {
+                self.comment_key(key, ctx);
+                return Exit::Stay;
+            }
+            Popup::Tag { .. } => {
+                self.tag_key(key, ctx);
                 return Exit::Stay;
             }
             Popup::None => {}
+        }
+        if self.stack_view.is_open() {
+            self.stack_key(key);
+            return Exit::Stay;
         }
         if self.search_input.is_some() {
             self.search_key(key);
@@ -34,30 +44,23 @@ impl Viewer {
         self.normal_key(key, ctx)
     }
 
-    fn rename_key(&mut self, key: KeyEvent, ctx: &Ctx) {
-        let Popup::Rename { old, buf, err } = &mut self.popup else {
-            return;
+    fn rename_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
+        let Popup::Rename { old, buf, err, scope } = &mut self.popup else {
+            return Exit::Stay;
         };
         match key.code {
             KeyCode::Enter => {
-                let (old, new) = (old.clone(), buf.clone());
+                let (old, new, scope) = (old.clone(), buf.clone(), *scope);
                 if new.is_empty() || new == old {
                     self.popup = Popup::None;
-                    return;
+                    return Exit::Stay;
                 }
                 if !valid_ident(&new) {
                     *err = "identifiers only — letters, digits, _  (no spaces)".into();
-                    return;
+                    return Exit::Stay;
                 }
                 self.popup = Popup::None;
-                let function = self.name.clone();
-                if ctx.bn.local_rename(&function, &old, &new) {
-                    self.apply_local_rename(ctx, &old, &new);
-                    self.status =
-                        format!(" ✓ renamed {old} → {new}   (live · `bn save` to persist)");
-                } else {
-                    self.status = format!(" ✗ rename {old} → {new} failed");
-                }
+                return self.commit_rename(ctx, scope, &old, &new);
             }
             KeyCode::Esc => self.popup = Popup::None,
             KeyCode::Backspace => {
@@ -68,6 +71,99 @@ impl Viewer {
                 buf.push(ch);
                 err.clear();
             }
+            _ => {}
+        }
+        Exit::Stay
+    }
+
+    /// Apply a validated rename. A local retexts in place (cheap); a function
+    /// symbol needs a ctx rebuild, so we update `self.name` if it was the one in
+    /// view and signal `Exit::Reload`.
+    fn commit_rename(&mut self, ctx: &Ctx, scope: super::RenameScope, old: &str, new: &str) -> Exit {
+        match scope {
+            super::RenameScope::Local => {
+                let function = self.name.clone();
+                if ctx.bn.local_rename(&function, old, new) {
+                    self.apply_local_rename(ctx, old, new);
+                    self.status =
+                        format!(" ✓ renamed {old} → {new}   (live · `bn save` to persist)");
+                } else {
+                    self.status = format!(" ✗ rename {old} → {new} failed");
+                }
+                Exit::Stay
+            }
+            super::RenameScope::Symbol => {
+                if ctx.bn.symbol_rename(old, new) {
+                    if self.name == old {
+                        self.name = new.to_string();
+                    }
+                    self.status =
+                        format!(" ✓ renamed fn {old} → {new}   (live · `bn save` to persist)");
+                    Exit::Reload
+                } else {
+                    self.status = format!(" ✗ rename fn {old} → {new} failed");
+                    Exit::Stay
+                }
+            }
+        }
+    }
+
+    fn comment_key(&mut self, key: KeyEvent, ctx: &Ctx) {
+        let Popup::Comment { target, buf } = &mut self.popup else {
+            return;
+        };
+        match key.code {
+            KeyCode::Enter => {
+                let (target, text) = (target.clone(), buf.clone());
+                self.popup = Popup::None;
+                if text.is_empty() {
+                    return;
+                }
+                let ok = match &target {
+                    super::AnnTarget::Addr(addr) => ctx.bn.comment_set_addr(addr, &text),
+                    super::AnnTarget::Func(func) => ctx.bn.comment_set_func(func, &text),
+                };
+                if ok {
+                    self.status = format!(" ✓ comment set {}   (`bn save` to persist)", target.label());
+                    // Re-render so the note shows inline (no ctx change).
+                    self.load(ctx);
+                } else {
+                    self.status = format!(" ✗ comment {} failed", target.label());
+                }
+            }
+            KeyCode::Esc => self.popup = Popup::None,
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(ch) => buf.push(ch),
+            _ => {}
+        }
+    }
+
+    fn tag_key(&mut self, key: KeyEvent, ctx: &Ctx) {
+        let Popup::Tag { target, buf } = &mut self.popup else {
+            return;
+        };
+        match key.code {
+            KeyCode::Enter => {
+                let (target, note) = (target.clone(), buf.clone());
+                self.popup = Popup::None;
+                let ok = match &target {
+                    super::AnnTarget::Addr(addr) => ctx.bn.tag_add_addr(addr, "Bookmarks", &note),
+                    super::AnnTarget::Func(func) => ctx.bn.tag_add_func(func, "Bookmarks", &note),
+                };
+                if ok {
+                    self.status =
+                        format!(" ✓ bookmarked {}   (`bn save` to persist)", target.label());
+                } else {
+                    self.status = format!(" ✗ tag {} failed", target.label());
+                }
+            }
+            KeyCode::Esc => self.popup = Popup::None,
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(ch) => buf.push(ch),
             _ => {}
         }
     }
@@ -151,8 +247,11 @@ impl Viewer {
                     off: 0,
                 };
             }
+            KeyCode::Char('S') => self.open_stack_view(),
             KeyCode::Char('x') => self.open_xrefs(ctx),
             KeyCode::Char('r') => self.open_rename(),
+            KeyCode::Char(';') => self.open_comment(),
+            KeyCode::Char('t') => self.open_tag(),
             KeyCode::Char('i') => self.cycle_view(ctx, 1),
             KeyCode::Char('I') => self.cycle_view(ctx, -1),
             KeyCode::Char('b') => return self.back(ctx),
@@ -167,6 +266,47 @@ impl Viewer {
             _ => {}
         }
         Exit::Stay
+    }
+
+    fn open_stack_view(&mut self) {
+        let preferred = self.cur_span().and_then(|index| {
+            let span = &self.spans[index];
+            (span.kind == super::HotKind::Local).then(|| span.target.clone())
+        });
+        if !self.stack_view.open(preferred.as_deref()) {
+            self.status = " no stack-backed variables recovered for this view".into();
+        }
+    }
+
+    fn stack_key(&mut self, key: KeyEvent) {
+        match self.stack_view.on_key(key) {
+            StackAction::None => {}
+            StackAction::Close => self.stack_view.close(),
+            StackAction::Jump(name) => {
+                if let Some(index) = self
+                    .spans
+                    .iter()
+                    .position(|span| span.kind == super::HotKind::Local && span.target == name)
+                {
+                    self.stack_view.close();
+                    self.active = Some(index);
+                    self.cline = self.spans[index].line;
+                    self.top = self.cline.saturating_sub(3);
+                } else {
+                    self.stack_view.close();
+                    self.status = format!(" {name} has no rendered use in this view");
+                }
+            }
+            StackAction::Rename(old) => {
+                self.stack_view.close();
+                self.popup = Popup::Rename {
+                    buf: String::new(),
+                    old,
+                    err: String::new(),
+                    scope: super::RenameScope::Local,
+                };
+            }
+        }
     }
 
     fn visual_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
@@ -350,6 +490,9 @@ impl Viewer {
         if !matches!(self.popup, Popup::None) {
             return;
         }
+        if self.stack_view.is_open() && self.stack_view.on_mouse(mouse) {
+            return;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => self.move_cursor(-3),
             MouseEventKind::ScrollDown => self.move_cursor(3),
@@ -358,6 +501,9 @@ impl Viewer {
                     if mouse.row == y && mouse.column >= x0 && mouse.column < x1 {
                         self.active = Some(index);
                         self.cline = self.spans[index].line;
+                        if self.spans[index].kind == super::HotKind::Local {
+                            self.stack_view.select_name(&self.spans[index].target);
+                        }
                         break;
                     }
                 }

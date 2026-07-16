@@ -2,10 +2,10 @@
 
 ## Persisting renames to disk (`bn save`)
 
-**Status:** not implemented. Local rename (`r`) currently mutates the **live bn instance in-memory**
-only — instantly visible to every `bn` command against that instance, but **not written to the on-disk
-`.bndb`**. So a rename is lost if the instance restarts (GC'd, rebooted) or the target is reloaded in
-the GUI.
+**Status:** not implemented. The write paths — local rename, **function rename** (`r`), **comments**
+(`;`), and **bookmarks/tags** (`t`) — all mutate the **live bn instance in-memory** only: instantly
+visible to every `bn` command against that instance, but **not written to the on-disk `.bndb`**. So
+any annotation is lost if the instance restarts (GC'd, rebooted) or the target is reloaded in the GUI.
 
 **Why it's not auto-done:** `bn save` is ~388 ms on a *small* binary and scales with size (seconds on
 firmware). Saving on every rename was the old, slow behavior (~860 ms/rename). See DESIGN.md →
@@ -30,6 +30,29 @@ On a ~2000-function binary, `Ctx::build` is ~1.2 s because it runs 5 sequential 
 (`function list` ~330 ms + exports + imports + sections + arch, each paying the ~130 ms Python-CLI
 startup — see the "bn-as-CLI" discussion). It's a one-time cost, but could be trimmed by running the
 independent calls concurrently, or lazy-loading exports/imports on first use. Not urgent.
+
+## Navigation / session persistence (side-parked)
+
+**Status:** not implemented. The picker's `recent` list (your `▸` opens and the agent's `◆`
+references) and any per-session navigation trail live **in-memory only** and die with the pane. For a
+multi-session RE effort, a small on-disk breadcrumb per instance/target — the "▸ you" trail, and
+maybe a notes/marks list — would let the shared map survive a relaunch.
+
+**Open questions:** where it lives (alongside bn's session state under `~/.cache/bn/`? a lens-owned
+file keyed by instance+target?), what's worth persisting (opens only, or marks/notes too), and how it
+reconciles when the underlying `.bndb` changed between sessions. Tied to the same
+"live-in-instance vs. persistent" question as the `bn save` note above.
+
+## Call-graph / xref-tree view (side-parked, likely hard)
+
+**Status:** not implemented. Today following calls is one-hop at a time (`g` on a Func hotspot); there
+is no "who calls this / what does this reach" overview. A call-tree peek (callers ↑ / callees ↓,
+expandable, `Enter` to jump) would fit the navigator framing without drifting toward decompiler
+parity. `bn` already exposes `xrefs` and `callsites` to build it from.
+
+**Why it's hard:** rendering an interactive, scrollable, expandable tree in ratatui (cycle handling,
+depth limits, lazy expansion to avoid fanning out a whole binary), plus deciding how it composes with
+the existing nav stack and hotspot model. Non-trivial UI work; scope carefully before starting.
 
 ## Deferred / future
 

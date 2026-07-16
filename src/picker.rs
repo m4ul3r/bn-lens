@@ -132,6 +132,23 @@ impl Picker {
         }
     }
 
+    /// Re-sync the static tables (functions, symbols, sections) from a rebuilt
+    /// ctx after a mutation/refresh, preserving your opens, the agent scan, the
+    /// filter, and the cursor. A fresh `Picker` would drop that live history.
+    pub fn refresh(&mut self, ctx: &Ctx) {
+        let fresh = Picker::new(ctx);
+        self.all = fresh.all;
+        self.awidth = fresh.awidth;
+        self.fn_names = fresh.fn_names;
+        self.fn_name_addr = fresh.fn_name_addr;
+        self.fn_addr_name = fresh.fn_addr_name;
+        self.imports = fresh.imports;
+        self.ranges = fresh.ranges;
+        self.syms = fresh.syms;
+        self.sec_lines = fresh.sec_lines;
+        self.rebuild_recent();
+    }
+
     /// Record a function you just opened in the lens (MRU, newest first).
     pub fn record_open(&mut self, name: &str) {
         if name.is_empty() {
@@ -395,7 +412,7 @@ impl Picker {
                 } else {
                     format!(" filter: {}", self.filter)
                 },
-                " j/k move · / search · Enter open · x xrefs · i switch · ? help · q quit",
+                " j/k move · / search · Enter open · x xrefs · m menu · i switch · ? help · q quit",
             ),
         };
         buf.set_stringn(x0, area.y + 1, state, w, Style::default().add_modifier(Modifier::DIM));

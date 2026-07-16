@@ -8,6 +8,12 @@ use ratatui::text::Span;
 /// Background of the header bar (a dark slate that reads on light + dark themes).
 pub const BAR_BG: Color = Color::Rgb(38, 44, 66);
 
+/// Popup panel colours — a slightly raised slate over the header, with a light
+/// default foreground so content that sets no colour of its own stays legible
+/// (and doesn't fall back to a terminal default fg that could vanish on the bg).
+pub const POPUP_BG: Color = Color::Rgb(48, 55, 82);
+pub const POPUP_FG: Color = Color::Rgb(216, 221, 233);
+
 /// The shared header "breadcrumbs": tool · `-i instance` · `-t target` · arch.
 /// The `-i`/`-t` are shown verbatim so an agent reading the pane can copy them
 /// into `bn -i <> -t <>`; the target selector also carries the binary name.
@@ -49,9 +55,17 @@ pub fn draw_box(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, title: &str) {
         return;
     }
     let wu = w as usize;
-    let cyan = Style::default().fg(Color::Cyan);
+    // Fill from a *reset* base (ratatui patches cell styles, so an all-unset
+    // default would leave the highlighted cells underneath bleeding through),
+    // then set the panel bg + a light default fg. Because writes only patch, any
+    // content drawn on top keeps this bg unless it sets its own — so the whole
+    // popup reads as one opaque, raised panel.
+    let panel = Style::reset().bg(POPUP_BG).fg(POPUP_FG);
+    // Borders start from a plain style (no reset), so `add_modifier(BOLD)` on the
+    // title isn't cancelled by reset()'s "clear all modifiers".
+    let cyan = Style::default().fg(Color::Cyan).bg(POPUP_BG);
     for row in 0..h {
-        buf.set_stringn(x, y + row, " ".repeat(wu), wu, Style::default());
+        buf.set_stringn(x, y + row, " ".repeat(wu), wu, panel);
     }
     // top: ┌─ title ─…─┐  (exactly w columns; box chars are width 1)
     let head = format!("┌─ {title} ");
