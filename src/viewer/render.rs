@@ -313,10 +313,15 @@ impl Viewer {
         let info = vec![
             Span::styled(
                 format!(" {sel_addr:#x}"),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  cfg  ", Style::default().fg(Color::Blue)),
-            Span::styled(self.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                self.name.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!("   block {}/{}", g.sel + 1, g.data.block_count),
                 dim,
@@ -330,8 +335,7 @@ impl Viewer {
         ];
         crate::ui::put_spans(buffer, area.x, area.y + 1, width, &info);
 
-        let hint =
-            " hjkl move · PgUp/Dn block · Enter read · Space list · i/v cycle · q close";
+        let hint = " hjkl move · PgUp/Dn block · Enter read · Space list · i/v cycle · q close";
         crate::ui::render_bar(
             buffer,
             area.x,
@@ -438,12 +442,21 @@ impl Viewer {
         // Pan affordances: ‹ › on a mid-body row when the canvas extends off the
         // sides (the graph is wider than the pane and panned to follow selection).
         let mid = body_top + (view_h / 2) as u16;
-        let mark = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let mark = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
         if g.left > 0 {
             crate::ui::put_str(buffer, area.x, mid, "‹", 1, mark);
         }
         if g.left + width < g.data.w {
-            crate::ui::put_str(buffer, area.x + area.width.saturating_sub(1), mid, "›", 1, mark);
+            crate::ui::put_str(
+                buffer,
+                area.x + area.width.saturating_sub(1),
+                mid,
+                "›",
+                1,
+                mark,
+            );
         }
 
         // Always-on top-left inspector for the highlighted block (syntax-
@@ -701,14 +714,7 @@ fn render_cfg_expand(
     let bg = Color::Black;
     let fg = crate::ui::POPUP_FG;
     crate::ui::draw_box_colored(
-        buffer,
-        panel_x,
-        panel_y,
-        panel_w,
-        panel_h,
-        &exp.title,
-        bg,
-        fg,
+        buffer, panel_x, panel_y, panel_w, panel_h, &exp.title, bg, fg,
     );
 
     let view_rows = (panel_h as usize).saturating_sub(2);
@@ -758,16 +764,22 @@ fn render_cfg_expand(
 fn cfg_cell_style(col: u8, selected: bool) -> Style {
     use crate::cfg;
     let base = match col {
-        cfg::C_TRUE => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        cfg::C_TRUE => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
         cfg::C_FALSE => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        cfg::C_OTHER => Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+        cfg::C_OTHER => Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
         cfg::C_ADDR => Style::default().fg(crate::theme::ADDR),
         cfg::C_BORDER => Style::default().fg(Color::Gray),
         _ => Style::default(),
     };
     if selected {
         match col {
-            cfg::C_BORDER => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            cfg::C_BORDER => Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
             _ => base.add_modifier(Modifier::BOLD),
         }
     } else if col == cfg::C_BORDER {

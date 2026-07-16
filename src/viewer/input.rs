@@ -345,7 +345,9 @@ impl Viewer {
     fn cycle_view(&mut self, ctx: &Ctx, direction: i32) {
         let order = [View::Decomp, View::Mlil, View::Disasm, View::Cfg];
         let next = match order.iter().position(|&view| view == self.view) {
-            Some(current) => order[(current as i32 + direction).rem_euclid(order.len() as i32) as usize],
+            Some(current) => {
+                order[(current as i32 + direction).rem_euclid(order.len() as i32) as usize]
+            }
             None => View::Decomp,
         };
         self.view = next;

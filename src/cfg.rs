@@ -139,9 +139,15 @@ fn edge_lines(block: &Block, labels: &HashMap<u64, String>, indent: &str) -> Vec
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            let connector = if i + 1 == edges.len() { "└─" } else { "├─" };
+            let connector = if i + 1 == edges.len() {
+                "└─"
+            } else {
+                "├─"
+            };
             let word = edge_word(&e.k);
-            let is_loop = parse_hex(&e.to).map(|to| to <= block.start).unwrap_or(false);
+            let is_loop = parse_hex(&e.to)
+                .map(|to| to <= block.start)
+                .unwrap_or(false);
             let loop_note = if is_loop { "   ↑loop" } else { "" };
             let target = target_label(labels, &e.to);
             if word.is_empty() && word_w == 0 {
@@ -390,8 +396,8 @@ impl Canvas {
 /// A node in the layered layout: a real block or a routing dummy.
 struct LNode {
     rank: usize,
-    order: usize, // position within its rank
-    cx: usize,    // center column (assigned after ordering)
+    order: usize,        // position within its rank
+    cx: usize,           // center column (assigned after ordering)
     real: Option<usize>, // Some(block index) for a real box; None for a dummy
 }
 
@@ -557,7 +563,11 @@ fn build_graph(
     entry: Option<u64>,
 ) -> Option<GraphData> {
     let n = blocks.len();
-    let addr_idx: HashMap<u64, usize> = blocks.iter().enumerate().map(|(i, b)| (b.start, i)).collect();
+    let addr_idx: HashMap<u64, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.start, i))
+        .collect();
     let entry_idx = entry.and_then(|a| addr_idx.get(&a).copied()).unwrap_or(0);
 
     // In-function edges (u, v, word). External targets can't be routed (no box
@@ -708,7 +718,13 @@ fn build_graph(
         match node.real {
             Some(bi) => {
                 let left = node.cx - box_w / 2;
-                draw_box(&mut canvas, top, left, box_w, &box_content(labels, &blocks[bi], entry));
+                draw_box(
+                    &mut canvas,
+                    top,
+                    left,
+                    box_w,
+                    &box_content(labels, &blocks[bi], entry),
+                );
                 gblocks[bi] = GBlock {
                     addr: blocks[bi].start,
                     label: labels
@@ -1055,7 +1071,10 @@ mod tests {
         assert!(text.contains('┌') && text.contains('┐'), "has box corners");
         assert!(text.contains('▼'), "has forward arrowheads");
         assert!(text.contains("block_0"), "labels the entry");
-        assert!(text.contains("0x1010") && text.contains("0x1020"), "both branches drawn");
+        assert!(
+            text.contains("0x1010") && text.contains("0x1020"),
+            "both branches drawn"
+        );
         // Five blocks, entry recorded.
         assert_eq!(g.blocks.len(), 5);
         assert_eq!(g.blocks[g.entry].addr, 0x1000);
@@ -1067,7 +1086,10 @@ mod tests {
         assert!(g.color.contains(&C_TRUE), "true branch coloured green");
         assert!(g.color.contains(&C_FALSE), "false branch coloured red");
         // The unconditional joins (block_1/2 → block_3) are 'other' (blue).
-        assert!(g.color.contains(&C_OTHER), "unconditional edge coloured blue");
+        assert!(
+            g.color.contains(&C_OTHER),
+            "unconditional edge coloured blue"
+        );
     }
 
     #[test]
