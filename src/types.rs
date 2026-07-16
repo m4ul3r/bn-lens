@@ -6,7 +6,7 @@
 //! live database immediately but persists to the on-disk `.bndb` only on an
 //! explicit `bn save`.
 
-use crate::bn::TypeCheck;
+use crate::bn::{TypeCheck, TypeItem, TypeLayout};
 use crate::ctx::Ctx;
 use crate::picker::Action;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -39,6 +39,9 @@ struct TypeEditor {
     col: usize,
     /// Vertical scroll offset (first visible editor line).
     top: usize,
+    /// Horizontal scroll offset (first visible char column, all lines shift
+    /// together) — follows the cursor so long declarations stay editable.
+    left: usize,
     /// Validation / error feedback under the text area.
     status: String,
     /// True once a `^P` check or `^S` commit reported the text parses.
@@ -85,6 +88,45 @@ fn kind_color(kind: &str) -> Color {
     }
 }
 
+/// Affected-type names a declaration would define that already exist in the
+/// type system. The Types view only *adds* types, so any hit blocks the commit
+/// (a raw `bn types declare` would silently replace them).
+fn collisions(affected: &[TypeLayout], existing: &[TypeItem]) -> Vec<String> {
+    let known: std::collections::HashSet<&str> =
+        existing.iter().map(|it| it.name.as_str()).collect();
+    affected
+        .iter()
+        .filter(|l| known.contains(l.name.as_str()))
+        .map(|l| l.name.clone())
+        .collect()
+}
+
+/// Terminal display width of one char in cells (wide CJK chars are 2 cells,
+/// combining marks 0) — ratatui's own unicode-width measure, so the cursor x
+/// matches where `Buffer::set_stringn` actually puts glyphs.
+fn char_w(c: char) -> usize {
+    Span::raw(c.encode_utf8(&mut [0u8; 4]) as &str).width()
+}
+
+/// Advance/retreat the horizontal scroll `left` (a char offset into `line`) so
+/// the cursor at char index `col` is fully visible within `inner` display
+/// cells. Returns the new `left` (always `<= col`).
+fn follow_h(line: &str, col: usize, mut left: usize, inner: usize) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    let col = col.min(chars.len());
+    left = left.min(col);
+    // The cursor cell itself: the char under it, or 1 cell at end-of-line.
+    let cursor_w = chars.get(col).map(|&c| char_w(c).max(1)).unwrap_or(1);
+    while left < col {
+        let prefix: usize = chars[left..col].iter().map(|&c| char_w(c)).sum();
+        if prefix + cursor_w <= inner {
+            break;
+        }
+        left += 1;
+    }
+    left
+}
+
 impl TypeEditor {
     fn new() -> Self {
         TypeEditor {
@@ -92,7 +134,9 @@ impl TypeEditor {
             row: 0,
             col: 0,
             top: 0,
-            status: "write a C declaration, e.g.  struct foo { uint32_t id; char name[16]; };".into(),
+            left: 0,
+            status: "write a C declaration, e.g.  struct foo { uint32_t id; char name[16]; };"
+                .into(),
             ok: false,
         }
     }
@@ -121,7 +165,10 @@ impl TypeEditor {
         self.col = self.col.min(chars.len());
         let head: String = chars[..self.col].iter().collect();
         let tail: String = chars[self.col..].iter().collect();
-        let indent: String = head.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        let indent: String = head
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
         self.lines[self.row] = head;
         self.lines.insert(self.row + 1, format!("{indent}{tail}"));
         self.row += 1;
@@ -184,6 +231,14 @@ impl TypeEditor {
         }
         match ctx.bn.type_declare_check(&self.text()) {
             TypeCheck::Ok(layouts) => {
+                // bn returns a successful noop for input that parses but names
+                // no type (e.g. `int helper(int);`) — that must not read as a
+                // plain success, because `^S` would have nothing to declare.
+                if layouts.is_empty() {
+                    self.ok = false;
+                    self.status = "✗ parses, but defines no named type".into();
+                    return;
+                }
                 self.ok = true;
                 let summary: Vec<String> = layouts
                     .iter()
@@ -208,13 +263,45 @@ impl TypeEditor {
     }
 
     /// `^S`: commit. Returns the type on success (caller closes + refreshes);
-    /// keeps the editor open on a parse error.
+    /// keeps the editor open on a parse error, a declaration that names no
+    /// type, or a name collision — the Types view only *adds* new types, and
+    /// `bn types declare` would silently replace an existing one.
     fn commit(&mut self, ctx: &Ctx) -> EditorResult {
         if self.is_empty() {
             self.status = "nothing to declare yet".into();
             return EditorResult::None;
         }
+        // Preview first: learn which type names the declaration defines.
+        let affected = match ctx.bn.type_declare_check(&self.text()) {
+            TypeCheck::Ok(layouts) => layouts,
+            TypeCheck::Err(err) => {
+                self.ok = false;
+                self.status = format!("✗ {err}");
+                return EditorResult::None;
+            }
+        };
+        if affected.is_empty() {
+            self.ok = false;
+            self.status = "✗ no named types were defined".into();
+            return EditorResult::None;
+        }
+        // Re-list at commit time (not the possibly stale view snapshot) and
+        // refuse to overwrite a type that already exists.
+        let clash = collisions(&affected, &ctx.bn.types_list());
+        if !clash.is_empty() {
+            self.ok = false;
+            self.status = format!(
+                "✗ '{}' already exists — the Types view only adds new types",
+                clash.join("', '")
+            );
+            return EditorResult::None;
+        }
         match ctx.bn.type_declare(&self.text()) {
+            Ok(0) => {
+                self.ok = false;
+                self.status = "✗ no named types were defined".into();
+                EditorResult::None
+            }
             Ok(count) => EditorResult::Committed(format!(
                 "✓ declared {count} type(s)   (live · `bn save` to persist)"
             )),
@@ -361,7 +448,9 @@ impl TypesList {
         let n = show.lines.len();
         match k.code {
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => self.show = None,
-            KeyCode::Char('j') | KeyCode::Down => show.off = (show.off + 1).min(n.saturating_sub(1)),
+            KeyCode::Char('j') | KeyCode::Down => {
+                show.off = (show.off + 1).min(n.saturating_sub(1))
+            }
             KeyCode::Char('k') | KeyCode::Up => show.off = show.off.saturating_sub(1),
             KeyCode::PageDown => show.off = (show.off + 10).min(n.saturating_sub(1)),
             KeyCode::PageUp => show.off = show.off.saturating_sub(10),
@@ -580,7 +669,10 @@ impl TypesList {
                         .fg(kind_color(&it.kind))
                         .add_modifier(Modifier::DIM),
                 ),
-                Span::styled(format!("  {}", it.name), Style::default().fg(kind_color(&it.kind))),
+                Span::styled(
+                    format!("  {}", it.name),
+                    Style::default().fg(kind_color(&it.kind)),
+                ),
             ];
             crate::ui::put_spans(buf, x0, y, w, &spans);
         }
@@ -642,6 +734,10 @@ impl TypesList {
         } else if editor.row >= editor.top + text_h {
             editor.top = editor.row + 1 - text_h;
         }
+        // Keep the cursor column visible: all lines scroll together by `left`
+        // char columns, and the cursor x is measured in display cells (wide
+        // chars are 2 cells) so it lands where the glyphs actually are.
+        editor.left = follow_h(&editor.lines[editor.row], editor.col, editor.left, inner);
         for (vis, line) in editor
             .lines
             .iter()
@@ -650,22 +746,27 @@ impl TypesList {
             .take(text_h)
         {
             let y = by + 1 + (vis - editor.top) as u16;
-            crate::ui::put_str(buf, bx + 2, y, line, inner, Style::default());
+            let visible: String = line.chars().skip(editor.left).collect();
+            crate::ui::put_str(buf, bx + 2, y, visible, inner, Style::default());
             // Draw the block cursor on its line.
             if vis == editor.row {
-                let cursor_col = editor.col.min(line.chars().count());
-                if cursor_col < inner {
-                    let under: String = line
-                        .chars()
-                        .nth(cursor_col)
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| " ".into());
+                let chars: Vec<char> = line.chars().collect();
+                let cursor_col = editor.col.min(chars.len());
+                let cx: usize = chars[editor.left..cursor_col]
+                    .iter()
+                    .map(|&c| char_w(c))
+                    .sum();
+                let (under, under_w) = chars
+                    .get(cursor_col)
+                    .map(|&c| (c.to_string(), char_w(c).max(1)))
+                    .unwrap_or_else(|| (" ".into(), 1));
+                if cx + under_w <= inner {
                     crate::ui::put_str(
                         buf,
-                        bx + 2 + cursor_col as u16,
+                        bx + 2 + cx as u16,
                         y,
                         under,
-                        1,
+                        under_w,
                         Style::default().add_modifier(Modifier::REVERSED),
                     );
                 }
@@ -700,7 +801,8 @@ impl TypesList {
 
 #[cfg(test)]
 mod tests {
-    use super::{rank, TypeEditor};
+    use super::{collisions, follow_h, rank, TypeEditor};
+    use crate::bn::{TypeItem, TypeLayout};
 
     fn typed(text: &str) -> TypeEditor {
         let mut e = TypeEditor::new();
@@ -768,6 +870,67 @@ mod tests {
         assert!(TypeEditor::new().is_empty());
         assert!(typed("   \n\t").is_empty());
         assert!(!typed("struct s {};").is_empty());
+    }
+
+    fn layouts(names: &[&str]) -> Vec<TypeLayout> {
+        names
+            .iter()
+            .map(|n| TypeLayout {
+                name: n.to_string(),
+                layout: format!("struct {n} // size=0x4"),
+            })
+            .collect()
+    }
+
+    fn items(names: &[&str]) -> Vec<TypeItem> {
+        names
+            .iter()
+            .map(|n| TypeItem {
+                name: n.to_string(),
+                kind: "struct".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn collisions_flag_only_names_already_in_the_type_system() {
+        let existing = items(&["widget", "gadget_hdr"]);
+        assert_eq!(
+            collisions(&layouts(&["widget", "brand_new"]), &existing),
+            vec!["widget".to_string()],
+            "an existing name blocks; a new one passes"
+        );
+        assert!(collisions(&layouts(&["brand_new"]), &existing).is_empty());
+        assert!(collisions(&[], &existing).is_empty());
+        // Names are exact matches — no prefix/case fuzz.
+        assert!(collisions(&layouts(&["Widget"]), &existing).is_empty());
+        assert!(collisions(&layouts(&["gadget"]), &existing).is_empty());
+    }
+
+    #[test]
+    fn horizontal_follow_keeps_the_cursor_inside_the_viewport() {
+        let line = "struct very_long_declaration_line_for_the_editor_popup";
+        // Cursor inside the window: no scroll.
+        assert_eq!(follow_h(line, 5, 0, 20), 0);
+        // Cursor past the window: left advances until col fits (19 chars of
+        // prefix + the 1-cell cursor == 20).
+        assert_eq!(follow_h(line, 40, 0, 20), 21);
+        // Moving back before the scroll origin pulls left back to the cursor.
+        assert_eq!(follow_h(line, 3, 10, 20), 3);
+        // Cursor at end-of-line still gets its 1-cell block.
+        let col = line.chars().count();
+        let left = follow_h(line, col, 0, 20);
+        assert_eq!(col - left + 1, 20);
+    }
+
+    #[test]
+    fn horizontal_follow_measures_wide_chars_in_cells() {
+        // Ten 2-cell CJK chars: cursor at char 6 in a 10-cell window must
+        // scroll so (6 - left) * 2 + 2 <= 10.
+        let line = "宽宽宽宽宽宽宽宽宽宽";
+        assert_eq!(follow_h(line, 6, 0, 10), 2);
+        // An ASCII line never scrolls while it fits.
+        assert_eq!(follow_h("short", 5, 0, 10), 0);
     }
 
     #[test]

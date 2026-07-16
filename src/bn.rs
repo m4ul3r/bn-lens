@@ -277,6 +277,8 @@ pub struct TypeItem {
 struct TypesJson {
     #[serde(default)]
     items: Vec<TypeItemJson>,
+    #[serde(default)]
+    has_more: bool,
 }
 
 #[derive(Deserialize)]
@@ -285,6 +287,8 @@ struct TypeItemJson {
     name: String,
     #[serde(default)]
     kind: String,
+    #[serde(default)]
+    decl: String,
 }
 
 /// Result of previewing a `types declare` (validate without committing): either
@@ -372,6 +376,31 @@ fn clean_err(msg: &str) -> String {
         format!("{head}…")
     } else {
         collapsed
+    }
+}
+
+/// Parse one `bn types --format json` page into items plus the envelope's
+/// `has_more` flag. bn reports actual unions as `kind: "struct"`; the `decl`
+/// field (`union __BLOB_ARG` vs `struct S`) disambiguates, so recover the
+/// `union` kind from it here.
+fn parse_types_page(text: &str) -> (Vec<TypeItem>, bool) {
+    match serde_json::from_str::<TypesJson>(text.trim()) {
+        Ok(page) => {
+            let items = page
+                .items
+                .into_iter()
+                .map(|i| {
+                    let kind = if i.decl.split_whitespace().next() == Some("union") {
+                        "union".to_string()
+                    } else {
+                        i.kind
+                    };
+                    TypeItem { name: i.name, kind }
+                })
+                .collect();
+            (items, page.has_more)
+        }
+        Err(_) => (Vec::new(), false),
     }
 }
 
@@ -560,20 +589,28 @@ impl Bn {
             .collect()
     }
 
-    /// `bn types` -> the type list (name + kind) for the Types view.
+    /// `bn types` -> the full type list (name + kind) for the Types view,
+    /// paged with `--offset` until the envelope reports `has_more: false` so a
+    /// database past the page size is never silently truncated.
     pub fn types_list(&self) -> Vec<TypeItem> {
-        let out = self.run_out(&["types", "--limit", "5000", "--format", "json"]);
-        serde_json::from_str::<TypesJson>(&out)
-            .map(|t| {
-                t.items
-                    .into_iter()
-                    .map(|i| TypeItem {
-                        name: i.name,
-                        kind: i.kind,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        let mut all: Vec<TypeItem> = Vec::new();
+        loop {
+            let offset = all.len().to_string();
+            let out = self.run_out(&[
+                "types", "--offset", &offset, "--limit", "5000", "--format", "json",
+            ]);
+            let (mut items, has_more) = parse_types_page(&out);
+            // An empty page also ends the loop, so a malformed/stuck envelope
+            // can't page forever.
+            if items.is_empty() {
+                break;
+            }
+            all.append(&mut items);
+            if !has_more {
+                break;
+            }
+        }
+        all
     }
 
     /// `bn types show <name>` -> the rendered layout (struct fields + offsets).
@@ -590,9 +627,7 @@ impl Bn {
     /// Validate a C declaration without committing (`types declare --preview`):
     /// the resulting type layouts, or the parser error.
     pub fn type_declare_check(&self, decl: &str) -> TypeCheck {
-        let out = self.run_out(&[
-            "types", "declare", "--preview", "--format", "json", decl,
-        ]);
+        let out = self.run_out(&["types", "declare", "--preview", "--format", "json", decl]);
         match serde_json::from_str::<PreviewPayload>(out.trim()) {
             Ok(payload) if payload.ok => TypeCheck::Ok(
                 payload
@@ -922,7 +957,36 @@ pub fn newest_live(bin: &str, exclude: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_local_list_json, push_mark, CommentListJson, TagListJson};
+    use super::{parse_local_list_json, parse_types_page, push_mark, CommentListJson, TagListJson};
+
+    #[test]
+    fn types_page_recovers_union_kind_from_decl() {
+        // bn reports actual unions as kind:"struct"; only `decl` disambiguates.
+        let json = r#"{"items":[
+            {"name":"__BLOB_ARG","kind":"struct","decl":"union __BLOB_ARG"},
+            {"name":"widget","kind":"struct","decl":"struct widget"},
+            {"name":"color","kind":"enum","decl":"enum color"},
+            {"name":"unionizer_t","kind":"named_type_ref","decl":"typedef struct widget unionizer_t"}
+        ],"has_more":false,"total":4,"returned":4}"#;
+        let (items, has_more) = parse_types_page(json);
+        assert!(!has_more);
+        let kinds: Vec<&str> = items.iter().map(|i| i.kind.as_str()).collect();
+        assert_eq!(kinds, ["union", "struct", "enum", "named_type_ref"]);
+        assert_eq!(items[0].name, "__BLOB_ARG");
+    }
+
+    #[test]
+    fn types_page_reports_more_pages_and_survives_garbage() {
+        let json = r#"{"items":[{"name":"widget","kind":"struct","decl":"struct widget"}],
+                       "has_more":true,"total":9001,"returned":1}"#;
+        let (items, has_more) = parse_types_page(json);
+        assert_eq!(items.len(), 1);
+        assert!(has_more, "has_more must surface so the caller keeps paging");
+
+        let (items, has_more) = parse_types_page("not json at all");
+        assert!(items.is_empty());
+        assert!(!has_more, "a malformed page must not page forever");
+    }
 
     #[test]
     fn mark_json_survives_null_function_and_address() {
