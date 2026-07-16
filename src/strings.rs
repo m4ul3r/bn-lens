@@ -3,6 +3,7 @@
 //! the viewer), so it doubles as a "where is this text used?" entry point.
 
 use crate::ctx::Ctx;
+use crate::decomp::{addr_lines, lines_at};
 use crate::picker::Action;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
@@ -96,51 +97,6 @@ fn parse_xrefs(text: &str) -> (Vec<(String, Vec<String>)>, Vec<String>) {
     (code, data)
 }
 
-/// Parse `bn decompile --addresses` into (address, pseudo-C) pairs. Each line
-/// begins with an 8-hex address column; lines without one (blank separators) are
-/// skipped. The code text is trimmed of its indentation for compact display.
-fn addr_lines(text: &str) -> Vec<(u64, String)> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        if line.len() < 9 {
-            continue;
-        }
-        let (head, rest) = line.split_at(8);
-        if !head.chars().all(|c| c.is_ascii_hexdigit()) {
-            continue;
-        }
-        let Ok(addr) = u64::from_str_radix(head, 16) else {
-            continue;
-        };
-        let code = rest.trim();
-        if !code.is_empty() {
-            out.push((addr, code.to_string()));
-        }
-    }
-    out
-}
-
-/// The pseudo-C statement at `site`: lines whose address matches exactly, else
-/// the statement whose address is the greatest at/below `site` (the instruction
-/// falls inside it). Empty when nothing is at/below `site`.
-fn lines_at(dec: &[(u64, String)], site: u64) -> Vec<&str> {
-    let exact: Vec<&str> = dec
-        .iter()
-        .filter(|(a, _)| *a == site)
-        .map(|(_, t)| t.as_str())
-        .collect();
-    if !exact.is_empty() {
-        return exact;
-    }
-    let Some(best) = dec.iter().map(|(a, _)| *a).filter(|a| *a <= site).max() else {
-        return Vec::new();
-    };
-    dec.iter()
-        .filter(|(a, _)| *a == best)
-        .map(|(_, t)| t.as_str())
-        .collect()
-}
-
 /// The instruction line at `addr` (first non-comment line of a 1-instruction
 /// linear disasm), trimmed; falls back to the bare address on any miss.
 fn disasm_line(ctx: &Ctx, addr: &str) -> String {
@@ -177,26 +133,6 @@ data refs:
         assert_eq!(code[1].1.len(), 3);
         assert_eq!(code[1].1[2], "0x4102b4");
         assert_eq!(data, vec!["0x4152a0  .data  ptr_table".to_string()]);
-    }
-
-    #[test]
-    fn maps_callsite_to_pseudo_c_statement() {
-        use super::{addr_lines, lines_at};
-        let dec = "\
-0040428c        void* sub_40428c(void* arg1)
-004042bc            size_t x0_1 = strlen(arg4);
-00404304            /* tailcall */
-00404304            return memcpy(result, arg4, x19);
-";
-        let mapped = addr_lines(dec);
-        // exact match returns both lines sharing the address
-        let exact = lines_at(&mapped, 0x404304);
-        assert_eq!(exact, vec!["/* tailcall */", "return memcpy(result, arg4, x19);"]);
-        // an address inside a statement snaps to the greatest addr at/below it
-        let inside = lines_at(&mapped, 0x4042c0);
-        assert_eq!(inside, vec!["size_t x0_1 = strlen(arg4);"]);
-        // below everything → nothing
-        assert!(lines_at(&mapped, 0x400000).is_empty());
     }
 
     #[test]

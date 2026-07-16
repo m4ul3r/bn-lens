@@ -92,6 +92,14 @@ rendered uses, `Enter` jumps to the first use, and `r` reuses local rename. At 1
 side panel beside the code; narrower terminals get a centered modal. Slot span is labeled separately
 from type size because recovered spacing can include alignment/padding.
 
+**Decomp peek** — `p` on a **code** hotspot (a function name, or a `0x…` in an executable section —
+notably a callsite line on the xrefs page) opens a scrollable pseudo-C popup of the containing
+function, centered on and highlighting the statement at that address. It decompiles via
+`bn decompile <addr> --addresses --format json` (bn resolves an interior address to its function and
+returns the name); `decomp.rs` maps the use address to its statement (exact, else nearest at/below) and
+normalizes the address-column indentation. Data hotspots still peek as a symbolized byte dump. This is
+the same address→pseudo-C mapping the Strings usage popup uses.
+
 **Views** — `i`/`I` cycle the current function through **decompile → MLIL → disassembly** (forward /
 back; `bn decompile` / `bn il --view mlil` / `bn disasm`). The three code views + the xrefs view are a
 single `View` enum; decompile uses the pseudo-C tokenizer, the rest the plain one, and hotspots build

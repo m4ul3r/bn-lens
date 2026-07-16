@@ -121,6 +121,22 @@ struct LocalListJson {
     locals: Vec<LocalVariable>,
 }
 
+/// A function reference as bn emits it in JSON; we only need the resolved name.
+#[derive(Deserialize, Default)]
+struct FnRef {
+    #[serde(default)]
+    name: String,
+}
+
+/// The subset of `bn decompile --format json` we consume.
+#[derive(Deserialize)]
+struct DecompiledFn {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    function: FnRef,
+}
+
 /// A `--summary` mutation payload reports `"success": true` when the write
 /// applied and verified. Both spacings appear depending on formatter.
 fn mutation_ok(out: &str) -> bool {
@@ -272,6 +288,20 @@ impl Bn {
     /// address back to the statement it belongs to.
     pub fn decompile_addr(&self, name: &str) -> String {
         self.run_out(&["decompile", name, "--addresses"])
+    }
+
+    /// Decompile `id` — a function name or any *interior* address (bn resolves
+    /// it to the containing function) — as JSON, returning
+    /// `(function name, address-prefixed text)`. The JSON gives us the resolved
+    /// name directly instead of scraping the text header.
+    pub fn decompile_json(&self, id: &str) -> Option<(String, String)> {
+        let out = self.run_out(&["decompile", id, "--addresses", "--format", "json"]);
+        let parsed: DecompiledFn = serde_json::from_str(&out).ok()?;
+        if parsed.text.is_empty() {
+            None
+        } else {
+            Some((parsed.function.name, parsed.text))
+        }
     }
 
     /// IL dump at a given level (`hlil`/`mlil`/`llil`), via `--out`.

@@ -227,21 +227,27 @@ impl Viewer {
 
     /// `p`: peek the selected span, else the first resolvable symbol or
     /// 0x-address on the cursor line (so internal globals + literals are peekable).
+    ///
+    /// Code hotspots (a function name, or a `0x…` in an executable section — e.g.
+    /// a callsite on the xrefs page) peek as **pseudo-C**: the containing
+    /// function's decompile, centered on the use. Data peeks as a byte dump.
     pub(super) fn peek_on_line(&mut self, ctx: &Ctx) {
         if let Some(index) = self.cur_span() {
-            match self.spans[index].kind {
-                HotKind::Local => {
-                    self.show_local(index);
-                    return;
+            let kind = self.spans[index].kind;
+            let target = self.spans[index].target.clone();
+            let code = self.spans[index].code;
+            match kind {
+                HotKind::Local => self.show_local(index),
+                HotKind::Str => self.peek_string(ctx, index),
+                HotKind::Func => {
+                    self.peek_code(ctx, &target, None, &format!("decomp · {target}"))
                 }
-                HotKind::Str => {
-                    self.peek_string(ctx, index);
-                    return;
+                HotKind::Addr if code => {
+                    let focus = crate::ctx::parse_hex(&target);
+                    self.peek_code(ctx, &target, focus, &format!("decomp @ {target}"));
                 }
-                _ => {}
+                HotKind::Addr | HotKind::Data => self.peek(ctx, &target),
             }
-            let symbol = self.spans[index].target.clone();
-            self.peek(ctx, &symbol);
             return;
         }
         let tokens: Vec<String> = self.lines[self.cline]
@@ -269,6 +275,50 @@ impl Viewer {
             title: format!("peek {symbol} @ {address}"),
             lines: symbolize_dump(&dump, &ctx.name_by_addr),
             off: 0,
+            focus: None,
+        };
+    }
+
+    /// Peek the decompilation of a code hotspot: decompile the containing
+    /// function (JSON, so bn resolves an interior address and hands back the
+    /// name), then open a scrollable pseudo-C popup — marking and centering the
+    /// statement at `focus` when given. Powers `p` on a function or a code
+    /// address (e.g. a callsite on the xrefs page), so a code ref reads as
+    /// pseudo-C rather than raw bytes.
+    fn peek_code(&mut self, ctx: &Ctx, identifier: &str, focus: Option<u64>, fallback: &str) {
+        let Some((name, text)) = ctx.bn.decompile_json(identifier) else {
+            self.status = format!(" ✗ no decompile for {identifier}");
+            return;
+        };
+        let dec = crate::decomp::dec_lines(&text);
+        if dec.is_empty() {
+            self.status = format!(" ✗ no decompile for {identifier}");
+            return;
+        }
+        let addrs = crate::decomp::line_addrs(&dec);
+        let focus_addr = focus.and_then(|site| crate::decomp::resolve_stmt_addr(&addrs, site));
+        let mut lines = Vec::with_capacity(dec.len());
+        let mut first_hit = None;
+        for (index, line) in dec.iter().enumerate() {
+            let hit = focus_addr.is_some() && line.addr == focus_addr;
+            if hit && first_hit.is_none() {
+                first_hit = Some(index);
+            }
+            let marker = if hit { "▸ " } else { "  " };
+            lines.push(format!("{marker}{}", line.text));
+        }
+        // Center the focused statement with a few lines of lead-in context.
+        let off = first_hit.map_or(0, |index| index.saturating_sub(4));
+        let title = if name.is_empty() {
+            fallback.to_string()
+        } else {
+            format!("decomp · {name}")
+        };
+        self.popup = Popup::Peek {
+            title,
+            lines,
+            off,
+            focus: first_hit,
         };
     }
 

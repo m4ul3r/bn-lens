@@ -95,7 +95,7 @@ most useful keys for the current mode.
 | `j`/`k` `^D`/`^U` `G` | move the line cursor |
 | `Tab` / `Shift-Tab` | step through **hotspots** — functions (blue), data (cyan), addresses (yellow), strings (magenta), locals (gray) |
 | `g` / `Enter` | act on the hotspot: goto a function/code address, peek data, show a local's type |
-| `p` | peek bytes (symbolizes pointers; strings resolve to their `.rodata` address) |
+| `p` | peek — a **code** hotspot (function name, or a `0x…` in an executable section, e.g. a callsite on the xrefs page) shows the **decompile** centered on the use; **data** shows the byte dump (pointers symbolized) |
 | `x` | xrefs of the hotspot (`Enter` on a caller lands on the *use*) |
 | `r` | rename (live) — the selected **local**, a selected **function** hotspot, or the function in view; persist with `bn save` |
 | `;` | comment (live) — an address (disasm/hotspot) or the function's doc comment |

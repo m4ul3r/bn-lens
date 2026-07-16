@@ -245,6 +245,7 @@ impl Viewer {
                     title: "sections  ·  r-x=exec  rw-=data  w+x flagged".into(),
                     lines: ctx.bn.sections(),
                     off: 0,
+                    focus: None,
                 };
             }
             KeyCode::Char('S') => self.open_stack_view(),

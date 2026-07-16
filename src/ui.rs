@@ -14,6 +14,10 @@ pub const BAR_BG: Color = Color::Rgb(38, 44, 66);
 pub const POPUP_BG: Color = Color::Rgb(48, 55, 82);
 pub const POPUP_FG: Color = Color::Rgb(216, 221, 233);
 
+/// Selection/focus bar background inside a popup (an accent blue that reads on
+/// the panel) — e.g. the focused statement of a decomp peek.
+pub const HILITE_BG: Color = Color::Rgb(58, 78, 130);
+
 /// The shared header "breadcrumbs": tool · `-i instance` · `-t target` · arch.
 /// The `-i`/`-t` are shown verbatim so an agent reading the pane can copy them
 /// into `bn -i <> -t <>`; the target selector also carries the binary name.

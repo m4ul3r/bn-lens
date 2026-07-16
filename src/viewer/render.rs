@@ -335,21 +335,36 @@ impl Viewer {
                     Style::default().add_modifier(Modifier::DIM),
                 );
             }
-            Popup::Peek { title, lines, off } => {
+            Popup::Peek {
+                title,
+                lines,
+                off,
+                focus,
+            } => {
                 let box_width = (area.width.saturating_sub(6)).clamp(50, 90);
                 let box_height = (area.height.saturating_sub(4)).clamp(8, 22);
                 let box_x = area.x + (area.width.saturating_sub(box_width)) / 2;
                 let box_y = area.y + (area.height.saturating_sub(box_height)) / 2;
                 crate::ui::draw_box(buffer, box_x, box_y, box_width, box_height, title);
                 let view_height = (box_height - 3) as usize;
-                for (index, line) in lines.iter().skip(*off).take(view_height).enumerate() {
-                    buffer.set_stringn(
-                        box_x + 2,
-                        box_y + 1 + index as u16,
-                        line,
-                        (box_width - 4) as usize,
-                        Style::default().fg(Color::Yellow),
-                    );
+                let inner = (box_width - 4) as usize;
+                for (row, line) in lines.iter().skip(*off).take(view_height).enumerate() {
+                    let focused = *focus == Some(*off + row);
+                    let style = if focused {
+                        // A highlight bar across the full inner width for the
+                        // focused statement (a decomp peek's use site).
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(crate::ui::HILITE_BG)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    };
+                    let y = box_y + 1 + row as u16;
+                    if focused {
+                        buffer.set_stringn(box_x + 2, y, " ".repeat(inner), inner, style);
+                    }
+                    buffer.set_stringn(box_x + 2, y, line, inner, style);
                 }
                 buffer.set_stringn(
                     box_x + 2,

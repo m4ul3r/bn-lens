@@ -103,6 +103,9 @@ enum Popup {
         title: String,
         lines: Vec<String>,
         off: usize,
+        /// Absolute index of a line to highlight (the focused statement of a
+        /// decomp peek); `None` for plain scrollable peeks (byte dumps, sections).
+        focus: Option<usize>,
     },
     Rename {
         old: String,

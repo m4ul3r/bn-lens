@@ -207,8 +207,13 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "p / x",
-        action: "peek / show xrefs",
+        key: "p",
+        action: "peek — code→decompile, data→bytes",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "x",
+        action: "show xrefs",
     },
     HelpLine::Entry {
         scope: "VIEWER",
