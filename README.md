@@ -63,11 +63,12 @@ pane and open **bn lens beside it** (`alt+d`).
 The picker's **`recent`** section keeps a live list of what you opened (`▸`) and what the agent
 referenced in its pane (`◆`) — a shared map of where you both are.
 
-The list pane has three views, switched from the **`bn lens` menu** (`m`, or click the title):
-**Symbols** (functions + data — the default), **Strings** (every recovered string), and **Imports**
-(the attack surface — imported symbols with dangerous **sinks flagged** in red, `f` for sinks-only). In
-Strings and Imports, **`p`** peeks where the selected entry is used — the **pseudo-C statement** at each
-callsite, grouped by function; `Enter`/`x` opens the full xrefs listing.
+The list pane has four views, switched from the **`bn lens` menu** (`m`, or click the title):
+**Symbols** (functions + data — the default), **Strings** (every recovered string), **Imports** (the
+attack surface — imported symbols with dangerous **sinks flagged** in red, `f` for sinks-only), and
+**Marks** (your comments + tags/bookmarks; `Enter` jumps to the annotated function — the read half of
+the shared map). In Strings and Imports, **`p`** peeks where the selected entry is used — the
+**pseudo-C statement** at each callsite, grouped by function; `Enter`/`x` opens the full xrefs listing.
 
 ## Keyboard shortcuts
 

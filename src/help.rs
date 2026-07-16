@@ -12,6 +12,7 @@ pub enum HelpContext {
     Picker,
     Strings,
     Imports,
+    Marks,
     Viewer,
     Stack,
     Switcher,
@@ -23,6 +24,7 @@ impl HelpContext {
             Self::Picker => "picker",
             Self::Strings => "strings",
             Self::Imports => "imports",
+            Self::Marks => "marks",
             Self::Viewer => "viewer",
             Self::Stack => "stack view",
             Self::Switcher => "switch bn",
@@ -34,6 +36,7 @@ impl HelpContext {
             Self::Picker => "PICKER",
             Self::Strings => "STRINGS",
             Self::Imports => "IMPORTS",
+            Self::Marks => "MARKS",
             Self::Viewer => "VIEWER",
             Self::Stack => "STACK VIEW",
             Self::Switcher => "SWITCH BN",
@@ -45,6 +48,7 @@ impl HelpContext {
             Self::Picker => scope.starts_with("PICKER") || scope == "LIST",
             Self::Strings => scope == "STRINGS" || scope == "LIST",
             Self::Imports => scope == "IMPORTS" || scope == "LIST",
+            Self::Marks => scope == "MARKS" || scope == "LIST",
             Self::Viewer => {
                 scope.starts_with("VIEWER") || scope == "VISUAL" || scope == "STACK VIEW"
             }
@@ -208,6 +212,22 @@ const LINES: &[HelpLine] = &[
         scope: "IMPORTS",
         key: "Enter / x",
         action: "cross-reference the import (callers)",
+    },
+    HelpLine::Section("MARKS"),
+    HelpLine::Entry {
+        scope: "MARKS",
+        key: "j/k  ^D/^U  gg/G",
+        action: "move / page / ends",
+    },
+    HelpLine::Entry {
+        scope: "MARKS",
+        key: "/",
+        action: "filter by text / address / type / function",
+    },
+    HelpLine::Entry {
+        scope: "MARKS",
+        key: "Enter / x",
+        action: "open the annotated function / its xrefs",
     },
     HelpLine::Section("VIEWER"),
     HelpLine::Entry {

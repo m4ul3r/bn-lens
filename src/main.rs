@@ -10,6 +10,7 @@ mod help;
 mod herdr;
 mod imports;
 mod launch;
+mod marks;
 mod menu;
 mod picker;
 mod strings;

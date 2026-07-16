@@ -29,6 +29,7 @@ the code is split into small typed modules with unit tests.
 | `picker.rs` | the **Symbols** list (functions + data): filter, vim nav, colours, mouse |
 | `strings.rs` | the **Strings** list: recovered text, filter, `Enter`/`x` to xref its uses |
 | `imports.rs` | the **Imports** list (attack surface): dangerous-sink flagging, `f` sinks-only, `p` callers |
+| `marks.rs` | the **Marks** list: comments + tags/bookmarks merged, `Enter` jumps to the annotated function |
 | `usage.rs` | shared "where is this used?" report (xref + per-callsite pseudo-C) for Strings/Imports `p` |
 | `viewer.rs` | code-viewer state model and load lifecycle |
 | `viewer/actions.rs` | navigation and data-backed actions: goto/peek/xrefs/rename/comment/tag |
@@ -60,8 +61,16 @@ the top, `f` toggles a sinks-only filter, and `p` peeks **callers** (the `usage.
 at each callsite), `Enter`/`x` opens the full xrefs. This is the vuln-researcher's entry point: filter
 to `memcpy`, `p`, read every call in context.
 
-**Views + the title menu** — the list pane has three top-level views: **Symbols** (functions + data, the
-default `picker.rs`), **Strings** (`strings.rs`, recovered text), and **Imports** (`imports.rs`, above).
+**Marks (annotations)** — `marks.rs`, reached from the menu, is the read half of the "shared map":
+every comment (`;`) and tag/bookmark (`t`) — plus BN's own analysis tags — merged from `bn comment
+list`/`bn tag list` JSON into one navigable list, your own marks (comments, then Bookmarks) sorted to
+the top. `Enter` jumps to the annotated function; `x` its xrefs. Rebuilt on each open (unlike the
+static lists) since annotations change as you add them. Completes the annotate→navigate loop with the
+`;`/`t` write paths.
+
+**Views + the title menu** — the list pane has four top-level views: **Symbols** (functions + data, the
+default `picker.rs`), **Strings** (`strings.rs`, recovered text), **Imports** (`imports.rs`), and
+**Marks** (`marks.rs`), all above.
 In Strings and Imports, `p` peeks a **usage popup** (`usage.rs`) — it parses `bn xrefs` on the selected
 address, decompiles each referencing function once (`--addresses`), and shows the **pseudo-C statement**
 at each callsite (grouped by function; falling back to the disassembled instruction when a site maps to

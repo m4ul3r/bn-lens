@@ -137,6 +137,50 @@ struct DecompiledFn {
     function: FnRef,
 }
 
+/// One annotation for the Marks view — a comment or a tag, unified.
+#[derive(Clone)]
+pub struct Mark {
+    pub addr: String,
+    /// `comment`, or the tag type (`Bookmarks`, `Important`, …).
+    pub kind: String,
+    pub text: String,
+    pub func: String,
+}
+
+#[derive(Deserialize)]
+struct TagListJson {
+    #[serde(default)]
+    items: Vec<TagItemJson>,
+}
+
+#[derive(Deserialize)]
+struct TagItemJson {
+    #[serde(default)]
+    address: String,
+    #[serde(default, rename = "type")]
+    type_name: String,
+    #[serde(default)]
+    data: String,
+    #[serde(default)]
+    function: String,
+}
+
+#[derive(Deserialize)]
+struct CommentListJson {
+    #[serde(default)]
+    items: Vec<CommentItemJson>,
+}
+
+#[derive(Deserialize)]
+struct CommentItemJson {
+    #[serde(default)]
+    address: String,
+    #[serde(default)]
+    comment: String,
+    #[serde(default)]
+    function: String,
+}
+
 /// A unique temp path for a `--out` capture (`bn-lens-<pid>-<seq>.out`), so
 /// concurrent/sequential captures never share a file (see [`Bn::run_out`]).
 fn unique_tmp() -> String {
@@ -279,6 +323,44 @@ impl Bn {
             .lines()
             .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
             .collect()
+    }
+
+    /// Every annotation — comments + tags — merged for the Marks view. Both come
+    /// from `bn`'s JSON so we get the containing function and (for tags) the type
+    /// without scraping text.
+    pub fn marks(&self) -> Vec<Mark> {
+        let mut marks = Vec::new();
+        let comments = self.run_out(&["comment", "list", "--format", "json"]);
+        if let Ok(list) = serde_json::from_str::<CommentListJson>(&comments) {
+            for c in list.items {
+                if !c.address.is_empty() {
+                    marks.push(Mark {
+                        addr: c.address,
+                        kind: "comment".into(),
+                        text: c.comment,
+                        func: c.function,
+                    });
+                }
+            }
+        }
+        let tags = self.run_out(&["tag", "list", "--format", "json"]);
+        if let Ok(list) = serde_json::from_str::<TagListJson>(&tags) {
+            for t in list.items {
+                if !t.address.is_empty() {
+                    marks.push(Mark {
+                        addr: t.address,
+                        kind: if t.type_name.is_empty() {
+                            "tag".into()
+                        } else {
+                            t.type_name
+                        },
+                        text: t.data,
+                        func: t.function,
+                    });
+                }
+            }
+        }
+        marks
     }
 
     /// `bn imports` -> [(addr, name)] for the Imports/attack-surface view.

@@ -5,6 +5,7 @@
 use crate::ctx::Ctx;
 use crate::help::{Help, HelpContext};
 use crate::imports::ImportsList;
+use crate::marks::MarksList;
 use crate::menu::{Choice, Menu};
 use crate::picker::{Action, Picker};
 use crate::strings::StringsList;
@@ -38,6 +39,7 @@ enum AppView {
     Symbols,
     Strings,
     Imports,
+    Marks,
 }
 
 struct App {
@@ -46,6 +48,7 @@ struct App {
     picker: Picker,
     strings: Option<StringsList>, // built lazily on first switch to Strings
     imports: Option<ImportsList>, // built lazily on first switch to Imports
+    marks: Option<MarksList>,     // built lazily on first switch to Marks
     menu: Menu,
     viewer: Option<Viewer>,
     switcher: Option<Switcher>,
@@ -71,6 +74,7 @@ impl App {
             picker,
             strings: None,
             imports: None,
+            marks: None,
             menu: Menu::default(),
             viewer: None,
             switcher: None,
@@ -107,6 +111,7 @@ impl App {
             self.picker = Picker::new(&self.ctx);
             self.strings = None;
             self.imports = None;
+            self.marks = None;
             self.view = AppView::Symbols;
             self.viewer = None;
         }
@@ -118,6 +123,7 @@ impl App {
             AppView::Symbols => Choice::Symbols,
             AppView::Strings => Choice::Strings,
             AppView::Imports => Choice::Imports,
+            AppView::Marks => Choice::Marks,
         }
     }
 
@@ -140,6 +146,13 @@ impl App {
                     self.imports = Some(ImportsList::new(&self.ctx));
                 }
                 self.view = AppView::Imports;
+                self.viewer = None;
+            }
+            Choice::Marks => {
+                // Rebuild every time: unlike the static Symbols/Strings/Imports
+                // lists, annotations change as you add them with `;`/`t`.
+                self.marks = Some(MarksList::new(&self.ctx));
+                self.view = AppView::Marks;
                 self.viewer = None;
             }
             Choice::Refresh => self.start_refresh(),
@@ -216,6 +229,9 @@ impl App {
                 }
                 if let Some(imports) = &mut self.imports {
                     imports.refresh(&self.ctx);
+                }
+                if let Some(marks) = &mut self.marks {
+                    marks.refresh(&self.ctx);
                 }
                 if let Some(viewer) = &mut self.viewer {
                     viewer.reload(&self.ctx);
@@ -325,6 +341,7 @@ impl App {
             AppView::Symbols => self.picker.is_searching(),
             AppView::Strings => self.strings.as_ref().is_some_and(StringsList::is_searching),
             AppView::Imports => self.imports.as_ref().is_some_and(ImportsList::is_searching),
+            AppView::Marks => self.marks.as_ref().is_some_and(MarksList::is_searching),
         }
     }
 
@@ -338,6 +355,7 @@ impl App {
             AppView::Symbols => self.picker.popup_open(),
             AppView::Strings => self.strings.as_ref().is_some_and(StringsList::popup_open),
             AppView::Imports => self.imports.as_ref().is_some_and(ImportsList::popup_open),
+            AppView::Marks => self.marks.as_ref().is_some_and(MarksList::popup_open),
         }
     }
 
@@ -421,6 +439,7 @@ impl App {
                         .imports
                         .as_mut()
                         .map_or(Action::None, |s| s.on_key(k, &self.ctx)),
+                    AppView::Marks => self.marks.as_mut().map_or(Action::None, |s| s.on_key(k)),
                 };
                 self.open_action(action)
             }
@@ -469,6 +488,11 @@ impl App {
                         s.on_mouse(m, self.area);
                     }
                 }
+                AppView::Marks => {
+                    if let Some(s) = &mut self.marks {
+                        s.on_mouse(m, self.area);
+                    }
+                }
             },
         }
         false
@@ -488,6 +512,7 @@ impl App {
                 AppView::Symbols => HelpContext::Picker,
                 AppView::Strings => HelpContext::Strings,
                 AppView::Imports => HelpContext::Imports,
+                AppView::Marks => HelpContext::Marks,
             }
         }
     }
@@ -534,6 +559,11 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
                     }
                     AppView::Imports => {
                         if let Some(s) = &mut app.imports {
+                            s.render(app.area, f.buffer_mut(), &app.ctx);
+                        }
+                    }
+                    AppView::Marks => {
+                        if let Some(s) = &mut app.marks {
                             s.render(app.area, f.buffer_mut(), &app.ctx);
                         }
                     }
