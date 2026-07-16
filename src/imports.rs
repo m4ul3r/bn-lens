@@ -13,28 +13,39 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
 /// Classify an import as a known-dangerous sink/source, returning a short
-/// category label (else `None`). Normalizes fortified (`__*_chk`) and
-/// underscore-prefixed variants, and catches obvious wrappers by substring on
-/// high-signal tokens (so `tsk_sys_System`/`my_strcpy` still flag).
+/// category label (else `None`). Normalizes fortified (`__*_chk`), the glibc
+/// `__isoc99_` scanf prefix, and underscore prefixes, then matches unambiguous
+/// sink words at underscore-segment boundaries so wrappers like `tsk_sys_System`
+/// / `my_strcpy` flag while `__system_property_get` / `filesystem` do not.
 pub fn sink_category(name: &str) -> Option<&'static str> {
     let base = name.trim_start_matches('_');
     let base = base.strip_suffix("_chk").unwrap_or(base);
-    let lower = base.to_ascii_lowercase();
+    let mut lower = base.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("isoc99_") {
+        lower = rest.to_string(); // __isoc99_sscanf → sscanf
+    }
 
-    // (token, category) — exact match on the normalized name.
+    // (token, category) — exact match on the fully-normalized name.
     const EXACT: &[(&str, &str)] = &[
         ("memcpy", "buffer"),
+        ("mempcpy", "buffer"),
         ("memmove", "buffer"),
         ("strcpy", "buffer"),
         ("strcat", "buffer"),
         ("stpcpy", "buffer"),
+        ("stpncpy", "buffer"),
         ("strncpy", "buffer"),
         ("strncat", "buffer"),
         ("bcopy", "buffer"),
         ("sprintf", "buffer"),
         ("vsprintf", "buffer"),
         ("gets", "buffer"),
+        ("alloca", "buffer"),
         ("wcscpy", "buffer"),
+        ("wcsncpy", "buffer"),
+        ("wcscat", "buffer"),
+        ("wcsncat", "buffer"),
+        ("wmemcpy", "buffer"),
         ("system", "command"),
         ("popen", "command"),
         ("execl", "command"),
@@ -52,9 +63,14 @@ pub fn sink_category(name: &str) -> Option<&'static str> {
         ("vsnprintf", "format"),
         ("dprintf", "format"),
         ("syslog", "format"),
+        ("swprintf", "format"),
+        ("vswprintf", "format"),
         ("scanf", "source"),
         ("sscanf", "source"),
         ("fscanf", "source"),
+        ("vscanf", "source"),
+        ("vsscanf", "source"),
+        ("vfscanf", "source"),
         ("read", "source"),
         ("recv", "source"),
         ("recvfrom", "source"),
@@ -64,22 +80,41 @@ pub fn sink_category(name: &str) -> Option<&'static str> {
     if let Some((_, cat)) = EXACT.iter().find(|(tok, _)| *tok == lower) {
         return Some(cat);
     }
-    // Wrapper substrings unlikely to appear inside unrelated identifiers.
-    const SUB: &[(&str, &str)] = &[
+
+    // Wrapper detection at segment boundaries. These tokens never occur as a
+    // substring of an unrelated identifier, so any underscore-segment match is a
+    // real wrapper (`my_strcpy`, `bsp_MemCpy`). `system` is excluded here — it
+    // *does* prefix benign names (`system_property_get`) — and handled below.
+    const SEG: &[(&str, &str)] = &[
         ("strcpy", "buffer"),
+        ("strncpy", "buffer"),
         ("strcat", "buffer"),
+        ("strncat", "buffer"),
         ("sprintf", "buffer"),
         ("memcpy", "buffer"),
+        ("mempcpy", "buffer"),
         ("memmove", "buffer"),
-        ("system", "command"),
         ("popen", "command"),
-        ("execve", "command"),
-        ("execvp", "command"),
+        ("execl", "command"),
         ("execlp", "command"),
+        ("execle", "command"),
+        ("execv", "command"),
+        ("execvp", "command"),
+        ("execvpe", "command"),
+        ("execve", "command"),
     ];
-    SUB.iter()
-        .find(|(tok, _)| lower.contains(tok))
-        .map(|(_, cat)| *cat)
+    let segs: Vec<&str> = lower.split('_').collect();
+    for seg in &segs {
+        if let Some((_, cat)) = SEG.iter().find(|(tok, _)| tok == seg) {
+            return Some(cat);
+        }
+    }
+    // `system` only as the *trailing* segment (`tsk_sys_System`) — so a name
+    // that merely starts with or contains "system" as a prefix does not flag.
+    if segs.last() == Some(&"system") {
+        return Some("command");
+    }
+    None
 }
 
 /// A "high severity" category renders red; the rest yellow.
@@ -154,6 +189,10 @@ impl ImportsList {
             .max()
             .unwrap_or(10)
             .max(10);
+        // Keep the cursor valid if the rebuilt list shrank (else render can skip
+        // past every row and blank the list until the next keypress).
+        self.sel = self.sel.min(self.filtered().len().saturating_sub(1));
+        self.top = self.top.min(self.sel);
     }
 
     /// Sinks first (by category severity), then the rest — both by address —
@@ -524,16 +563,34 @@ mod tests {
     }
 
     #[test]
-    fn catches_wrappers_by_substring() {
+    fn normalizes_glibc_isoc99_and_extra_families() {
+        // glibc scanf sources import as __isoc99_*
+        assert_eq!(sink_category("__isoc99_sscanf"), Some("source"));
+        assert_eq!(sink_category("__isoc99_scanf"), Some("source"));
+        // previously-missed families
+        assert_eq!(sink_category("mempcpy"), Some("buffer"));
+        assert_eq!(sink_category("__mempcpy_chk"), Some("buffer"));
+        assert_eq!(sink_category("wcsncpy"), Some("buffer"));
+        assert_eq!(sink_category("alloca"), Some("buffer"));
+        assert_eq!(sink_category("vsscanf"), Some("source"));
+    }
+
+    #[test]
+    fn catches_wrappers_at_segment_boundaries() {
         assert_eq!(sink_category("tsk_sys_System"), Some("command"));
         assert_eq!(sink_category("my_strcpy_safe"), Some("buffer"));
+        assert_eq!(sink_category("bsp_MemCpy"), Some("buffer"));
     }
 
     #[test]
     fn leaves_benign_imports_unflagged() {
         assert_eq!(sink_category("malloc"), None);
-        assert_eq!(sink_category("targets"), None); // not a substring false-positive
+        assert_eq!(sink_category("targets"), None);
         assert_eq!(sink_category("SysDbClientOpen"), None);
         assert_eq!(sink_category("pthread_mutex_lock"), None);
+        // the `system` false-positives the review caught
+        assert_eq!(sink_category("__system_property_get"), None);
+        assert_eq!(sink_category("filesystem"), None);
+        assert_eq!(sink_category("get_system_info"), None);
     }
 }

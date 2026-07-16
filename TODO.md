@@ -76,6 +76,13 @@ names (`__isoc99_sscanf` → normalize `__isoc99_` too). Keep the substring set 
 - **Decomp peek** (`p` on a code hotspot → pseudo-C at the use) + Strings/Imports usage popups.
 - Popup rendering: opaque panels, vertical clip (no short-pane panic), highlight bar.
 
+## Threaded usage popup (`p`) — minor UX
+
+`p` in Strings/Imports runs `usage::report` synchronously — up to `MAX_FUNCS` (6) `bn decompile` calls
+(~1–2 s worst case), a silent UI freeze with no banner. Acceptable/bounded and consistent across both
+views, but ideally it'd run off-thread with a spinner like `start_refresh` does. Deferred for
+consistency; revisit if the freeze feels bad in practice.
+
 ## Deferred / future
 
 - Add items here as they come up.

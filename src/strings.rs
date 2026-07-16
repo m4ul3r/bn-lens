@@ -85,6 +85,9 @@ impl StringsList {
             .max()
             .unwrap_or(10)
             .max(10);
+        // Keep the cursor valid if the rebuilt list shrank.
+        self.sel = self.sel.min(self.filtered().len().saturating_sub(1));
+        self.top = self.top.min(self.sel);
     }
 
     /// Deduped by address, sorted by address. bn emits the same content at
