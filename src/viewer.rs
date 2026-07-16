@@ -9,7 +9,7 @@ mod input;
 mod render;
 mod stack;
 
-use crate::bn::LocalVariable;
+use crate::bn::{CfgBlock, LocalVariable};
 use crate::ctx::Ctx;
 use crate::syntax::{self, Line};
 use hotspots::build_spans;
@@ -197,6 +197,11 @@ pub struct Viewer {
     cfg_index: std::collections::HashMap<u64, usize>,
     /// CFG view: whether the boxed graph layout is requested (Space toggles it).
     cfg_graph: bool,
+    /// CFG view: the fetched basic blocks for the named function, so layout
+    /// changes (graph↔list toggle, Enter-read, view cycling back to CFG) re-run
+    /// only the pure render instead of the external `bn cfg` query. Invalidated
+    /// by a reload (^R / rename) or a function change (the key is the name).
+    cfg_cache: Option<(String, Vec<CfgBlock>)>,
     /// CFG graph mode: the laid-out graph + selection, when a 2D graph is shown
     /// (None while in the CFG list fallback or any non-CFG view).
     cfg_graph_view: Option<CfgGraph>,
@@ -231,6 +236,7 @@ impl Viewer {
             screen_tgts: Vec::new(),
             cfg_index: std::collections::HashMap::new(),
             cfg_graph: true,
+            cfg_cache: None,
             cfg_graph_view: None,
             cfg_hit: Vec::new(),
             cfg_drag: None,
@@ -242,8 +248,10 @@ impl Viewer {
 
     /// Re-fetch the current view against a (possibly rebuilt) ctx — used after a
     /// function rename or a manual refresh so renamed symbols/callsites and any
-    /// new comments render. Keeps the cursor line; drops the transient selection.
+    /// new comments render. Keeps the cursor line; drops the transient selection
+    /// and the CFG block cache (the function may have changed under us).
     pub fn reload(&mut self, ctx: &Ctx) {
+        self.cfg_cache = None;
         self.load(ctx);
     }
 
@@ -300,11 +308,16 @@ impl Viewer {
         self.active = None;
     }
 
-    /// Build the CFG view: walk the function's basic blocks via `bn`, render them
-    /// (list or boxed graph) into display lines, and record the block-address →
-    /// line index so acting on an edge target jumps within the graph.
+    /// Build the CFG view: walk the function's basic blocks via `bn` (reusing
+    /// the cached fetch when it's for the same function — layout toggles and
+    /// re-entries must not re-spawn the external query), render them (list or
+    /// boxed graph) into display lines, and record the block-address → line
+    /// index so acting on an edge target jumps within the graph.
     fn load_cfg(&mut self, ctx: &Ctx) {
-        let blocks = ctx.bn.cfg(&self.name);
+        let blocks = match self.cfg_cache.take() {
+            Some((name, blocks)) if name == self.name => blocks,
+            _ => ctx.bn.cfg(&self.name),
+        };
         // Try the 2D graph first (when requested); fall back to the block list
         // only when there are too many blocks to lay out.
         if self.cfg_graph {
@@ -333,6 +346,7 @@ impl Viewer {
                 self.status = format!(
                     " cfg · {count} blocks · graph · hjkl move · PgUp/Dn scroll block · Enter read · Space list"
                 );
+                self.cfg_cache = Some((self.name.clone(), blocks));
                 return;
             }
         }
@@ -348,7 +362,7 @@ impl Viewer {
         self.active = None;
         self.status = if self.cfg_graph {
             format!(
-                " cfg · {} blocks · list (too many to graph) · v/i cycle",
+                " cfg · {} blocks · list (too many to graph) · Enter jump edge · v/i cycle",
                 rendered.block_count
             )
         } else {
@@ -357,6 +371,7 @@ impl Viewer {
                 rendered.block_count
             )
         };
+        self.cfg_cache = Some((self.name.clone(), blocks));
     }
 
     /// Move the CFG graph selection to the nearest box in `dir` (hjkl).

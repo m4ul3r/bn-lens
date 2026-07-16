@@ -514,17 +514,32 @@ fn barycenter_down(layers: &mut [Vec<usize>], nodes: &[LNode], adj_up: &[Vec<usi
     }
 }
 
-/// Build the compact 3-line content of a block's box.
+/// Build the compact 3-line content of a block's box. Successor edges that
+/// leave the function (a tail call, an unresolved target) can't be drawn as
+/// arrows, so they surface here as a `⇢ … ext` note on the summary line —
+/// control flow is annotated rather than silently dropped.
 fn box_content(labels: &HashMap<u64, String>, block: &Block, entry: Option<u64>) -> [String; 3] {
     let label = labels
         .get(&block.start)
         .cloned()
         .unwrap_or_else(|| "block".into());
     let n = block.inner.insns.len();
+    let ext: Vec<&str> = block
+        .inner
+        .edges
+        .iter()
+        .filter(|e| parse_hex(&e.to).is_none_or(|to| !labels.contains_key(&to)))
+        .map(|e| e.to.as_str())
+        .collect();
+    let ext_note = match ext.len() {
+        0 => String::new(),
+        1 => format!(" · ⇢ {} ext", ext[0]),
+        n => format!(" · ⇢ ext ×{n}"),
+    };
     let summary = if entry == Some(block.start) {
-        format!("entry · {n} insns")
+        format!("entry · {n} insns{ext_note}")
     } else {
-        format!("{n} insns")
+        format!("{n} insns{ext_note}")
     };
     [
         format!("{label}  {}", block.start_str()),
@@ -545,7 +560,9 @@ fn build_graph(
     let addr_idx: HashMap<u64, usize> = blocks.iter().enumerate().map(|(i, b)| (b.start, i)).collect();
     let entry_idx = entry.and_then(|a| addr_idx.get(&a).copied()).unwrap_or(0);
 
-    // In-function edges (u, v, word). External targets are dropped.
+    // In-function edges (u, v, word). External targets can't be routed (no box
+    // to land on) — they surface as a `⇢ … ext` note on the source box instead
+    // (see `box_content`).
     let mut edges: Vec<(usize, usize, String)> = Vec::new();
     for (u, b) in blocks.iter().enumerate() {
         for e in &b.inner.edges {
@@ -1056,8 +1073,15 @@ mod tests {
     #[test]
     fn graph_marks_the_loop_back_edge() {
         let g = graph(&diamond()).expect("lays out");
-        // The join→entry back-edge routes up a lane with a ◀ head.
-        assert!(as_text(&g).contains('◀'), "loop edge shown with a head");
+        // The join→entry back-edge routes up a lane with a ◀ head, and keeps its
+        // branch kind: the diamond's only back edge is a TrueBranch, so the head
+        // must be painted green — not the generic edge colour.
+        let head = g
+            .chars
+            .iter()
+            .position(|&c| c == '◀')
+            .expect("loop edge shown with a head");
+        assert_eq!(g.color[head], C_TRUE, "back edge keeps its branch colour");
     }
 
     #[test]
@@ -1100,6 +1124,55 @@ mod tests {
         assert!(graph(&[]).is_none());
     }
 
+    /// An edge whose target is outside the function (a tail call) can't be drawn
+    /// as an arrow, but must not vanish: the source box annotates it.
+    #[test]
+    fn graph_annotates_external_edges() {
+        let blocks = vec![
+            CfgBlock {
+                start: "0x3000".into(),
+                insns: vec![insn("0x3000", "cbz x0, 0x3010")],
+                edges: vec![edge("0x3010", "TrueBranch"), edge("0x9000", "FalseBranch")],
+            },
+            CfgBlock {
+                start: "0x3010".into(),
+                insns: vec![insn("0x3010", "ret")],
+                edges: vec![],
+            },
+        ];
+        let g = graph(&blocks).expect("lays out");
+        let text = as_text(&g);
+        assert!(
+            text.contains("⇢ 0x9000 ext"),
+            "external successor surfaced on the source box"
+        );
+        // List mode already labels it; keep that contract too.
+        let listed = list(&blocks).lines.join("\n");
+        assert!(listed.contains("0x9000  (external)"));
+    }
+
+    /// Several external successors collapse to a count so the note stays narrow.
+    #[test]
+    fn graph_counts_multiple_external_edges() {
+        let blocks = vec![
+            CfgBlock {
+                start: "0x4000".into(),
+                insns: vec![insn("0x4000", "br x8")],
+                edges: vec![
+                    edge("0x9100", "IndirectBranch"),
+                    edge("0x9200", "IndirectBranch"),
+                ],
+            },
+            CfgBlock {
+                start: "0x4010".into(),
+                insns: vec![insn("0x4010", "ret")],
+                edges: vec![],
+            },
+        ];
+        let g = graph(&blocks).expect("lays out");
+        assert!(as_text(&g).contains("⇢ ext ×2"), "external count surfaced");
+    }
+
     /// Long forward edge (rank gap > 1) threads a dummy column, so it must not
     /// overwrite the intermediate box.
     #[test]
@@ -1125,5 +1198,3 @@ mod tests {
         assert_eq!(g.blocks.len(), 3);
     }
 }
-
-
