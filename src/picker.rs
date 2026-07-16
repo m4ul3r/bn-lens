@@ -387,7 +387,7 @@ impl Picker {
         let (state, keys) = match self.mode {
             Mode::Search => (
                 format!(" /{}", self.filter),
-                " type · ↑↓ pick · Enter open · Tab list · Esc cancel",
+                " type · ↑↓ pick · Enter open · Tab list · Esc cancel · ? help",
             ),
             Mode::Normal => (
                 if self.filter.is_empty() {
@@ -395,7 +395,7 @@ impl Picker {
                 } else {
                     format!(" filter: {}", self.filter)
                 },
-                " j/k · g/G · / search · Enter decompile · x xrefs · s sects · i switch bn · q quit",
+                " j/k move · / search · Enter open · x xrefs · i switch · ? help · q quit",
             ),
         };
         buf.set_stringn(x0, area.y + 1, state, w, Style::default().add_modifier(Modifier::DIM));
@@ -432,7 +432,7 @@ impl Picker {
             for (i, ln) in self.sec_lines.iter().skip(off).take(view_h).enumerate() {
                 buf.set_stringn(bx + 2, by + 1 + i as u16, ln, (bw - 4) as usize, Style::default().fg(Color::Yellow));
             }
-            buf.set_stringn(bx + 2, by + bh - 1, " j/k scroll · s/q close ", (bw - 4) as usize, Style::default().add_modifier(Modifier::DIM));
+            buf.set_stringn(bx + 2, by + bh - 1, " j/k scroll · ? help · s/q close ", (bw - 4) as usize, Style::default().add_modifier(Modifier::DIM));
         }
     }
 

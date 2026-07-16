@@ -68,7 +68,7 @@ struct AgentSession {
 }
 
 /// The detected agent hosted by a pane: its status, stable session id, and kind.
-/// Identity (the `session` id) is what lets us confirm the `?` target is still
+/// Identity (the `session` id) is what lets us confirm the ask target is still
 /// the *same* agent the lens was spawned from.
 #[derive(Clone, Default)]
 pub struct PaneAgent {

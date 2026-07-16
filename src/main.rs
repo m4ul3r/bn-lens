@@ -5,6 +5,7 @@
 mod app;
 mod bn;
 mod ctx;
+mod help;
 mod herdr;
 mod launch;
 mod picker;

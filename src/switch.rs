@@ -154,7 +154,7 @@ impl Switcher {
             area.y,
             w as usize,
             &[ratatui::text::Span::styled(
-                " switch bn — j/k move · h/l columns · Enter select · Esc cancel",
+                " switch bn — j/k move · h/l columns · Enter select · ? help · Esc cancel",
                 Style::default().add_modifier(Modifier::BOLD),
             )],
         );

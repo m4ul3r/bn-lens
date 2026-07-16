@@ -10,7 +10,7 @@ pub struct Ctx {
     pub herdr: String,
     pub agent_pane: String,
     /// Session id of the agent that spawned the lens (from BN_LENS_AGENT_SESSION);
-    /// empty if unknown. Used to verify the `?` target is still that same agent.
+    /// empty if unknown. Used to verify the ask target is still that same agent.
     pub agent_session: String,
     pub instance_label: String,
     pub target: String, // the `-t` selector

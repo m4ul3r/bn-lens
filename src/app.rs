@@ -3,6 +3,7 @@
 //! ("working"/"done") is always visible on the header bar.
 
 use crate::ctx::Ctx;
+use crate::help::{Help, HelpContext};
 use crate::picker::{Action, Picker};
 use crate::switch::{Outcome, Switcher};
 use crate::ui;
@@ -27,6 +28,7 @@ struct App {
     picker: Picker,
     viewer: Option<Viewer>,
     switcher: Option<Switcher>,
+    help: Help,
     area: Rect,
     bn_bin: String,
     agent_pane: String,
@@ -46,6 +48,7 @@ impl App {
             picker,
             viewer: None,
             switcher: None,
+            help: Help::default(),
             area: Rect::new(0, 0, 0, 0),
             bn_bin,
             agent_pane,
@@ -93,7 +96,7 @@ impl App {
     }
 
     /// Overlay the ask destination + partner status on the right of the header:
-    /// `◐ → wD:p1 working`, or an explicit warning when no agent will receive `?`.
+    /// `◐ → wD:p1 working`, or an explicit warning when no agent will receive an ask.
     fn draw_partner(&self, buf: &mut Buffer, area: Rect) {
         let (color, label) = if self.agent_pane.is_empty() {
             (Color::Red, " ⚠ ask off: no launching pane ".to_string())
@@ -126,6 +129,18 @@ impl App {
     }
 
     fn on_key(&mut self, k: crossterm::event::KeyEvent) -> bool {
+        if self.help.is_open() {
+            self.help.on_key(k);
+            return false;
+        }
+        let composing_question = self
+            .viewer
+            .as_ref()
+            .is_some_and(Viewer::is_composing_question);
+        if k.code == crossterm::event::KeyCode::Char('?') && !composing_question {
+            self.help.open(self.help_context());
+            return false;
+        }
         if let Some(sw) = &mut self.switcher {
             match sw.on_key(k) {
                 Outcome::Continue => {}
@@ -167,12 +182,26 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        if self.help.is_open() {
+            self.help.on_mouse(m);
+            return;
+        }
         if self.switcher.is_some() {
             return;
         }
         match &mut self.viewer {
             Some(v) => v.on_mouse(m, &self.ctx),
             None => self.picker.on_mouse(m, self.area),
+        }
+    }
+
+    fn help_context(&self) -> HelpContext {
+        if self.switcher.is_some() {
+            HelpContext::Switcher
+        } else if self.viewer.is_some() {
+            HelpContext::Viewer
+        } else {
+            HelpContext::Picker
         }
     }
 }
@@ -214,6 +243,8 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
             if let Some(sw) = &app.switcher {
                 sw.render(app.area, f.buffer_mut());
             }
+            app.help
+                .render(app.area, f.buffer_mut(), app.help_context());
         })?;
 
         // Wake periodically even without input, so the partner status refreshes.

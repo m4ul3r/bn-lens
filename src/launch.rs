@@ -15,7 +15,7 @@ pub fn run() -> i32 {
         .unwrap_or_default();
     let herdr_bin = herdr::bin();
     // Record the launching agent's session id so the lens can later confirm the
-    // `?` target is still the *same* agent it was spawned from (not just any
+    // Ask target is still the *same* agent it was spawned from (not just any
     // agent that happens to occupy the pane).
     let session = herdr::pane_agent(&herdr_bin, &pane)
         .map(|a| a.session)
