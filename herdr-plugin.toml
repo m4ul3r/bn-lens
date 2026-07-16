@@ -1,0 +1,23 @@
+id = "bn.lens"
+name = "bn lens"
+version = "1.5.0"
+min_herdr_version = "0.7.0"
+description = "A headless Binary Ninja navigator TUI that pair-programs with agents: filter/goto/xref/peek a binary and ask the launching agent about any line — beside your work, no GUI."
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+[[actions]]
+id = "open"
+title = "bn: analyze this pane"
+contexts = ["pane"]
+command = ["./target/release/bn-lens", "launch"]
+description = "Open the bn lens picker for the focused pane's binary."
+
+[[panes]]
+id = "picker"
+title = "bn lens"
+placement = "overlay"
+command = ["./target/release/bn-lens", "picker"]
+description = "Filter-and-pick a function; view its highlighted decompile/xrefs, peek data, and ask the agent."
