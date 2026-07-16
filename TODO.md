@@ -136,6 +136,25 @@ names (`__isoc99_sscanf` → normalize `__isoc99_` too). Keep the substring set 
 views, but ideally it'd run off-thread with a spinner like `start_refresh` does. Deferred for
 consistency; revisit if the freeze feels bad in practice.
 
+## List-view Esc / switcher UX (done this pass — dogfood friction fixes)
+
+Fixes for friction found driving the lens via herdr send-keys:
+
+- **Esc no longer quits a top-level list.** On Symbols/Strings/Imports/Exports/Types/Marks, `q` is the
+  only quit. `Esc` in Normal mode backs out one step: clear an active filter (Imports also drops
+  sinks-only), else return to the Symbols list (`Action::Home`); on Symbols with no filter it's a no-op.
+  Search-mode Esc (restore prev filter) and popup Esc (close popup) are unchanged. This stops the
+  "dismiss search → Esc → one more Esc kills the pane" footgun agents kept hitting.
+- **`i` (switch bn) works from every list**, not just Symbols — same `Action::Switch` path.
+- **Switcher type-ahead filter** (`/`): narrows the focused column (instances, or targets) with the
+  same UX as the lists; Enter keeps the filter. `Esc` is layered (mirrors the list ladder): in search
+  mode it exits search and clears the filter (staying in the switcher); with an already-committed
+  filter it clears the filter (staying in the switcher); with no filter it cancels the switcher.
+- **Clean target label in the header.** A bndb cache selector (`<name>.<hash>.bndb`) is shown as just
+  `<name>` via `ui::clean_target_label`; the short form is still a valid `-t` selector so it stays
+  copyable. Non-bndb selectors are shown verbatim.
+- Help/footer text updated: `q` quits, `Esc` backs out, `i` switches, on all list views.
+
 ## Deferred / future
 
 - Add items here as they come up.

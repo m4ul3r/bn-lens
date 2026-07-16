@@ -18,9 +18,30 @@ pub const POPUP_FG: Color = Color::Rgb(216, 221, 233);
 /// the panel) — e.g. the focused statement of a decomp peek.
 pub const HILITE_BG: Color = Color::Rgb(58, 78, 130);
 
+/// Shorten a bndb cache selector to a human name for the header. bn's cache
+/// stores targets as `<name>.<16-hex-hash>.bndb` (e.g.
+/// `sample_svc.deadbeefcafebabe.bndb`); the hash is noise in the crumbs. Strip
+/// the `.bndb` suffix and a trailing hex-hash segment, leaving `sample_svc`.
+/// bn still resolves the short name as a `-t` selector, so it stays copyable.
+/// Anything that isn't a cache `.bndb` selector is returned unchanged. Shared
+/// with the switcher (column display + filter matching on the short form).
+pub fn clean_target_label(sel: &str) -> String {
+    let Some(base) = sel.strip_suffix(".bndb") else {
+        return sel.to_string();
+    };
+    if let Some(dot) = base.rfind('.') {
+        let (name, hash) = (&base[..dot], &base[dot + 1..]);
+        if hash.len() >= 8 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return name.to_string();
+        }
+    }
+    base.to_string()
+}
+
 /// The shared header "breadcrumbs": tool · `-i instance` · `-t target` · arch.
-/// The `-i`/`-t` are shown verbatim so an agent reading the pane can copy them
-/// into `bn -i <> -t <>`; the target selector also carries the binary name.
+/// The `-i` is shown verbatim so an agent reading the pane can copy it into
+/// `bn -i <>`; the `-t` target is cleaned of the bndb cache hash for legibility
+/// (still a valid selector — see [`clean_target_label`]).
 pub fn crumbs(ctx: &Ctx) -> Vec<Span<'static>> {
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let dim = Style::default().add_modifier(Modifier::DIM);
@@ -33,7 +54,7 @@ pub fn crumbs(ctx: &Ctx) -> Vec<Span<'static>> {
     if !ctx.target.is_empty() {
         v.push(Span::styled("  -t ", dim));
         v.push(Span::styled(
-            ctx.target.clone(),
+            clean_target_label(&ctx.target),
             Style::default().fg(Color::White),
         ));
     }
@@ -134,5 +155,37 @@ pub fn render_bar(buf: &mut Buffer, x0: u16, y: u16, width: usize, spans: &[Span
         let style = s.style.bg(BAR_BG);
         let (nx, _) = buf.set_stringn(x, y, &s.content, (end - x) as usize, style);
         x = nx;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_target_label;
+
+    #[test]
+    fn strips_cache_hash_from_bndb_selector() {
+        // bn's cache stores targets as <name>.<16-hex>.bndb
+        assert_eq!(
+            clean_target_label("sample_svc.deadbeefcafebabe.bndb"),
+            "sample_svc"
+        );
+        assert_eq!(
+            clean_target_label("netcfgd.0123456789abcdef.bndb"),
+            "netcfgd"
+        );
+    }
+
+    #[test]
+    fn keeps_names_without_a_hash_segment() {
+        // a plain .bndb (no hash) just loses the extension
+        assert_eq!(clean_target_label("libfoo.bndb"), "libfoo");
+        // dotted names whose last segment isn't a long hex hash are preserved
+        assert_eq!(clean_target_label("lib.so.1.bndb"), "lib.so.1");
+    }
+
+    #[test]
+    fn leaves_non_bndb_selectors_untouched() {
+        assert_eq!(clean_target_label("my_binary"), "my_binary");
+        assert_eq!(clean_target_label(""), "");
     }
 }

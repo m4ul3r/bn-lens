@@ -33,6 +33,9 @@ pub struct Switcher {
     preview: Vec<String>,
     tcache: std::collections::HashMap<String, Vec<TargetItem>>,
     icache: std::collections::HashMap<String, Vec<String>>,
+    /// Type-ahead filter over the *focused* column (instances or targets).
+    filter: String,
+    searching: bool,
 }
 
 impl Switcher {
@@ -53,9 +56,103 @@ impl Switcher {
             preview: Vec::new(),
             tcache: std::collections::HashMap::new(),
             icache: std::collections::HashMap::new(),
+            filter: String::new(),
+            searching: false,
         };
         s.reload_targets();
         s
+    }
+
+    /// True while the type-ahead filter is capturing raw text (so App must not
+    /// steal `?`/`m` as shortcuts — they belong in the query).
+    pub fn is_searching(&self) -> bool {
+        self.searching
+    }
+
+    /// The filter applies only to the currently-focused column.
+    fn inst_filter_on(&self) -> bool {
+        self.focus == Focus::Instances && !self.filter.is_empty()
+    }
+    fn tgt_filter_on(&self) -> bool {
+        self.focus == Focus::Targets && !self.filter.is_empty()
+    }
+
+    /// Instance indices passing the (focus-gated) filter, in list order.
+    fn visible_insts(&self) -> Vec<usize> {
+        let f = self.filter.to_lowercase();
+        (0..self.instances.len())
+            .filter(|&i| {
+                !self.inst_filter_on() || self.instances[i].instance_id.to_lowercase().contains(&f)
+            })
+            .collect()
+    }
+
+    /// Target indices passing the (focus-gated) filter, in list order.
+    fn visible_tgts(&self) -> Vec<usize> {
+        let f = self.filter.to_lowercase();
+        (0..self.targets.len())
+            .filter(|&i| {
+                let t = &self.targets[i];
+                !self.tgt_filter_on()
+                    || t.selector.to_lowercase().contains(&f)
+                    || ui::clean_target_label(&t.selector)
+                        .to_lowercase()
+                        .contains(&f)
+            })
+            .collect()
+    }
+
+    /// Move the instance cursor by `delta` over the visible (filtered) set.
+    fn move_inst(&mut self, delta: i64) {
+        let vis = self.visible_insts();
+        if vis.is_empty() {
+            return;
+        }
+        let cur = vis.iter().position(|&i| i == self.inst_sel).unwrap_or(0) as i64;
+        let new = vis[(cur + delta).clamp(0, vis.len() as i64 - 1) as usize];
+        if new != self.inst_sel {
+            self.inst_sel = new;
+            self.reload_targets();
+        }
+    }
+
+    /// Move the target cursor by `delta` over the visible (filtered) set.
+    fn move_tgt(&mut self, delta: i64) {
+        let vis = self.visible_tgts();
+        if vis.is_empty() {
+            return;
+        }
+        let cur = vis.iter().position(|&i| i == self.tgt_sel).unwrap_or(0) as i64;
+        let new = vis[(cur + delta).clamp(0, vis.len() as i64 - 1) as usize];
+        if new != self.tgt_sel {
+            self.tgt_sel = new;
+            self.reload_preview();
+        }
+    }
+
+    /// After the filter changes, pull the focused cursor onto the first visible
+    /// row if it fell outside the narrowed set.
+    fn snap_focused(&mut self) {
+        match self.focus {
+            Focus::Instances => {
+                let vis = self.visible_insts();
+                if !vis.contains(&self.inst_sel) {
+                    if let Some(&first) = vis.first() {
+                        self.inst_sel = first;
+                        self.reload_targets();
+                    }
+                }
+            }
+            Focus::Targets => {
+                let vis = self.visible_tgts();
+                if !vis.contains(&self.tgt_sel) {
+                    if let Some(&first) = vis.first() {
+                        self.tgt_sel = first;
+                        self.reload_preview();
+                    }
+                }
+            }
+        }
     }
 
     fn cur_inst_id(&self) -> Option<String> {
@@ -96,43 +193,56 @@ impl Switcher {
     }
 
     pub fn on_key(&mut self, k: KeyEvent) -> Outcome {
+        // Type-ahead filter mode: characters narrow the focused column.
+        if self.searching {
+            match k.code {
+                KeyCode::Esc => {
+                    self.filter.clear();
+                    self.searching = false;
+                }
+                // Enter/Tab commit the filter (leave search mode, keep the
+                // narrowed list) so you can then j/k and Enter to select.
+                KeyCode::Enter | KeyCode::Tab => self.searching = false,
+                KeyCode::Backspace => {
+                    self.filter.pop();
+                    self.snap_focused();
+                }
+                KeyCode::Down => self.move_focused(1),
+                KeyCode::Up => self.move_focused(-1),
+                KeyCode::Char(c) => {
+                    self.filter.push(c);
+                    self.snap_focused();
+                }
+                _ => {}
+            }
+            return Outcome::Continue;
+        }
+
         match k.code {
-            KeyCode::Esc | KeyCode::Char('q') => return Outcome::Cancel,
-            KeyCode::Char('j') | KeyCode::Down => match self.focus {
-                Focus::Instances => {
-                    if self.inst_sel + 1 < self.instances.len() {
-                        self.inst_sel += 1;
-                        self.reload_targets();
-                    }
+            // Esc clears an active filter first; only then cancels the switcher.
+            KeyCode::Esc => {
+                if self.filter.is_empty() {
+                    return Outcome::Cancel;
                 }
-                Focus::Targets => {
-                    if self.tgt_sel + 1 < self.targets.len() {
-                        self.tgt_sel += 1;
-                        self.reload_preview();
-                    }
-                }
-            },
-            KeyCode::Char('k') | KeyCode::Up => match self.focus {
-                Focus::Instances => {
-                    if self.inst_sel > 0 {
-                        self.inst_sel -= 1;
-                        self.reload_targets();
-                    }
-                }
-                Focus::Targets => {
-                    if self.tgt_sel > 0 {
-                        self.tgt_sel -= 1;
-                        self.reload_preview();
-                    }
-                }
-            },
+                self.filter.clear();
+                self.snap_focused();
+            }
+            KeyCode::Char('q') => return Outcome::Cancel,
+            KeyCode::Char('/') => {
+                self.filter.clear();
+                self.searching = true;
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.move_focused(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_focused(-1),
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => {
                 if !self.targets.is_empty() {
                     self.focus = Focus::Targets;
+                    self.filter.clear(); // filter is per-column
                 }
             }
             KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => {
                 self.focus = Focus::Instances;
+                self.filter.clear();
             }
             KeyCode::Enter => {
                 if let (Some(id), Some(t)) = (self.cur_inst_id(), self.targets.get(self.tgt_sel)) {
@@ -142,6 +252,13 @@ impl Switcher {
             _ => {}
         }
         Outcome::Continue
+    }
+
+    fn move_focused(&mut self, delta: i64) {
+        match self.focus {
+            Focus::Instances => self.move_inst(delta),
+            Focus::Targets => self.move_tgt(delta),
+        }
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -157,13 +274,24 @@ impl Switcher {
             );
         }
         let w = area.width;
+        let header = if self.searching {
+            format!(" switch bn — /{}   (Enter keep · Esc clear)", self.filter)
+        } else if !self.filter.is_empty() {
+            format!(
+                " switch bn — filter: {}   j/k move · h/l cols · / filter · Enter select · Esc clear",
+                self.filter
+            )
+        } else {
+            " switch bn — j/k move · h/l cols · / filter · Enter select · ? help · Esc cancel"
+                .to_string()
+        };
         ui::render_bar(
             buf,
             area.x,
             area.y,
             w as usize,
             &[ratatui::text::Span::styled(
-                " switch bn — j/k move · h/l columns · Enter select · ? help · Esc cancel",
+                header,
                 Style::default().add_modifier(Modifier::BOLD),
             )],
         );
@@ -198,21 +326,33 @@ impl Switcher {
             );
         }
 
-        // column 1 — instances
-        let inst_rows: Vec<(String, Style)> = self
-            .instances
+        // column 1 — instances (filtered when focus is here)
+        let vis_i = self.visible_insts();
+        let inst_rows: Vec<(String, Style)> = if vis_i.is_empty() {
+            vec![(
+                "(no match)".to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            )]
+        } else {
+            vis_i
+                .iter()
+                .map(|&idx| {
+                    let i = &self.instances[idx];
+                    let s = if i.instance_id == self.cur_instance {
+                        Style::default().fg(Color::Green)
+                    } else if i.binaries.is_empty() {
+                        Style::default().add_modifier(Modifier::DIM)
+                    } else {
+                        Style::default()
+                    };
+                    (i.instance_id.clone(), s)
+                })
+                .collect()
+        };
+        let inst_pos = vis_i
             .iter()
-            .map(|i| {
-                let s = if i.instance_id == self.cur_instance {
-                    Style::default().fg(Color::Green)
-                } else if i.binaries.is_empty() {
-                    Style::default().add_modifier(Modifier::DIM)
-                } else {
-                    Style::default()
-                };
-                (i.instance_id.clone(), s)
-            })
-            .collect();
+            .position(|&i| i == self.inst_sel)
+            .unwrap_or(usize::MAX);
         render_col(
             buf,
             c1x,
@@ -221,12 +361,14 @@ impl Switcher {
             body_h,
             "INSTANCES",
             &inst_rows,
-            self.inst_sel,
+            inst_pos,
             self.focus == Focus::Instances,
         );
 
-        // column 2 — targets (placeholder row when the instance has none open)
-        let (tgt_rows, tgt_sel): (Vec<(String, Style)>, usize) = if self.targets.is_empty() {
+        // column 2 — targets (placeholder row when the instance has none open,
+        // or when a filter matched nothing)
+        let vis_t = self.visible_tgts();
+        let (tgt_rows, tgt_pos): (Vec<(String, Style)>, usize) = if self.targets.is_empty() {
             (
                 vec![(
                     "(no targets open)".to_string(),
@@ -234,22 +376,34 @@ impl Switcher {
                 )],
                 usize::MAX, // never highlight the placeholder
             )
+        } else if vis_t.is_empty() {
+            (
+                vec![(
+                    "(no match)".to_string(),
+                    Style::default().add_modifier(Modifier::DIM),
+                )],
+                usize::MAX,
+            )
         } else {
             (
-                self.targets
+                vis_t
                     .iter()
-                    .map(|t| {
+                    .map(|&idx| {
+                        let t = &self.targets[idx];
                         (
                             format!(
                                 "{}{}",
                                 if t.active { "● " } else { "  " },
-                                short_target(&t.selector)
+                                ui::clean_target_label(&t.selector)
                             ),
                             Style::default(),
                         )
                     })
                     .collect(),
-                self.tgt_sel,
+                vis_t
+                    .iter()
+                    .position(|&i| i == self.tgt_sel)
+                    .unwrap_or(usize::MAX),
             )
         };
         render_col(
@@ -260,7 +414,7 @@ impl Switcher {
             body_h,
             "TARGETS",
             &tgt_rows,
-            tgt_sel,
+            tgt_pos,
             self.focus == Focus::Targets,
         );
 
@@ -358,18 +512,6 @@ fn trunc(s: &str, n: usize) -> String {
         let t: String = s.chars().take(n.saturating_sub(1)).collect();
         format!("{t}…")
     }
-}
-
-/// Shorten a bndb selector for the column: keep the name, abbreviate the hash.
-fn short_target(sel: &str) -> String {
-    let base = sel.strip_suffix(".bndb").unwrap_or(sel);
-    if let Some(dot) = base.rfind('.') {
-        let (name, hash) = base.split_at(dot);
-        if hash.len() > 7 {
-            return format!("{name}.{}…", &hash[1..5]);
-        }
-    }
-    sel.to_string()
 }
 
 fn format_info(raw: &str) -> Vec<String> {

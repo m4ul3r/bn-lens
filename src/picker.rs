@@ -17,6 +17,8 @@ pub enum Action {
     OpenDecompile(String),
     OpenXrefs(String),
     Switch,
+    /// Return to the Symbols list (Esc from a non-Symbols list, filter empty).
+    Home,
     Quit,
     None,
 }
@@ -476,7 +478,7 @@ impl Picker {
                 } else {
                     format!(" filter: {}", self.filter)
                 },
-                " j/k move · / search · Enter open · x xrefs · m menu · i switch · ? help · q quit",
+                " j/k move · / search · Enter open · x xrefs · m menu · i switch · ? help · q quit (Esc≠quit)",
             ),
         };
         crate::ui::put_str(
@@ -636,7 +638,16 @@ impl Picker {
             }
         }
         match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
+            // q is the only quit. Esc never closes the pane: it clears the
+            // filter if set, else no-ops (Symbols is already "home").
+            KeyCode::Char('q') => return Action::Quit,
+            KeyCode::Esc => {
+                if !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.sel = 0;
+                    self.top = 0;
+                }
+            }
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),

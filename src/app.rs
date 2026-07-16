@@ -225,6 +225,10 @@ impl App {
                 self.open_switcher();
                 false
             }
+            Action::Home => {
+                self.set_view(AppView::Symbols);
+                false
+            }
             Action::Quit => true,
             Action::None => false,
         }
@@ -381,6 +385,9 @@ impl App {
     /// filter, or an ask/comment/tag/rename field) — so the global `?`/`^R`/`m`
     /// shortcuts must not steal those characters.
     fn capturing_text(&self) -> bool {
+        if let Some(sw) = &self.switcher {
+            return sw.is_searching();
+        }
         if let Some(viewer) = &self.viewer {
             return viewer.is_capturing_text();
         }

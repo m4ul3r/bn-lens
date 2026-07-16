@@ -427,7 +427,18 @@ impl TypesList {
             }
         }
         match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
+            // q is the only quit. Esc backs out: clear the filter if set, else
+            // return to the Symbols list (never closes the pane).
+            KeyCode::Char('q') => return Action::Quit,
+            KeyCode::Esc => {
+                if self.filter.is_empty() {
+                    return Action::Home;
+                }
+                self.filter.clear();
+                self.sel = 0;
+                self.top = 0;
+            }
+            KeyCode::Char('i') => return Action::Switch,
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
@@ -512,7 +523,7 @@ impl TypesList {
                 } else {
                     format!(" types · filter: {}", self.filter)
                 },
-                " j/k move · / search · Enter/p show layout · n new type · m menu · q quit",
+                " j/k move · / search · Enter/p layout · n new · m menu · i switch · q quit",
             ),
         };
         crate::ui::put_str(

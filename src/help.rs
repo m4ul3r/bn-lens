@@ -150,8 +150,13 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "PICKER",
-        key: "q / Esc",
-        action: "quit",
+        key: "Esc",
+        action: "clear filter (never quits)",
+    },
+    HelpLine::Entry {
+        scope: "PICKER",
+        key: "q",
+        action: "quit the lens",
     },
     HelpLine::Section("PICKER SEARCH"),
     HelpLine::Entry {
@@ -197,8 +202,13 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "STRINGS",
-        key: "m / q",
-        action: "view menu / quit",
+        key: "m / v / i",
+        action: "view menu / cycle view / switch bn",
+    },
+    HelpLine::Entry {
+        scope: "STRINGS",
+        key: "Esc / q",
+        action: "clear filter, then back to symbols / quit",
     },
     HelpLine::Section("IMPORTS"),
     HelpLine::Entry {
@@ -226,6 +236,16 @@ const LINES: &[HelpLine] = &[
         key: "Enter / x",
         action: "cross-reference the import (callers)",
     },
+    HelpLine::Entry {
+        scope: "IMPORTS",
+        key: "m / v / i",
+        action: "view menu / cycle view / switch bn",
+    },
+    HelpLine::Entry {
+        scope: "IMPORTS",
+        key: "Esc / q",
+        action: "clear filter/sinks-only, then back to symbols / quit",
+    },
     HelpLine::Section("EXPORTS"),
     HelpLine::Entry {
         scope: "EXPORTS",
@@ -247,6 +267,16 @@ const LINES: &[HelpLine] = &[
         key: "Enter / x",
         action: "open decompile (function) or xrefs · cross-reference",
     },
+    HelpLine::Entry {
+        scope: "EXPORTS",
+        key: "m / v / i",
+        action: "view menu / cycle view / switch bn",
+    },
+    HelpLine::Entry {
+        scope: "EXPORTS",
+        key: "Esc / q",
+        action: "clear filter, then back to symbols / quit",
+    },
     HelpLine::Section("TYPES"),
     HelpLine::Entry {
         scope: "TYPES",
@@ -267,6 +297,16 @@ const LINES: &[HelpLine] = &[
         scope: "TYPES",
         key: "n",
         action: "new type: write a C declaration and add it",
+    },
+    HelpLine::Entry {
+        scope: "TYPES",
+        key: "m / v / i",
+        action: "view menu / cycle view / switch bn",
+    },
+    HelpLine::Entry {
+        scope: "TYPES",
+        key: "Esc / q",
+        action: "clear filter, then back to symbols / quit",
     },
     HelpLine::Section("TYPES EDITOR"),
     HelpLine::Entry {
@@ -304,6 +344,16 @@ const LINES: &[HelpLine] = &[
         scope: "MARKS",
         key: "Enter / x",
         action: "open the annotated function / its xrefs",
+    },
+    HelpLine::Entry {
+        scope: "MARKS",
+        key: "m / v / i",
+        action: "view menu / cycle view / switch bn",
+    },
+    HelpLine::Entry {
+        scope: "MARKS",
+        key: "Esc / q",
+        action: "clear filter, then back to symbols / quit",
     },
     HelpLine::Section("VIEWER"),
     HelpLine::Entry {
@@ -492,13 +542,18 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "SWITCH BN",
+        key: "/",
+        action: "type-ahead filter the focused column (Enter keep · Esc clear)",
+    },
+    HelpLine::Entry {
+        scope: "SWITCH BN",
         key: "Enter",
         action: "select instance and target",
     },
     HelpLine::Entry {
         scope: "SWITCH BN",
         key: "q / Esc",
-        action: "cancel",
+        action: "q cancels; Esc clears an active filter first, else cancels",
     },
     HelpLine::Section("MOUSE"),
     HelpLine::Entry {
