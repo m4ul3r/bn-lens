@@ -1,6 +1,6 @@
 //! Ratatui rendering for the code viewer and its modal popups.
 
-use super::{HotKind, Popup, View, Viewer};
+use super::{CfgExpand, HotKind, Popup, View, Viewer};
 use crate::ctx::Ctx;
 use crate::theme;
 use ratatui::buffer::Buffer;
@@ -19,6 +19,11 @@ impl Viewer {
         let code_width = stack_panel
             .map(|panel| panel.x.saturating_sub(area.x) as usize)
             .unwrap_or(width);
+        // The 2D CFG graph has its own colored, box-navigable, pannable renderer.
+        if self.cfg_graph_view.is_some() {
+            self.render_cfg_graph(area, buffer, ctx);
+            return;
+        }
         let body_height = height.saturating_sub(3);
         self.cline = self.cline.min(self.lines.len().saturating_sub(1));
         if self.cline < self.top {
@@ -239,7 +244,9 @@ impl Viewer {
                             HotKind::Local => Style::default().fg(Color::Gray),
                         }
                     }
-                } else if matches!(self.view, View::Mlil | View::Disasm) {
+                } else if matches!(self.view, View::Mlil | View::Disasm | View::Cfg) {
+                    // MLIL/disasm and the CFG list (which shows disassembly) use
+                    // the muted asm palette; decompile uses the pseudo-C one.
                     theme::asm_style(segment.kind)
                 } else {
                     theme::tok_style(segment.kind)
@@ -289,6 +296,177 @@ impl Viewer {
         if matches!(self.popup, Popup::None) && self.stack_view.is_open() {
             self.stack_view.render(area, buffer, &self.name);
         }
+    }
+
+    /// Render the 2D CFG graph: the colored box-and-arrow canvas with the
+    /// selected block highlighted. Navigated by block (hjkl), not by line.
+    fn render_cfg_graph(&mut self, area: Rect, buffer: &mut Buffer, ctx: &Ctx) {
+        let Some(mut g) = self.cfg_graph_view.take() else {
+            return;
+        };
+        let width = area.width as usize;
+        crate::ui::render_bar(buffer, area.x, area.y, width, &crate::ui::crumbs(ctx));
+
+        // Row 1: location + colour legend.
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let sel_addr = g.data.blocks.get(g.sel).map(|b| b.addr).unwrap_or(0);
+        let info = vec![
+            Span::styled(
+                format!(" {sel_addr:#x}"),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  cfg  ", Style::default().fg(Color::Blue)),
+            Span::styled(self.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("   block {}/{}", g.sel + 1, g.data.block_count),
+                dim,
+            ),
+            Span::styled("     ", dim),
+            Span::styled("● true", Style::default().fg(Color::Green)),
+            Span::styled("  ", dim),
+            Span::styled("● false", Style::default().fg(Color::Red)),
+            Span::styled("  ", dim),
+            Span::styled("● branch", Style::default().fg(Color::Blue)),
+        ];
+        crate::ui::put_spans(buffer, area.x, area.y + 1, width, &info);
+
+        // Corner hint (top-right): expand the highlighted block.
+        let corner = " e ⤢ expand block ";
+        let cw = corner.chars().count();
+        if (cw as u16) < area.width {
+            crate::ui::put_str(
+                buffer,
+                area.x + area.width - cw as u16,
+                area.y + 1,
+                corner,
+                cw,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+
+        let hint = " hjkl move · e expand · Enter read · Space list · i/v cycle · q close";
+        crate::ui::render_bar(
+            buffer,
+            area.x,
+            area.y + area.height.saturating_sub(1),
+            width,
+            &[Span::styled(hint, dim)],
+        );
+
+        let body_top = area.y + 2;
+        let bottom = area.y + area.height.saturating_sub(1);
+        let view_h = bottom.saturating_sub(body_top) as usize;
+
+        // The graph is a canvas with empty padding above and below, so it can be
+        // panned freely (a block can sit anywhere in the viewport, not just be
+        // clamped tight to the content). `g.top` is an offset into this padded
+        // virtual space; the real graph occupies rows [pad_v, pad_v + h).
+        let pad_v = (view_h / 2).max(4);
+        let virt_h = g.data.h + 2 * pad_v;
+        // Scroll-off margin so the selection isn't jammed against an edge.
+        let margin = 3usize;
+
+        // First render of a freshly-built graph: rest the entry near the top (a
+        // few rows of padding above), rather than floating in the middle of the
+        // top pad. Panning up from here reveals the rest of the pad.
+        if g.top == usize::MAX {
+            g.top = pad_v.saturating_sub(margin);
+        }
+
+        // In follow-mode (after hjkl) the viewport tracks the selection; a mouse
+        // pan clears follow so the canvas stays where the user dragged it.
+        if g.follow {
+            if let Some(sel) = g.data.blocks.get(g.sel) {
+                let vtop = sel.top + pad_v;
+                if vtop < g.top + margin {
+                    g.top = vtop.saturating_sub(margin);
+                }
+                if vtop + sel.h + margin > g.top + view_h {
+                    g.top = (vtop + sel.h + margin).saturating_sub(view_h);
+                }
+                if sel.left < g.left {
+                    g.left = sel.left;
+                }
+                let need_r = sel.left + sel.w;
+                if need_r > g.left + width {
+                    g.left = need_r.saturating_sub(width);
+                }
+            }
+        }
+        // Clamp to the padded canvas so a pan can't lose the graph entirely.
+        g.top = g.top.min(virt_h.saturating_sub(view_h.max(1)));
+        g.left = g.left.min(g.data.w.saturating_sub(width.max(1)));
+
+        // Record on-screen block rects for click hit-testing (in screen coords).
+        self.cfg_hit.clear();
+        for (i, b) in g.data.blocks.iter().enumerate() {
+            let vtop = b.top + pad_v;
+            let off_v = vtop + b.h <= g.top || vtop >= g.top + view_h;
+            let off_h = b.left + b.w <= g.left || b.left >= g.left + width;
+            if off_v || off_h {
+                continue;
+            }
+            let sy = body_top as i64 + vtop as i64 - g.top as i64;
+            let sx = area.x as i64 + b.left as i64 - g.left as i64;
+            let x0 = sx.max(area.x as i64) as u16;
+            let x1 = (sx + b.w as i64).min(area.x as i64 + width as i64) as u16;
+            let y0 = sy.max(body_top as i64) as u16;
+            let y1 = (sy + b.h as i64).min(bottom as i64) as u16;
+            self.cfg_hit.push((x0, x1, y0, y1, i));
+        }
+
+        // Draw the visible canvas window, cell by cell (skipping the pad rows).
+        let sel_rect = g.data.blocks.get(g.sel);
+        for vy in 0..view_h {
+            let crow = (g.top + vy) as i64 - pad_v as i64;
+            if crow < 0 {
+                continue; // top padding
+            }
+            let row = crow as usize;
+            if row >= g.data.h {
+                break; // bottom padding (and everything past it)
+            }
+            let y = body_top + vy as u16;
+            for vx in 0..width {
+                let col = g.left + vx;
+                if col >= g.data.w {
+                    break;
+                }
+                let (ch, color) = g.data.cell(row, col);
+                if ch == ' ' {
+                    continue;
+                }
+                let selected = sel_rect.is_some_and(|b| b.contains(row, col));
+                crate::ui::put_str(
+                    buffer,
+                    area.x + vx as u16,
+                    y,
+                    ch.to_string(),
+                    1,
+                    cfg_cell_style(color, selected),
+                );
+            }
+        }
+
+        // Pan affordances: ‹ › on a mid-body row when the canvas extends off the
+        // sides (the graph is wider than the pane and panned to follow selection).
+        let mid = body_top + (view_h / 2) as u16;
+        let mark = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        if g.left > 0 {
+            crate::ui::put_str(buffer, area.x, mid, "‹", 1, mark);
+        }
+        if g.left + width < g.data.w {
+            crate::ui::put_str(buffer, area.x + area.width.saturating_sub(1), mid, "›", 1, mark);
+        }
+
+        // Expand panel (corner-anchored, syntax-highlighted) draws on top.
+        if let Some(exp) = &g.expand {
+            render_cfg_expand(buffer, area, body_top, bottom, exp);
+        }
+        self.cfg_graph_view = Some(g);
     }
 
     fn render_popup(&self, area: Rect, buffer: &mut Buffer, ctx: &Ctx) {
@@ -504,5 +682,86 @@ impl Viewer {
             (box_width - 4) as usize,
             Style::default().add_modifier(Modifier::DIM),
         );
+    }
+}
+
+/// Render the `e` expand panel: the selected block's instructions, syntax-
+/// highlighted with the disasm palette, in a content-sized box anchored to the
+/// top-left corner, with a scroll/close hint in its bottom-right corner.
+fn render_cfg_expand(buffer: &mut Buffer, area: Rect, body_top: u16, bottom: u16, exp: &CfgExpand) {
+    let avail_h = bottom.saturating_sub(body_top) as usize;
+    let inner_w = exp
+        .lines
+        .iter()
+        .map(|l| l.iter().map(|s| s.text.chars().count()).sum::<usize>())
+        .max()
+        .unwrap_or(24)
+        .clamp(24, (area.width as usize).saturating_sub(6).min(96));
+    let panel_w = (inner_w + 4) as u16;
+    let panel_h = (exp.lines.len() + 2).clamp(4, avail_h.max(4)) as u16;
+    let panel_x = area.x;
+    let panel_y = body_top;
+    crate::ui::draw_box(buffer, panel_x, panel_y, panel_w, panel_h, &exp.title);
+
+    let view_rows = (panel_h as usize).saturating_sub(2);
+    for (i, line) in exp.lines.iter().skip(exp.off).take(view_rows).enumerate() {
+        let spans: Vec<Span> = line
+            .iter()
+            .map(|seg| {
+                let mut st = theme::asm_style(seg.kind);
+                if st.fg.is_none() {
+                    st = st.fg(crate::ui::POPUP_FG);
+                }
+                Span::styled(seg.text.clone(), st.bg(crate::ui::POPUP_BG))
+            })
+            .collect();
+        crate::ui::put_spans(buffer, panel_x + 2, panel_y + 1 + i as u16, inner_w, &spans);
+    }
+
+    // Scroll/close hint in the bottom-right corner of the panel.
+    let more = exp.off + view_rows < exp.lines.len();
+    let hint = if more || exp.off > 0 {
+        " ↑↓ scroll · q close "
+    } else {
+        " q close "
+    };
+    let hlen = hint.chars().count() as u16;
+    if hlen + 2 < panel_w {
+        crate::ui::put_str(
+            buffer,
+            panel_x + panel_w - hlen - 1,
+            panel_y + panel_h - 1,
+            hint,
+            hlen as usize,
+            Style::default()
+                .fg(Color::Cyan)
+                .bg(crate::ui::POPUP_BG)
+                .add_modifier(Modifier::DIM),
+        );
+    }
+}
+
+/// Style for a CFG canvas cell from its colour class. Edges are bold-coloured
+/// (green true / red false / blue other); the selected block's border turns
+/// yellow and its text goes bold so the box pops.
+fn cfg_cell_style(col: u8, selected: bool) -> Style {
+    use crate::cfg;
+    let base = match col {
+        cfg::C_TRUE => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        cfg::C_FALSE => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        cfg::C_OTHER => Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+        cfg::C_ADDR => Style::default().fg(crate::theme::ADDR),
+        cfg::C_BORDER => Style::default().fg(Color::Gray),
+        _ => Style::default(),
+    };
+    if selected {
+        match col {
+            cfg::C_BORDER => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            _ => base.add_modifier(Modifier::BOLD),
+        }
+    } else if col == cfg::C_BORDER {
+        base.add_modifier(Modifier::DIM)
+    } else {
+        base
     }
 }

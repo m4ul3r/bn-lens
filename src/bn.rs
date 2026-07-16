@@ -265,6 +265,77 @@ if fn is not None:
 print(json.dumps({'blocks': blocks}))
 "#;
 
+/// One entry in the Types view: a type's name and kind (`struct`/`union`/
+/// `enum`/`int`/`named_type_ref`/…).
+#[derive(Clone)]
+pub struct TypeItem {
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Deserialize)]
+struct TypesJson {
+    #[serde(default)]
+    items: Vec<TypeItemJson>,
+}
+
+#[derive(Deserialize)]
+struct TypeItemJson {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    kind: String,
+}
+
+/// Result of previewing a `types declare` (validate without committing): either
+/// the types it would define (name + rendered layout) or the parser error.
+pub enum TypeCheck {
+    Ok(Vec<TypeLayout>),
+    Err(String),
+}
+
+/// A previewed/declared type: its name and bn's rendered layout text (the first
+/// line carries `// size=0x…`).
+pub struct TypeLayout {
+    pub name: String,
+    pub layout: String,
+}
+
+#[derive(Deserialize)]
+struct PreviewPayload {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    affected_types: Vec<AffectedTypeJson>,
+    #[serde(default)]
+    results: Vec<PreviewResultJson>,
+}
+
+#[derive(Deserialize)]
+struct AffectedTypeJson {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    after_layout: String,
+}
+
+#[derive(Deserialize)]
+struct PreviewResultJson {
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// A `--summary` mutation payload's fields we consume for `types declare`.
+#[derive(Deserialize)]
+struct MutationSummaryJson {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    changed_count: u64,
+    #[serde(default)]
+    first_error: Option<String>,
+}
+
 /// A unique temp path for a `--out` capture (`bn-lens-<pid>-<seq>.out`), so
 /// concurrent/sequential captures never share a file (see [`Bn::run_out`]).
 fn unique_tmp() -> String {
@@ -289,6 +360,19 @@ fn mutation_ok(out: &str) -> bool {
         }
     }
     out.contains("\"success\": true") || out.contains("\"success\":true")
+}
+
+/// Tidy a bn declaration-parser error for a one-line status: collapse
+/// whitespace/newlines and cap the length so a long multi-error blob stays
+/// readable in the editor footer.
+fn clean_err(msg: &str) -> String {
+    let collapsed = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > 160 {
+        let head: String = collapsed.chars().take(159).collect();
+        format!("{head}…")
+    } else {
+        collapsed
+    }
 }
 
 fn parse_local_list_json(text: &str) -> Vec<LocalVariable> {
@@ -474,6 +558,76 @@ impl Bn {
                     .then(|| (addr.to_string(), name.to_string()))
             })
             .collect()
+    }
+
+    /// `bn types` -> the type list (name + kind) for the Types view.
+    pub fn types_list(&self) -> Vec<TypeItem> {
+        let out = self.run_out(&["types", "--limit", "5000", "--format", "json"]);
+        serde_json::from_str::<TypesJson>(&out)
+            .map(|t| {
+                t.items
+                    .into_iter()
+                    .map(|i| TypeItem {
+                        name: i.name,
+                        kind: i.kind,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `bn types show <name>` -> the rendered layout (struct fields + offsets).
+    pub fn type_show(&self, name: &str) -> Vec<String> {
+        let out = self.run_out(&["types", "show", name]);
+        let lines: Vec<String> = out.lines().map(str::to_string).collect();
+        if lines.is_empty() {
+            vec![format!("(no layout for {name})")]
+        } else {
+            lines
+        }
+    }
+
+    /// Validate a C declaration without committing (`types declare --preview`):
+    /// the resulting type layouts, or the parser error.
+    pub fn type_declare_check(&self, decl: &str) -> TypeCheck {
+        let out = self.run_out(&[
+            "types", "declare", "--preview", "--format", "json", decl,
+        ]);
+        match serde_json::from_str::<PreviewPayload>(out.trim()) {
+            Ok(payload) if payload.ok => TypeCheck::Ok(
+                payload
+                    .affected_types
+                    .into_iter()
+                    .map(|a| TypeLayout {
+                        name: a.name,
+                        layout: a.after_layout,
+                    })
+                    .collect(),
+            ),
+            Ok(payload) => TypeCheck::Err(clean_err(
+                &payload
+                    .results
+                    .into_iter()
+                    .find_map(|r| r.message)
+                    .unwrap_or_else(|| "declaration rejected".into()),
+            )),
+            Err(_) => TypeCheck::Err("no response from bn".into()),
+        }
+    }
+
+    /// Commit a C declaration as user types (`types declare`). Live in the bn
+    /// instance, like every other write — not persisted until an explicit
+    /// `bn save`. Returns the count of defined types, or the parser error.
+    pub fn type_declare(&self, decl: &str) -> Result<u64, String> {
+        let out = self.run_out(&["types", "declare", "--summary", "--format", "json", decl]);
+        match serde_json::from_str::<MutationSummaryJson>(out.trim()) {
+            Ok(summary) if summary.success => Ok(summary.changed_count),
+            Ok(summary) => Err(summary
+                .first_error
+                .map(|e| clean_err(&e))
+                .unwrap_or_else(|| "declaration failed".into())),
+            Err(_) => Err("no response from bn".into()),
+        }
     }
 
     /// `bn exports` -> the exported symbols (public API) for the Exports view.

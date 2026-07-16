@@ -13,6 +13,7 @@ pub enum HelpContext {
     Strings,
     Imports,
     Exports,
+    Types,
     Marks,
     Viewer,
     Stack,
@@ -26,6 +27,7 @@ impl HelpContext {
             Self::Strings => "strings",
             Self::Imports => "imports",
             Self::Exports => "exports",
+            Self::Types => "types",
             Self::Marks => "marks",
             Self::Viewer => "viewer",
             Self::Stack => "stack view",
@@ -39,6 +41,7 @@ impl HelpContext {
             Self::Strings => "STRINGS",
             Self::Imports => "IMPORTS",
             Self::Exports => "EXPORTS",
+            Self::Types => "TYPES",
             Self::Marks => "MARKS",
             Self::Viewer => "VIEWER",
             Self::Stack => "STACK VIEW",
@@ -52,6 +55,7 @@ impl HelpContext {
             Self::Strings => scope == "STRINGS" || scope == "LIST",
             Self::Imports => scope == "IMPORTS" || scope == "LIST",
             Self::Exports => scope == "EXPORTS" || scope == "LIST",
+            Self::Types => scope.starts_with("TYPES") || scope == "LIST",
             Self::Marks => scope == "MARKS" || scope == "LIST",
             Self::Viewer => {
                 scope.starts_with("VIEWER") || scope == "VISUAL" || scope == "STACK VIEW"
@@ -91,7 +95,7 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "LIST",
         key: "v",
-        action: "cycle top-level views (symbols/strings/imports/exports/marks)",
+        action: "cycle top-level views (symbols/strings/imports/exports/types/marks)",
     },
     HelpLine::Entry {
         scope: "MENU",
@@ -243,6 +247,48 @@ const LINES: &[HelpLine] = &[
         key: "Enter / x",
         action: "open decompile (function) or xrefs · cross-reference",
     },
+    HelpLine::Section("TYPES"),
+    HelpLine::Entry {
+        scope: "TYPES",
+        key: "j/k  ^D/^U  gg/G",
+        action: "move / page / ends",
+    },
+    HelpLine::Entry {
+        scope: "TYPES",
+        key: "/",
+        action: "filter by name / kind",
+    },
+    HelpLine::Entry {
+        scope: "TYPES",
+        key: "Enter / p",
+        action: "show the type's layout (fields + offsets)",
+    },
+    HelpLine::Entry {
+        scope: "TYPES",
+        key: "n",
+        action: "new type: write a C declaration and add it",
+    },
+    HelpLine::Section("TYPES EDITOR"),
+    HelpLine::Entry {
+        scope: "TYPES EDITOR",
+        key: "Enter · Tab",
+        action: "newline (auto-indent) · insert 4 spaces",
+    },
+    HelpLine::Entry {
+        scope: "TYPES EDITOR",
+        key: "^P",
+        action: "check — validate the declaration without committing",
+    },
+    HelpLine::Entry {
+        scope: "TYPES EDITOR",
+        key: "^S",
+        action: "declare — add the type to the live bn instance",
+    },
+    HelpLine::Entry {
+        scope: "TYPES EDITOR",
+        key: "Esc",
+        action: "cancel",
+    },
     HelpLine::Section("MARKS"),
     HelpLine::Entry {
         scope: "MARKS",
@@ -317,13 +363,18 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "Space  (in cfg)",
-        action: "toggle boxed graph vs. block list",
+        key: "hjkl  (cfg graph)",
+        action: "move between blocks (arrows: green=true red=false blue=branch)",
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "g / Enter  (in cfg)",
-        action: "jump to the edge target block in place",
+        key: "e  (cfg graph)",
+        action: "expand the highlighted block (full instructions)",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "Enter/g · Space  (cfg)",
+        action: "read the selected block · toggle graph ⇄ list",
     },
     HelpLine::Entry {
         scope: "VIEWER",
@@ -459,6 +510,16 @@ const LINES: &[HelpLine] = &[
         scope: "PICKER/VIEWER",
         key: "click",
         action: "select function / hotspot",
+    },
+    HelpLine::Entry {
+        scope: "CFG GRAPH",
+        key: "drag",
+        action: "pan the graph canvas (selection unchanged)",
+    },
+    HelpLine::Entry {
+        scope: "CFG GRAPH",
+        key: "click · wheel",
+        action: "select a block · scroll",
     },
 ];
 

@@ -11,6 +11,7 @@ use crate::menu::{Choice, Menu};
 use crate::picker::{Action, Picker};
 use crate::strings::StringsList;
 use crate::switch::{Outcome, Switcher};
+use crate::types::TypesList;
 use crate::ui;
 use crate::viewer::{Exit, Viewer};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
@@ -41,6 +42,7 @@ enum AppView {
     Strings,
     Imports,
     Exports,
+    Types,
     Marks,
 }
 
@@ -51,6 +53,7 @@ struct App {
     strings: Option<StringsList>, // built lazily on first switch to Strings
     imports: Option<ImportsList>, // built lazily on first switch to Imports
     exports: Option<ExportsList>, // built lazily on first switch to Exports
+    types: Option<TypesList>,     // built lazily on first switch to Types
     marks: Option<MarksList>,     // built lazily on first switch to Marks
     menu: Menu,
     viewer: Option<Viewer>,
@@ -78,6 +81,7 @@ impl App {
             strings: None,
             imports: None,
             exports: None,
+            types: None,
             marks: None,
             menu: Menu::default(),
             viewer: None,
@@ -116,6 +120,7 @@ impl App {
             self.strings = None;
             self.imports = None;
             self.exports = None;
+            self.types = None;
             self.marks = None;
             self.view = AppView::Symbols;
             self.viewer = None;
@@ -129,6 +134,7 @@ impl App {
             AppView::Strings => Choice::Strings,
             AppView::Imports => Choice::Imports,
             AppView::Exports => Choice::Exports,
+            AppView::Types => Choice::Types,
             AppView::Marks => Choice::Marks,
         }
     }
@@ -154,6 +160,11 @@ impl App {
                     self.exports = Some(ExportsList::new(&self.ctx));
                 }
             }
+            AppView::Types => {
+                if self.types.is_none() {
+                    self.types = Some(TypesList::new(&self.ctx));
+                }
+            }
             AppView::Marks => self.marks = Some(MarksList::new(&self.ctx)),
         }
         self.view = view;
@@ -168,6 +179,7 @@ impl App {
             AppView::Strings,
             AppView::Imports,
             AppView::Exports,
+            AppView::Types,
             AppView::Marks,
         ];
         let current = ORDER.iter().position(|v| *v == self.view).unwrap_or(0) as i32;
@@ -182,6 +194,7 @@ impl App {
             Choice::Strings => self.set_view(AppView::Strings),
             Choice::Imports => self.set_view(AppView::Imports),
             Choice::Exports => self.set_view(AppView::Exports),
+            Choice::Types => self.set_view(AppView::Types),
             Choice::Marks => self.set_view(AppView::Marks),
             Choice::Refresh => self.start_refresh(),
             Choice::SwitchBn => self.open_switcher(),
@@ -260,6 +273,9 @@ impl App {
                 }
                 if let Some(exports) = &mut self.exports {
                     exports.refresh(&self.ctx);
+                }
+                if let Some(types) = &mut self.types {
+                    types.refresh(&self.ctx);
                 }
                 if let Some(marks) = &mut self.marks {
                     marks.refresh(&self.ctx);
@@ -373,6 +389,7 @@ impl App {
             AppView::Strings => self.strings.as_ref().is_some_and(StringsList::is_searching),
             AppView::Imports => self.imports.as_ref().is_some_and(ImportsList::is_searching),
             AppView::Exports => self.exports.as_ref().is_some_and(ExportsList::is_searching),
+            AppView::Types => self.types.as_ref().is_some_and(TypesList::is_searching),
             AppView::Marks => self.marks.as_ref().is_some_and(MarksList::is_searching),
         }
     }
@@ -388,6 +405,7 @@ impl App {
             AppView::Strings => self.strings.as_ref().is_some_and(StringsList::popup_open),
             AppView::Imports => self.imports.as_ref().is_some_and(ImportsList::popup_open),
             AppView::Exports => self.exports.as_ref().is_some_and(ExportsList::popup_open),
+            AppView::Types => self.types.as_ref().is_some_and(TypesList::popup_open),
             AppView::Marks => self.marks.as_ref().is_some_and(MarksList::popup_open),
         }
     }
@@ -487,6 +505,10 @@ impl App {
                         .exports
                         .as_mut()
                         .map_or(Action::None, |s| s.on_key(k, &self.ctx)),
+                    AppView::Types => self
+                        .types
+                        .as_mut()
+                        .map_or(Action::None, |s| s.on_key(k, &self.ctx)),
                     AppView::Marks => self.marks.as_mut().map_or(Action::None, |s| s.on_key(k)),
                 };
                 self.open_action(action)
@@ -541,6 +563,11 @@ impl App {
                         s.on_mouse(m, self.area);
                     }
                 }
+                AppView::Types => {
+                    if let Some(s) = &mut self.types {
+                        s.on_mouse(m, self.area);
+                    }
+                }
                 AppView::Marks => {
                     if let Some(s) = &mut self.marks {
                         s.on_mouse(m, self.area);
@@ -566,6 +593,7 @@ impl App {
                 AppView::Strings => HelpContext::Strings,
                 AppView::Imports => HelpContext::Imports,
                 AppView::Exports => HelpContext::Exports,
+                AppView::Types => HelpContext::Types,
                 AppView::Marks => HelpContext::Marks,
             }
         }
@@ -618,6 +646,11 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
                     }
                     AppView::Exports => {
                         if let Some(s) = &mut app.exports {
+                            s.render(app.area, f.buffer_mut(), &app.ctx);
+                        }
+                    }
+                    AppView::Types => {
+                        if let Some(s) = &mut app.types {
                             s.render(app.area, f.buffer_mut(), &app.ctx);
                         }
                     }

@@ -19,6 +19,7 @@ mod strings;
 mod switch;
 mod syntax;
 mod theme;
+mod types;
 mod ui;
 mod usage;
 mod viewer;

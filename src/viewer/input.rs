@@ -2,7 +2,7 @@
 
 use super::hotspots::valid_ident;
 use super::stack::StackAction;
-use super::{Exit, Popup, View, Viewer};
+use super::{CfgDir, Exit, Popup, View, Viewer};
 use crate::ctx::Ctx;
 use crate::herdr;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -29,6 +29,10 @@ impl Viewer {
                 return Exit::Stay;
             }
             Popup::None => {}
+        }
+        // The 2D CFG graph is navigated by block, not by line.
+        if self.in_cfg_graph() {
+            return self.cfg_graph_key(key, ctx);
         }
         if self.stack_view.is_open() {
             self.stack_key(key);
@@ -364,6 +368,48 @@ impl Viewer {
         self.active = None;
     }
 
+    /// Keys for the 2D CFG graph: hjkl move the selected block, Enter reads it,
+    /// Space drops to the list, i/v cycle the function view.
+    fn cfg_graph_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
+        // While the expand panel is open it captures scroll/close keys.
+        if self.cfg_expand_open() {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.cfg_expand_scroll(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.cfg_expand_scroll(-1);
+                }
+                KeyCode::PageDown => {
+                    self.cfg_expand_scroll(10);
+                }
+                KeyCode::PageUp => {
+                    self.cfg_expand_scroll(-10);
+                }
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('e') | KeyCode::Enter => {
+                    self.cfg_expand_close();
+                }
+                _ => {}
+            }
+            return Exit::Stay;
+        }
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return Exit::Back,
+            KeyCode::Char('b') => return self.back(ctx),
+            KeyCode::Char('h') | KeyCode::Left => self.cfg_move(CfgDir::Left),
+            KeyCode::Char('l') | KeyCode::Right => self.cfg_move(CfgDir::Right),
+            KeyCode::Char('j') | KeyCode::Down => self.cfg_move(CfgDir::Down),
+            KeyCode::Char('k') | KeyCode::Up => self.cfg_move(CfgDir::Up),
+            KeyCode::Char('e') => self.cfg_expand_selected(),
+            KeyCode::Enter | KeyCode::Char('g') => self.cfg_read_selected(ctx),
+            KeyCode::Char(' ') => self.toggle_cfg_graph(ctx),
+            KeyCode::Char('i') | KeyCode::Char('v') => self.cycle_view(ctx, 1),
+            KeyCode::Char('I') => self.cycle_view(ctx, -1),
+            _ => {}
+        }
+        Exit::Stay
+    }
+
     fn move_cursor(&mut self, delta: i64) {
         let line_count = self.lines.len() as i64;
         self.cline = (self.cline as i64 + delta).clamp(0, (line_count - 1).max(0)) as usize;
@@ -518,6 +564,10 @@ impl Viewer {
         if !matches!(self.popup, Popup::None) {
             return;
         }
+        if self.in_cfg_graph() {
+            self.cfg_graph_mouse(mouse);
+            return;
+        }
         if self.stack_view.is_open() && self.stack_view.on_mouse(mouse) {
             return;
         }
@@ -535,6 +585,94 @@ impl Viewer {
                         break;
                     }
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// Mouse in the CFG graph. Drag pans the canvas freely (without moving the
+    /// selection); a click (press+release with no drag) selects the box under the
+    /// cursor; the wheel scrolls vertically. Panning/scrolling clears follow-mode
+    /// so the viewport doesn't snap back to the selection.
+    fn cfg_graph_mouse(&mut self, mouse: MouseEvent) {
+        // The expand panel captures the wheel while open; a click closes it.
+        if self.cfg_expand_open() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.cfg_expand_scroll(-3);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.cfg_expand_scroll(3);
+                }
+                MouseEventKind::Down(_) => self.cfg_expand_close(),
+                _ => {}
+            }
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if let Some(g) = self.cfg_graph_view.as_mut() {
+                    g.top = g.top.saturating_sub(3);
+                    g.follow = false;
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(g) = self.cfg_graph_view.as_mut() {
+                    g.top += 3; // upper bound clamped in render
+                    g.follow = false;
+                }
+            }
+            MouseEventKind::ScrollLeft => {
+                if let Some(g) = self.cfg_graph_view.as_mut() {
+                    g.left = g.left.saturating_sub(3);
+                    g.follow = false;
+                }
+            }
+            MouseEventKind::ScrollRight => {
+                if let Some(g) = self.cfg_graph_view.as_mut() {
+                    g.left += 3;
+                    g.follow = false;
+                }
+            }
+            MouseEventKind::Down(_) => {
+                self.cfg_drag = Some((mouse.column, mouse.row));
+                self.cfg_dragged = false;
+            }
+            MouseEventKind::Drag(_) => {
+                if let Some((px, py)) = self.cfg_drag {
+                    let dx = mouse.column as i64 - px as i64;
+                    let dy = mouse.row as i64 - py as i64;
+                    if let Some(g) = self.cfg_graph_view.as_mut() {
+                        // Grab-and-drag: content moves with the cursor.
+                        g.left = (g.left as i64 - dx).max(0) as usize;
+                        g.top = (g.top as i64 - dy).max(0) as usize;
+                        g.follow = false;
+                    }
+                    self.cfg_drag = Some((mouse.column, mouse.row));
+                    self.cfg_dragged = true;
+                }
+            }
+            MouseEventKind::Up(_) => {
+                if !self.cfg_dragged {
+                    // A click (no drag) selects the block under the cursor.
+                    let hit = self
+                        .cfg_hit
+                        .iter()
+                        .find(|&&(x0, x1, y0, y1, _)| {
+                            mouse.column >= x0
+                                && mouse.column < x1
+                                && mouse.row >= y0
+                                && mouse.row < y1
+                        })
+                        .map(|&(_, _, _, _, idx)| idx);
+                    if let Some(idx) = hit {
+                        if let Some(g) = self.cfg_graph_view.as_mut() {
+                            g.sel = idx;
+                        }
+                    }
+                }
+                self.cfg_drag = None;
+                self.cfg_dragged = false;
             }
             _ => {}
         }

@@ -51,17 +51,27 @@ Decomp → MLIL → Disasm → **CFG**). It walks `func.basic_blocks` + typed `o
 stdout spill envelope — see `bn.rs::cfg` + `CFG_PROGRAM`). Rendering lives in the pure, tested
 `cfg.rs`:
 
-- **list mode** (default): blocks in address order, each with its instructions and labelled successor
-  edges (`├─ true → block_1`), back-edges flagged `↑loop`. Robust at any block count.
-- **box-graph mode** (`Space` toggles): the same blocks wrapped in ascii boxes with arrow connectors,
-  **size-gated** to ≤ `MAX_GRAPH_BLOCKS` (24) — above that it falls back to the list with a note
-  (a fixed character grid can't route a big CFG readably).
+- **graph mode** (default, `Space` toggles): a **true 2D layered box-and-arrow layout** — blocks
+  ranked into layers (longest path from entry), ordered within a layer by barycenter to reduce
+  crossings, connected by orthogonally-routed arrows drawn on a char canvas with junction-merging.
+  Long edges thread **dummy columns** (never cross a box); **back-edges/loops** route up dedicated
+  right-margin lanes with a `◀` head. Compact nodes (id · addr · terminator) keep it inside the pane
+  width; it re-lays out on resize and falls back to the list if it can't fit (or > `MAX_GRAPH_BLOCKS`).
+  It is a **spatial navigator, not a text buffer**: `hjkl` move the selected block (highlighted; the
+  view scrolls to keep it visible), a click selects a box, and **edges are colour-coded** — green
+  (true), red (false), blue (any other/unconditional) — so no true/false text labels are needed.
+  `Enter`/`g` drops into the list scrolled to the selected block to read its instructions.
+  Implementation: `cfg::graph()` returns a `GraphData` (char grid + parallel colour grid + block
+  rects); the viewer has a dedicated colored renderer (`render_cfg_graph`) + `cfg_move`, bypassing the
+  generic line renderer.
+- **list mode**: blocks in address order with full instructions and labelled successor edges
+  (`├─ true → block_1`), back-edges flagged `↑loop`. Scales to any block count; `g`/`Enter` on an
+  edge target jumps to that block in place (via `cfg_index`).
 
-`g`/`Enter` on an edge target jumps to that block **in place** (via the block-addr→line `cfg_index`).
-
-**Next step if wanted:** the box-graph mode stacks boxes vertically with labelled arrows; it does *not*
-do true 2D edge routing (layered ranks, crossing-minimization). That's the genuinely-messy part and was
-deliberately deferred — a real Sugiyama-style layout would be the follow-on.
+**Possible follow-ups:** the router handles adjacent-rank + dummy-threaded forward edges and
+right-lane back-edges well; heavy fan-in/fan-out (large switches) can still cross — a full
+crossing-minimization pass and per-node variable widths would sharpen it. hjkl is nearest-box spatial;
+a strict edge-following mode (Tab through successors/preds) could be added.
 
 ## Call-graph / xref-tree view (side-parked, likely hard)
 
@@ -80,12 +90,30 @@ the existing nav stack and hotspot model. Non-trivial UI work; scope carefully b
 **Status:** implemented as the **Marks** view (`marks.rs`) — lists comments + tags/bookmarks, `Enter`
 jumps to the annotated function. The read half of the "shared map".
 
-## Exports (public-API) view (done this pass)
+## Exports (public-API) view (done)
 
 **Status:** implemented as the **Exports** view (`exports.rs`, mirrors `imports.rs`). Lists exported
 symbols — functions and data globals shown distinctly; `Enter` opens a function export's decompile (a
 data export's xrefs), `x` cross-references, `p` peeks who-uses-it. Reachable via the `m` menu or the
 new `v` top-level view-cycle.
+
+## Types view + declare (done this pass — extends the write surface)
+
+**Status:** implemented as the **Types** view (`types.rs`). Lists the binary's type system
+(`bn types`), composites first; `Enter`/`p` shows a type's layout (`bn types show` — fields +
+offsets); `n` opens a **multi-line C-declaration editor** to author a new type. The editor auto-indents
+on newline, validates without committing via `^P` (`bn types declare --preview`, showing the parsed
+name + `size=`), and commits with `^S` (`bn types declare`).
+
+**Write-surface note:** this *deliberately extends* the previously annotation-only write surface —
+adding *whole* user types is now in scope (CLAUDE.md invariant updated). It stays live-in-instance
+like every other write (no `bn save`; deferred). **Editing fields of existing structs and graph
+editing remain explicit non-goals** — the view reads existing layouts but only *adds* new types.
+
+**Possible follow-ups:** live validation as-you-type (currently on-demand via `^P`; per-keystroke
+`--preview` would spawn a bn process each keypress, too slow); load a declaration from a file
+(`bn types declare --file`); struct-field editing (`bn struct field`) if that non-goal is ever
+revisited.
 
 ## Sink classifier — extend coverage (minor)
 

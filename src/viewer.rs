@@ -70,6 +70,38 @@ struct Frame {
     cline: usize,
 }
 
+/// The laid-out 2D CFG plus its interactive state: which block is selected and
+/// the canvas scroll (the graph is a pannable canvas — it may be wider/taller
+/// than the pane, and the viewport follows the selection).
+struct CfgGraph {
+    data: crate::cfg::GraphData,
+    sel: usize,
+    top: usize,
+    left: usize,
+    /// While true the viewport tracks the selected block (after hjkl). A mouse
+    /// pan/scroll clears it so free panning isn't snapped back to the selection.
+    follow: bool,
+    /// The expanded block inspector (a corner panel), when open.
+    expand: Option<CfgExpand>,
+}
+
+/// The `e` expand panel: the selected block's full instructions, tokenized for
+/// syntax highlighting, with a scroll offset.
+struct CfgExpand {
+    title: String,
+    lines: Vec<Line>,
+    off: usize,
+}
+
+/// hjkl navigation direction across the CFG boxes.
+#[derive(Clone, Copy)]
+pub(crate) enum CfgDir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
 /// What `r` is renaming: a function-local (retexted in place) or a function
 /// symbol (needs a ctx rebuild so every callsite/name map picks it up).
 #[derive(Clone, Copy, PartialEq)]
@@ -158,6 +190,16 @@ pub struct Viewer {
     cfg_index: std::collections::HashMap<u64, usize>,
     /// CFG view: whether the boxed graph layout is requested (Space toggles it).
     cfg_graph: bool,
+    /// CFG graph mode: the laid-out graph + selection, when a 2D graph is shown
+    /// (None while in the CFG list fallback or any non-CFG view).
+    cfg_graph_view: Option<CfgGraph>,
+    /// CFG graph mode: screen rects of each block box for click hit-testing:
+    /// (x0, x1, y0, y1, block index).
+    cfg_hit: Vec<(u16, u16, u16, u16, usize)>,
+    /// CFG graph mode: last mouse position while a button is held (for drag-pan),
+    /// and whether this press has moved (so a click still selects, a drag pans).
+    cfg_drag: Option<(u16, u16)>,
+    cfg_dragged: bool,
 }
 
 impl Viewer {
@@ -181,7 +223,11 @@ impl Viewer {
             popup: Popup::None,
             screen_tgts: Vec::new(),
             cfg_index: std::collections::HashMap::new(),
-            cfg_graph: false,
+            cfg_graph: true,
+            cfg_graph_view: None,
+            cfg_hit: Vec::new(),
+            cfg_drag: None,
+            cfg_dragged: false,
         };
         viewer.load(ctx);
         viewer
@@ -217,6 +263,7 @@ impl Viewer {
             self.load_cfg(ctx);
             return;
         }
+        self.cfg_graph_view = None; // left the CFG view
         let text = match self.view {
             View::Decomp => ctx.bn.decompile(&self.name),
             View::Mlil => ctx.bn.il(&self.name, "mlil"),
@@ -251,7 +298,38 @@ impl Viewer {
     /// line index so acting on an edge target jumps within the graph.
     fn load_cfg(&mut self, ctx: &Ctx) {
         let blocks = ctx.bn.cfg(&self.name);
-        let rendered = crate::cfg::render(&blocks, self.cfg_graph);
+        // Try the 2D graph first (when requested); fall back to the block list
+        // only when there are too many blocks to lay out.
+        if self.cfg_graph {
+            if let Some(data) = crate::cfg::graph(&blocks) {
+                // Preserve the selection across a re-layout (e.g. refresh) by address.
+                let keep = self
+                    .cfg_graph_view
+                    .as_ref()
+                    .and_then(|g| g.data.blocks.get(g.sel).map(|b| b.addr));
+                let sel = keep
+                    .and_then(|a| data.blocks.iter().position(|b| b.addr == a))
+                    .unwrap_or(data.entry);
+                let count = data.block_count;
+                self.cfg_graph_view = Some(CfgGraph {
+                    data,
+                    sel,
+                    top: usize::MAX, // sentinel: render positions the entry near the top
+                    left: 0,
+                    follow: true,
+                    expand: None,
+                });
+                self.lines = Vec::new();
+                self.spans = Vec::new();
+                self.cfg_index = std::collections::HashMap::new();
+                self.status =
+                    format!(" cfg · {count} blocks · graph · hjkl move · Enter read · Space list");
+                return;
+            }
+        }
+        // List fallback (too many blocks) / explicit toggle.
+        self.cfg_graph_view = None;
+        let rendered = crate::cfg::list(&blocks);
         let text = rendered.lines.join("\n");
         self.lines = syntax::tokenize_plain(&text);
         self.cfg_index = rendered.index;
@@ -259,15 +337,130 @@ impl Viewer {
         self.locals = std::collections::HashMap::new();
         self.spans = build_spans(&self.lines, ctx, &self.locals);
         self.active = None;
-        self.status = match rendered.note {
-            Some(note) => format!(" {note}"),
-            None => format!(
-                " cfg · {} blocks · {} · v/i cycles view · Space {} graph",
-                rendered.block_count,
-                if rendered.graph { "graph" } else { "list" },
-                if rendered.graph { "→ list" } else { "→ graph" },
-            ),
+        self.status = if self.cfg_graph {
+            format!(
+                " cfg · {} blocks · list (too many to graph) · v/i cycle",
+                rendered.block_count
+            )
+        } else {
+            format!(
+                " cfg · {} blocks · list · Space graph · Enter jump edge · v/i cycle",
+                rendered.block_count
+            )
         };
+    }
+
+    /// Move the CFG graph selection to the nearest box in `dir` (hjkl).
+    pub(crate) fn cfg_move(&mut self, dir: CfgDir) {
+        let Some(g) = self.cfg_graph_view.as_mut() else {
+            return;
+        };
+        let blocks = &g.data.blocks;
+        if blocks.len() < 2 {
+            return;
+        }
+        let (ccx, ccy) = (blocks[g.sel].cx() as i64, blocks[g.sel].cy() as i64);
+        let mut best: Option<(i64, usize)> = None;
+        for (i, b) in blocks.iter().enumerate() {
+            if i == g.sel {
+                continue;
+            }
+            let (dx, dy) = (b.cx() as i64 - ccx, b.cy() as i64 - ccy);
+            let in_dir = match dir {
+                CfgDir::Up => dy < 0,
+                CfgDir::Down => dy > 0,
+                CfgDir::Left => dx < 0,
+                CfgDir::Right => dx > 0,
+            };
+            if !in_dir {
+                continue;
+            }
+            // Favour the dominant axis; break ties by the perpendicular offset.
+            let score = match dir {
+                CfgDir::Up | CfgDir::Down => dy.abs() * 2 + dx.abs(),
+                CfgDir::Left | CfgDir::Right => dx.abs() * 2 + dy.abs(),
+            };
+            if best.map_or(true, |(s, _)| score < s) {
+                best = Some((score, i));
+            }
+        }
+        if let Some((_, i)) = best {
+            g.sel = i;
+            g.follow = true; // re-center the viewport on the new selection
+        }
+    }
+
+    /// Enter/`g` in the CFG graph: drop into the block list scrolled to the
+    /// selected block so its instructions can be read.
+    pub(crate) fn cfg_read_selected(&mut self, ctx: &Ctx) {
+        let addr = self
+            .cfg_graph_view
+            .as_ref()
+            .and_then(|g| g.data.blocks.get(g.sel).map(|b| b.addr));
+        self.cfg_graph = false;
+        self.load(ctx);
+        if let Some(line) = addr.and_then(|a| self.cfg_index.get(&a).copied()) {
+            self.cline = line;
+            self.top = line.saturating_sub(2);
+        }
+    }
+
+    pub(crate) fn in_cfg_graph(&self) -> bool {
+        self.cfg_graph_view.is_some()
+    }
+
+    /// `e` in the CFG graph: toggle a corner panel expanding the highlighted
+    /// block into its full, syntax-highlighted instructions (the box in the graph
+    /// stays compact).
+    pub(crate) fn cfg_expand_selected(&mut self) {
+        let Some(g) = self.cfg_graph_view.as_mut() else {
+            return;
+        };
+        if g.expand.is_some() {
+            g.expand = None; // toggle closed
+            return;
+        }
+        let Some(b) = g.data.blocks.get(g.sel) else {
+            return;
+        };
+        if b.insns.is_empty() {
+            self.status = " (block has no instructions)".into();
+            return;
+        }
+        let title = format!("{}  {:#x}", b.label, b.addr);
+        let text = b
+            .insns
+            .iter()
+            .map(|(a, t)| format!("{a}  {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        g.expand = Some(CfgExpand {
+            title,
+            lines: syntax::tokenize_plain(&text),
+            off: 0,
+        });
+    }
+
+    /// Scroll the expand panel (if open). Returns true if it consumed the key.
+    pub(crate) fn cfg_expand_scroll(&mut self, delta: i64) -> bool {
+        let Some(exp) = self.cfg_graph_view.as_mut().and_then(|g| g.expand.as_mut()) else {
+            return false;
+        };
+        let max = exp.lines.len().saturating_sub(1);
+        exp.off = (exp.off as i64 + delta).clamp(0, max as i64) as usize;
+        true
+    }
+
+    pub(crate) fn cfg_expand_open(&self) -> bool {
+        self.cfg_graph_view
+            .as_ref()
+            .is_some_and(|g| g.expand.is_some())
+    }
+
+    pub(crate) fn cfg_expand_close(&mut self) {
+        if let Some(g) = self.cfg_graph_view.as_mut() {
+            g.expand = None;
+        }
     }
 
     /// The effective selected span: the Tab/click-selected one if it's still on
