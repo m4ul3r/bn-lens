@@ -137,9 +137,29 @@ struct DecompiledFn {
     function: FnRef,
 }
 
-/// A `--summary` mutation payload reports `"success": true` when the write
-/// applied and verified. Both spacings appear depending on formatter.
+/// A unique temp path for a `--out` capture (`bn-lens-<pid>-<seq>.out`), so
+/// concurrent/sequential captures never share a file (see [`Bn::run_out`]).
+fn unique_tmp() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!("bn-lens-{}-{seq}.out", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Whether a `--summary` mutation payload reports success. The summary is a JSON
+/// object even in text mode, so prefer its `success` field; fall back to a
+/// substring probe so a format change can't silently read as failure.
 fn mutation_ok(out: &str) -> bool {
+    for line in out.lines() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+            if let Some(success) = value.get("success").and_then(serde_json::Value::as_bool) {
+                return success;
+            }
+        }
+    }
     out.contains("\"success\": true") || out.contains("\"success\":true")
 }
 
@@ -151,7 +171,11 @@ fn parse_local_list_json(text: &str) -> Vec<LocalVariable> {
 
 impl Bn {
     pub fn new(bin: String, instance: Option<String>, target: Option<String>) -> Self {
-        Bn { bin, instance, target }
+        Bn {
+            bin,
+            instance,
+            target,
+        }
     }
 
     fn cmd(&self) -> Command {
@@ -201,12 +225,18 @@ impl Bn {
     /// Run a subcommand capturing the FULL output via `--out` to a temp file —
     /// dodging bn's stdout "spill envelope" for large results (any read that can
     /// exceed ~10k tokens: function list, exports, imports, xrefs, locals on a
-    /// big binary). Sequential single-threaded use, so one temp file is fine.
+    /// big binary).
+    ///
+    /// The temp path is unique per call (and removed after reading), so a bn
+    /// invocation that fails to (re)write the file can't leave us silently
+    /// reading a *previous* call's bytes — and the refresh worker thread can't
+    /// collide with a foreground read.
     fn run_out(&self, args: &[&str]) -> String {
-        let tmp = std::env::temp_dir().join(format!("bn-lens-out-{}.txt", std::process::id()));
-        let tmp = tmp.to_string_lossy().into_owned();
+        let tmp = unique_tmp();
         let _ = self.cmd().args(args).args(["--out", &tmp]).output();
-        std::fs::read_to_string(&tmp).unwrap_or_default()
+        let out = std::fs::read_to_string(&tmp).unwrap_or_default();
+        let _ = std::fs::remove_file(&tmp);
+        out
     }
 
     /// All instances (parsed from `bn session list --format json`), regardless
@@ -274,13 +304,12 @@ impl Bn {
 
     /// Decompile via `--out` (avoids the stdout spill envelope for big funcs).
     pub fn decompile(&self, name: &str) -> String {
-        let tmp = std::env::temp_dir().join(format!("bn-lens-{}.c", std::process::id()));
-        let tmp = tmp.to_string_lossy().into_owned();
-        let _ = self
-            .cmd()
-            .args(["decompile", name, "--out", &tmp])
-            .output();
-        std::fs::read_to_string(&tmp).unwrap_or_else(|_| "(no output)".into())
+        let out = self.run_out(&["decompile", name]);
+        if out.trim().is_empty() {
+            "(no output)".into()
+        } else {
+            out
+        }
     }
 
     /// Decompile with each pseudo-C line prefixed by its 8-hex address column
@@ -370,13 +399,12 @@ impl Bn {
     /// All strings: (content, address). Content is bn's rendering (same escape
     /// form as the decompile, so it matches a quote-stripped literal directly).
     pub fn strings(&self) -> Vec<(String, String)> {
-        let tmp = std::env::temp_dir().join(format!("bn-lens-str-{}.txt", std::process::id()));
-        let tmp = tmp.to_string_lossy().into_owned();
-        let _ = self.cmd().args(["strings", "--out", &tmp]).output();
-        let text = std::fs::read_to_string(&tmp).unwrap_or_default();
+        let text = self.run_out(&["strings"]);
         let mut out = Vec::new();
         for line in text.lines() {
-            let Some(addr) = line.split_whitespace().next() else { continue };
+            let Some(addr) = line.split_whitespace().next() else {
+                continue;
+            };
             if !addr.starts_with("0x") {
                 continue;
             }
@@ -425,13 +453,32 @@ impl Bn {
 
     /// Add a tag of `ty` (e.g. `Bookmarks`) at an address, with optional note.
     pub fn tag_add_addr(&self, addr: &str, ty: &str, data: &str) -> bool {
-        let out = self.run(&["tag", "add", addr, "--type", ty, "--data", data, "--summary"]);
+        let out = self.run(&[
+            "tag",
+            "add",
+            addr,
+            "--type",
+            ty,
+            "--data",
+            data,
+            "--summary",
+        ]);
         mutation_ok(&out)
     }
 
     /// Add a tag of `ty` on a whole function, with optional note.
     pub fn tag_add_func(&self, func: &str, ty: &str, data: &str) -> bool {
-        let out = self.run(&["tag", "add", "--function", func, "--type", ty, "--data", data, "--summary"]);
+        let out = self.run(&[
+            "tag",
+            "add",
+            "--function",
+            func,
+            "--type",
+            ty,
+            "--data",
+            data,
+            "--summary",
+        ]);
         mutation_ok(&out)
     }
 

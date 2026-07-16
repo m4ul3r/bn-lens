@@ -456,7 +456,8 @@ impl Help {
                 HelpLine::Section(label) => {
                     let active = *label == context.section();
                     let marker = if active { "●" } else { "─" };
-                    buffer.set_stringn(
+                    crate::ui::put_str(
+                        buffer,
                         box_x + 2,
                         y,
                         format!("{marker} {label}"),
@@ -492,7 +493,8 @@ impl Help {
             start + 1,
             max_start + 1
         );
-        buffer.set_stringn(
+        crate::ui::put_str(
+            buffer,
             box_x + 2,
             box_y + box_height - 1,
             position,

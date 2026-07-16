@@ -111,7 +111,15 @@ pub fn pane_run(herdr: &str, pane: &str, text: &str) -> bool {
 /// no target pane is known). Returns the raw JSON response.
 pub fn open_picker(herdr: &str, target_pane: &str, envs: &[(&str, &str)]) -> String {
     let mut c = Command::new(herdr);
-    c.args(["plugin", "pane", "open", "--plugin", "bn.lens", "--entrypoint", "picker"]);
+    c.args([
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        "bn.lens",
+        "--entrypoint",
+        "picker",
+    ]);
     if target_pane.is_empty() {
         c.args(["--placement", "overlay", "--focus"]);
     } else {

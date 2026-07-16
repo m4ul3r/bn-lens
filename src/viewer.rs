@@ -183,8 +183,18 @@ impl Viewer {
         self.load(ctx);
     }
 
-    pub(crate) fn is_composing_question(&self) -> bool {
-        matches!(self.popup, Popup::Ask { .. })
+    /// True while the viewer is capturing raw text — composing an ask, editing a
+    /// rename/comment/tag, or typing an in-function search. App must not steal
+    /// `?`/`^R` (and `m` is already viewer-only) while this holds.
+    pub(crate) fn is_capturing_text(&self) -> bool {
+        self.search_input.is_some()
+            || matches!(
+                self.popup,
+                Popup::Ask { .. }
+                    | Popup::Rename { .. }
+                    | Popup::Comment { .. }
+                    | Popup::Tag { .. }
+            )
     }
 
     pub(crate) fn is_inspecting_stack(&self) -> bool {

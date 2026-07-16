@@ -22,13 +22,15 @@ pub struct DecLine {
 pub fn dec_lines(text: &str) -> Vec<DecLine> {
     let mut rows: Vec<(Option<u64>, String)> = Vec::new();
     for line in text.lines() {
-        if line.len() >= 8 {
-            let (head, rest) = line.split_at(8);
-            if head.bytes().all(|b| b.is_ascii_hexdigit()) {
-                if let Ok(addr) = u64::from_str_radix(head, 16) {
-                    rows.push((Some(addr), rest.trim_end().to_string()));
-                    continue;
-                }
+        // Test the 8-byte address column via bytes so we never `split_at` on a
+        // non-char-boundary (a comment line with a multibyte char at index 8
+        // would otherwise panic). ASCII-hex first 8 bytes ⇒ byte 8 is a
+        // boundary, so the `[..8]`/`[8..]` slices below are safe.
+        let bytes = line.as_bytes();
+        if bytes.len() >= 8 && bytes[..8].iter().all(u8::is_ascii_hexdigit) {
+            if let Ok(addr) = u64::from_str_radix(&line[..8], 16) {
+                rows.push((Some(addr), line[8..].trim_end().to_string()));
+                continue;
             }
         }
         let trimmed = line.trim_end();
@@ -129,6 +131,16 @@ mod tests {
     }
 
     #[test]
+    fn dec_lines_does_not_panic_on_multibyte_at_the_address_column() {
+        // A comment line ≥8 bytes with a multibyte char straddling byte 8 must
+        // not be split_at(8)'d — it's address-less, kept as-is.
+        let dec = dec_lines("/* café ☕ */\n0040428c        x = 1;");
+        assert_eq!(dec[0].addr, None);
+        assert!(dec[0].text.contains("café"));
+        assert_eq!(dec[1].addr, Some(0x40428c));
+    }
+
+    #[test]
     fn dec_lines_drops_the_bn_resolver_note() {
         let dec = dec_lines(&format!("// bn: 0x404304 is inside sub_40428c\n{DEC}"));
         assert!(!dec.iter().any(|l| l.text.starts_with("// bn")));
@@ -142,7 +154,10 @@ mod tests {
             vec!["/* tailcall */", "return memcpy(result, arg4, x19);"]
         );
         // an address inside a statement snaps to the greatest addr at/below it
-        assert_eq!(lines_at(&dec, 0x4042c0), vec!["size_t x0_1 = strlen(arg4);"]);
+        assert_eq!(
+            lines_at(&dec, 0x4042c0),
+            vec!["size_t x0_1 = strlen(arg4);"]
+        );
         assert!(lines_at(&dec, 0x400000).is_empty());
     }
 

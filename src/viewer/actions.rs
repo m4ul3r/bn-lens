@@ -149,11 +149,29 @@ impl Viewer {
     /// rename is just an identifier swap within this function, so we retext the
     /// tokens, move the locals entry, and rebuild spans.
     pub(super) fn apply_local_rename(&mut self, ctx: &Ctx, old: &str, new: &str) {
-        for segments in &mut self.lines {
-            for segment in segments {
-                if segment.kind == Tok::Name && segment.text == old {
+        // Retext only the segments the current spans classify as *this* local (by
+        // (line, col) position), not every token that happens to share the name —
+        // otherwise a same-named function/global (a shadow) or a struct field
+        // would be rewritten too, diverging the display from real BN state.
+        let targets: std::collections::HashSet<(usize, usize)> = self
+            .spans
+            .iter()
+            .filter(|span| span.kind == HotKind::Local && span.target == old)
+            .map(|span| (span.line, span.col))
+            .collect();
+        for (line_index, segments) in self.lines.iter_mut().enumerate() {
+            let mut col = 0usize;
+            for segment in segments.iter_mut() {
+                // Advance by the *original* length so cols keep matching the
+                // spans even after a same-line rename changes a token's width.
+                let len = segment.text.chars().count();
+                if segment.kind == Tok::Name
+                    && segment.text == old
+                    && targets.contains(&(line_index, col))
+                {
                     segment.text = new.to_string();
                 }
+                col += len;
             }
         }
         if let Some(ty) = self.locals.remove(old) {
@@ -239,9 +257,7 @@ impl Viewer {
             match kind {
                 HotKind::Local => self.show_local(index),
                 HotKind::Str => self.peek_string(ctx, index),
-                HotKind::Func => {
-                    self.peek_code(ctx, &target, None, &format!("decomp · {target}"))
-                }
+                HotKind::Func => self.peek_code(ctx, &target, None, &format!("decomp · {target}")),
                 HotKind::Addr if code => {
                     let focus = crate::ctx::parse_hex(&target);
                     self.peek_code(ctx, &target, focus, &format!("decomp @ {target}"));

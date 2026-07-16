@@ -49,6 +49,9 @@ pub struct Menu {
     sel: usize,
     /// Screen rows of each drawn entry (for click hit-testing): (y, choice-idx).
     hit: Vec<(u16, usize)>,
+    /// The drawn box's horizontal span `[x0, x1)`, so a click must land inside
+    /// the box columns — not just anywhere on an entry's row.
+    box_x: (u16, u16),
 }
 
 impl Menu {
@@ -93,14 +96,19 @@ impl Menu {
         None
     }
 
-    /// A click either selects an entry (returns it) or dismisses the menu.
+    /// A click inside the box selects the entry on that row; a click anywhere
+    /// else dismisses the menu.
     pub fn on_mouse(&mut self, m: MouseEvent) -> Option<Choice> {
         if !matches!(m.kind, MouseEventKind::Down(_)) {
             return None;
         }
-        if let Some(&(_, idx)) = self.hit.iter().find(|(y, _)| *y == m.row) {
-            self.open = false;
-            return Some(ITEMS[idx]);
+        let (x0, x1) = self.box_x;
+        let in_box = m.column >= x0 && m.column < x1;
+        if in_box {
+            if let Some(&(_, idx)) = self.hit.iter().find(|(y, _)| *y == m.row) {
+                self.open = false;
+                return Some(ITEMS[idx]);
+            }
         }
         self.open = false; // click-away dismiss
         None
@@ -121,6 +129,7 @@ impl Menu {
         let height = ITEMS.len() as u16 + 2;
         let x = area.x;
         let y = area.y + 1;
+        self.box_x = (x, x + width);
         ui::draw_box(buf, x, y, width, height, "view");
         for (row, choice) in ITEMS.iter().enumerate() {
             let yy = y + 1 + row as u16;
@@ -128,16 +137,24 @@ impl Menu {
             let is_active = *choice == active;
             let marker = if is_active { "●" } else { " " };
             let style = if selected {
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else if is_active {
                 Style::default().fg(Color::Cyan)
             } else {
                 Style::default()
             };
-            buf.set_stringn(
+            crate::ui::put_str(
+                buf,
                 x + 1,
                 yy,
-                format!(" {marker} {:<w$}", choice.label(), w = (width as usize).saturating_sub(5)),
+                format!(
+                    " {marker} {:<w$}",
+                    choice.label(),
+                    w = (width as usize).saturating_sub(5)
+                ),
                 (width as usize).saturating_sub(2),
                 style,
             );

@@ -5,7 +5,11 @@ use ratatui::style::{Color, Modifier, Style};
 
 pub fn tok_style(tok: Tok) -> Style {
     let c = match tok {
-        Tok::Comment => return Style::default().fg(Color::Green).add_modifier(Modifier::DIM),
+        Tok::Comment => {
+            return Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::DIM)
+        }
         Tok::Keyword => Color::Magenta,
         Tok::Type => Color::Cyan,
         Tok::Str => Color::Yellow,
@@ -21,11 +25,13 @@ pub fn tok_style(tok: Tok) -> Style {
 /// operators — stays plain; hotspots layer their own colour on top.
 pub fn asm_style(tok: Tok) -> Style {
     match tok {
-        Tok::Type => Style::default().fg(Color::Cyan),                 // 0x… addresses
-        Tok::Num => Style::default().add_modifier(Modifier::DIM),      // bare hex: addr col, bytes, imms
+        Tok::Type => Style::default().fg(Color::Cyan), // 0x… addresses
+        Tok::Num => Style::default().add_modifier(Modifier::DIM), // bare hex: addr col, bytes, imms
         Tok::Str => Style::default().fg(Color::Yellow),
-        Tok::Comment => Style::default().fg(Color::Green).add_modifier(Modifier::DIM),
-        _ => Style::default(),                                         // mnemonics / registers / ops
+        Tok::Comment => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::DIM),
+        _ => Style::default(), // mnemonics / registers / ops
     }
 }
 

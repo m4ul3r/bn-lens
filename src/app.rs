@@ -10,9 +10,7 @@ use crate::strings::StringsList;
 use crate::switch::{Outcome, Switcher};
 use crate::ui;
 use crate::viewer::{Exit, Viewer};
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
-};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -89,10 +87,18 @@ impl App {
 
     /// Re-point the lens at (instance, target); keep current on failure.
     fn apply_switch(&mut self, instance: String, target: String) {
-        let tgt = if target.is_empty() { None } else { Some(target) };
-        if let Ok(ctx) =
-            Ctx::build(&self.bn_bin, &self.herdr, &self.agent_pane, Some(instance), tgt)
-        {
+        let tgt = if target.is_empty() {
+            None
+        } else {
+            Some(target)
+        };
+        if let Ok(ctx) = Ctx::build(
+            &self.bn_bin,
+            &self.herdr,
+            &self.agent_pane,
+            Some(instance),
+            tgt,
+        ) {
             self.ctx = ctx;
             self.picker = Picker::new(&self.ctx);
             self.strings = None;
@@ -212,7 +218,7 @@ impl App {
             return;
         };
         let secs = refreshing.started.elapsed().as_secs_f32();
-        let label = format!("⟳ refreshing bn context…  {secs:.1}s   · input paused");
+        let label = format!("⟳ refreshing bn context…  {secs:.1}s   · Esc to cancel");
         let width = area.width as usize;
         let y = area.y + area.height.saturating_sub(1);
         let style = Style::default()
@@ -220,18 +226,23 @@ impl App {
             .bg(Color::Yellow)
             .add_modifier(Modifier::BOLD);
         // Fill the whole bottom row, then center the label on it.
-        buf.set_stringn(area.x, y, " ".repeat(width), width, style);
+        crate::ui::put_str(buf, area.x, y, " ".repeat(width), width, style);
         let label_width = label.chars().count();
         let x = area.x + ((width.saturating_sub(label_width)) / 2) as u16;
-        buf.set_stringn(x, y, label, width, style);
+        crate::ui::put_str(buf, x, y, label, width, style);
     }
 
     /// Refresh the pairing partner (throttled to ~1s).
     fn poll_status(&mut self) {
+        // Don't do blocking herdr I/O while a refresh owns the screen — it would
+        // stutter the banner's counter and can't be acted on anyway.
+        if self.refreshing.is_some() {
+            return;
+        }
         let now = Instant::now();
-        let due = self
-            .last_poll
-            .map_or(true, |t| now.duration_since(t) >= Duration::from_millis(1000));
+        let due = self.last_poll.map_or(true, |t| {
+            now.duration_since(t) >= Duration::from_millis(1000)
+        });
         if due {
             self.partner = if self.agent_pane.is_empty() {
                 None
@@ -263,7 +274,10 @@ impl App {
                         "idle" => ("○", Color::Green),
                         _ => ("·", Color::Gray),
                     };
-                    (c, format!(" {g} → {} {} {} ", self.agent_pane, a.agent, a.status))
+                    (
+                        c,
+                        format!(" {g} → {} {} {} ", self.agent_pane, a.agent, a.status),
+                    )
                 }
             }
         };
@@ -271,48 +285,82 @@ impl App {
         if lw >= area.width {
             return;
         }
-        buf.set_stringn(
+        crate::ui::put_str(
+            buf,
             area.x + area.width - lw,
             area.y,
             label,
             lw as usize,
-            Style::default().fg(color).bg(ui::BAR_BG).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(color)
+                .bg(ui::BAR_BG)
+                .add_modifier(Modifier::BOLD),
         );
     }
 
+    /// True while the focused list/viewer is capturing raw text input (a search
+    /// filter, or an ask/comment/tag/rename field) — so the global `?`/`^R`/`m`
+    /// shortcuts must not steal those characters.
+    fn capturing_text(&self) -> bool {
+        if let Some(viewer) = &self.viewer {
+            return viewer.is_capturing_text();
+        }
+        match self.view {
+            AppView::Symbols => self.picker.is_searching(),
+            AppView::Strings => self.strings.as_ref().is_some_and(StringsList::is_searching),
+        }
+    }
+
+    /// True while the active list has a self-managed overlay open (sections /
+    /// usage popup) — so `m` shouldn't stack the dropdown on top of it.
+    fn list_popup_open(&self) -> bool {
+        if self.viewer.is_some() {
+            return false;
+        }
+        match self.view {
+            AppView::Symbols => self.picker.popup_open(),
+            AppView::Strings => self.strings.as_ref().is_some_and(StringsList::popup_open),
+        }
+    }
+
     fn on_key(&mut self, k: crossterm::event::KeyEvent) -> bool {
-        // A refresh is blocking-by-design: swallow input until it lands.
+        let ctrl = k
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL);
+        // A refresh blocks input by design, but keep an escape hatch (Esc /
+        // Ctrl-C) so a hung `bn` can't wedge the TUI unrecoverably.
         if self.refreshing.is_some() {
+            if k.code == crossterm::event::KeyCode::Esc
+                || (ctrl && k.code == crossterm::event::KeyCode::Char('c'))
+            {
+                self.refreshing = None; // abandon; the worker's result is ignored
+            }
             return false;
         }
         if self.help.is_open() {
             self.help.on_key(k);
             return false;
         }
-        let composing_question = self
-            .viewer
-            .as_ref()
-            .is_some_and(Viewer::is_composing_question);
-        if k.code == crossterm::event::KeyCode::Char('?') && !composing_question {
-            self.help.open(self.help_context());
-            return false;
-        }
-        // Ctrl-R: re-sync with the live bn instance (agent edits, renames).
-        if k.code == crossterm::event::KeyCode::Char('r')
-            && k.modifiers
-                .contains(crossterm::event::KeyModifiers::CONTROL)
-            && self.switcher.is_none()
-            && !composing_question
-        {
-            self.start_refresh();
-            return false;
-        }
-        // The dropdown, when open, captures keys until a choice or dismiss.
+        // The dropdown, when open, owns every key until a choice or a dismiss —
+        // checked before the global shortcuts so `?`/`^R` don't stack over it.
         if self.menu.is_open() {
             if let Some(choice) = self.menu.on_key(k) {
                 return self.choose(choice);
             }
             return false;
+        }
+        // Global shortcuts, suppressed while a text field is capturing input so
+        // `?`/`m`/`^R` stay typeable inside search/comment/ask/rename fields.
+        let capturing = self.capturing_text();
+        if !capturing {
+            if k.code == crossterm::event::KeyCode::Char('?') {
+                self.help.open(self.help_context());
+                return false;
+            }
+            if ctrl && k.code == crossterm::event::KeyCode::Char('r') && self.switcher.is_none() {
+                self.start_refresh();
+                return false;
+            }
         }
         if let Some(sw) = &mut self.switcher {
             match sw.on_key(k) {
@@ -325,8 +373,13 @@ impl App {
             }
             return false;
         }
-        // `m` opens the view menu from either list (not while in the viewer).
-        if k.code == crossterm::event::KeyCode::Char('m') && self.viewer.is_none() {
+        // `m` opens the view menu from a list — never in the viewer, while typing,
+        // or over a list sub-popup.
+        if k.code == crossterm::event::KeyCode::Char('m')
+            && self.viewer.is_none()
+            && !capturing
+            && !self.list_popup_open()
+        {
             self.menu.open(self.active_choice());
             return false;
         }
@@ -367,8 +420,13 @@ impl App {
             }
             return false;
         }
-        // Clicking the `bn lens` title toggles the dropdown (list mode only).
-        if self.viewer.is_none() && self.switcher.is_none() && Menu::hit_title(self.area, m) {
+        // Clicking the `bn lens` title toggles the dropdown (list mode only, and
+        // not over a list sub-popup).
+        if self.viewer.is_none()
+            && self.switcher.is_none()
+            && !self.list_popup_open()
+            && Menu::hit_title(self.area, m)
+        {
             self.menu.toggle(self.active_choice());
             return false;
         }

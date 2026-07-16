@@ -45,7 +45,13 @@ impl Viewer {
     }
 
     fn rename_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
-        let Popup::Rename { old, buf, err, scope } = &mut self.popup else {
+        let Popup::Rename {
+            old,
+            buf,
+            err,
+            scope,
+        } = &mut self.popup
+        else {
             return Exit::Stay;
         };
         match key.code {
@@ -79,7 +85,13 @@ impl Viewer {
     /// Apply a validated rename. A local retexts in place (cheap); a function
     /// symbol needs a ctx rebuild, so we update `self.name` if it was the one in
     /// view and signal `Exit::Reload`.
-    fn commit_rename(&mut self, ctx: &Ctx, scope: super::RenameScope, old: &str, new: &str) -> Exit {
+    fn commit_rename(
+        &mut self,
+        ctx: &Ctx,
+        scope: super::RenameScope,
+        old: &str,
+        new: &str,
+    ) -> Exit {
         match scope {
             super::RenameScope::Local => {
                 let function = self.name.clone();
@@ -124,7 +136,8 @@ impl Viewer {
                     super::AnnTarget::Func(func) => ctx.bn.comment_set_func(func, &text),
                 };
                 if ok {
-                    self.status = format!(" ✓ comment set {}   (`bn save` to persist)", target.label());
+                    self.status =
+                        format!(" ✓ comment set {}   (`bn save` to persist)", target.label());
                     // Re-render so the note shows inline (no ctx change).
                     self.load(ctx);
                 } else {

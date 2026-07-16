@@ -58,7 +58,8 @@ impl Viewer {
         let kind = self.view.label();
         let dim = Style::default().add_modifier(Modifier::DIM);
         if let Some(query) = &self.search_input {
-            buffer.set_stringn(
+            crate::ui::put_str(
+                buffer,
                 area.x,
                 area.y + 1,
                 format!(" /{query}"),
@@ -68,7 +69,8 @@ impl Viewer {
                     .add_modifier(Modifier::BOLD),
             );
         } else if !self.status.is_empty() {
-            buffer.set_stringn(
+            crate::ui::put_str(
+                buffer,
                 area.x,
                 area.y + 1,
                 &self.status,
@@ -78,7 +80,8 @@ impl Viewer {
                     .add_modifier(Modifier::BOLD),
             );
         } else if self.vmode {
-            buffer.set_stringn(
+            crate::ui::put_str(
+                buffer,
                 area.x,
                 area.y + 1,
                 format!(
@@ -185,7 +188,14 @@ impl Viewer {
                     .fg(Color::Green)
                     .add_modifier(Modifier::DIM)
             };
-            buffer.set_stringn(area.x, y, gutter, GUTTER_WIDTH as usize, gutter_style);
+            crate::ui::put_str(
+                buffer,
+                area.x,
+                y,
+                gutter,
+                GUTTER_WIDTH as usize,
+                gutter_style,
+            );
 
             let continuation_gutter = format!("    {}↳ ", if selected { "┃" } else { " " });
             let continuation_style = if selected {
@@ -244,7 +254,8 @@ impl Viewer {
                         if y >= bottom {
                             break 'segments;
                         }
-                        buffer.set_stringn(
+                        crate::ui::put_str(
+                            buffer,
                             area.x,
                             y,
                             &continuation_gutter,
@@ -258,7 +269,7 @@ impl Viewer {
                         .iter()
                         .collect();
                     let chunk_len = chunk.chars().count();
-                    buffer.set_stringn(x, y, &chunk, space, style);
+                    crate::ui::put_str(buffer, x, y, &chunk, space, style);
                     if first_chunk {
                         if let Some(index) = hotspot {
                             self.screen_tgts.push((x, x + chunk_len as u16, y, index));
@@ -299,35 +310,40 @@ impl Viewer {
                 } else {
                     format!("→ sends to {}", ctx.agent_pane)
                 };
-                buffer.set_stringn(
+                crate::ui::put_str(
+                    buffer,
                     box_x + 2,
                     box_y + 1,
                     destination,
                     (box_width - 4) as usize,
                     Style::default().fg(Color::Yellow),
                 );
-                buffer.set_stringn(
+                crate::ui::put_str(
+                    buffer,
                     box_x + 2,
                     box_y + 2,
                     label,
                     (box_width - 4) as usize,
                     Style::default().fg(Color::Cyan),
                 );
-                buffer.set_stringn(
+                crate::ui::put_str(
+                    buffer,
                     box_x + 2,
                     box_y + 3,
                     preview,
                     (box_width - 4) as usize,
                     Style::default().add_modifier(Modifier::DIM),
                 );
-                buffer.set_stringn(
+                crate::ui::put_str(
+                    buffer,
                     box_x + 2,
                     box_y + 5,
                     format!("> {input}"),
                     (box_width - 4) as usize,
                     Style::default(),
                 );
-                buffer.set_stringn(
+                crate::ui::put_str(
+                    buffer,
                     box_x + 2,
                     box_y + box_height - 1,
                     " Enter send · Esc cancel ",
@@ -362,11 +378,12 @@ impl Viewer {
                     };
                     let y = box_y + 1 + row as u16;
                     if focused {
-                        buffer.set_stringn(box_x + 2, y, " ".repeat(inner), inner, style);
+                        crate::ui::put_str(buffer, box_x + 2, y, " ".repeat(inner), inner, style);
                     }
-                    buffer.set_stringn(box_x + 2, y, line, inner, style);
+                    crate::ui::put_str(buffer, box_x + 2, y, line, inner, style);
                 }
-                buffer.set_stringn(
+                crate::ui::put_str(
+                    buffer,
                     box_x + 2,
                     box_y + box_height - 1,
                     " j/k scroll · ? help · q close ",
@@ -389,14 +406,16 @@ impl Viewer {
                     super::RenameScope::Symbol => "rename function  (live in the bn instance)",
                 };
                 crate::ui::draw_box(buffer, box_x, box_y, box_width, box_height, title);
-                buffer.set_stringn(
+                crate::ui::put_str(
+                    buffer,
                     box_x + 2,
                     box_y + 2,
                     format!("{old}  →"),
                     (box_width - 4) as usize,
                     Style::default().fg(Color::Cyan),
                 );
-                buffer.set_stringn(
+                crate::ui::put_str(
+                    buffer,
                     box_x + 2,
                     box_y + 3,
                     format!("> {input}"),
@@ -404,7 +423,8 @@ impl Viewer {
                     Style::default(),
                 );
                 if !err.is_empty() {
-                    buffer.set_stringn(
+                    crate::ui::put_str(
+                        buffer,
                         box_x + 2,
                         box_y + 4,
                         format!("✗ {err}"),
@@ -412,7 +432,8 @@ impl Viewer {
                         Style::default().fg(Color::Red),
                     );
                 }
-                buffer.set_stringn(
+                crate::ui::put_str(
+                    buffer,
                     box_x + 2,
                     box_y + box_height - 1,
                     " Enter rename · Esc cancel · ? help ",
@@ -459,21 +480,24 @@ impl Viewer {
         let box_x = area.x + (area.width.saturating_sub(box_width)) / 2;
         let box_y = area.y + (area.height.saturating_sub(box_height)) / 2;
         crate::ui::draw_box(buffer, box_x, box_y, box_width, box_height, title);
-        buffer.set_stringn(
+        crate::ui::put_str(
+            buffer,
             box_x + 2,
             box_y + 2,
             target_line,
             (box_width - 4) as usize,
             Style::default().fg(Color::Cyan),
         );
-        buffer.set_stringn(
+        crate::ui::put_str(
+            buffer,
             box_x + 2,
             box_y + 3,
             format!("> {input}"),
             (box_width - 4) as usize,
             Style::default(),
         );
-        buffer.set_stringn(
+        crate::ui::put_str(
+            buffer,
             box_x + 2,
             box_y + box_height - 1,
             footer,

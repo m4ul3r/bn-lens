@@ -31,8 +31,8 @@ struct Item {
     name: String,   // "" => a data address (not a function)
     target: String, // decompile/xref target: fn name, or the address
     import: bool,
-    annot: String,  // section → nearest-symbol for data addresses; "" for functions
-    src: u8,        // YOU|AGENT bits (0 in the "all" group)
+    annot: String, // section → nearest-symbol for data addresses; "" for functions
+    src: u8,       // YOU|AGENT bits (0 in the "all" group)
 }
 
 /// One display line: a group header, or an item in the recent / all group.
@@ -76,7 +76,13 @@ fn parse_hex(s: &str) -> Option<u64> {
 
 impl Picker {
     pub fn new(ctx: &Ctx) -> Self {
-        let awidth = ctx.funcs.iter().map(|f| f.addr.len()).max().unwrap_or(10).max(10);
+        let awidth = ctx
+            .funcs
+            .iter()
+            .map(|f| f.addr.len())
+            .max()
+            .unwrap_or(10)
+            .max(10);
 
         let mut all: Vec<Item> = ctx
             .funcs
@@ -93,10 +99,16 @@ impl Picker {
         all.sort_by_key(|it| parse_hex(&it.addr).unwrap_or(0));
 
         let fn_names = ctx.func_names.clone();
-        let fn_name_addr: HashMap<String, String> =
-            ctx.funcs.iter().map(|f| (f.name.clone(), f.addr.clone())).collect();
-        let fn_addr_name: HashMap<String, String> =
-            ctx.funcs.iter().map(|f| (f.addr.clone(), f.name.clone())).collect();
+        let fn_name_addr: HashMap<String, String> = ctx
+            .funcs
+            .iter()
+            .map(|f| (f.name.clone(), f.addr.clone()))
+            .collect();
+        let fn_addr_name: HashMap<String, String> = ctx
+            .funcs
+            .iter()
+            .map(|f| (f.addr.clone(), f.name.clone()))
+            .collect();
 
         let mut syms: Vec<(u64, String)> = ctx
             .addr_by_name
@@ -106,8 +118,11 @@ impl Picker {
         syms.sort_by_key(|(a, _)| *a);
 
         let sec_lines = ctx.sections_text.clone();
-        let ranges: Vec<(u64, u64, String)> =
-            ctx.section_ranges.iter().map(|(s, e, n, _)| (*s, *e, n.clone())).collect();
+        let ranges: Vec<(u64, u64, String)> = ctx
+            .section_ranges
+            .iter()
+            .map(|(s, e, n, _)| (*s, *e, n.clone()))
+            .collect();
 
         Picker {
             all,
@@ -149,6 +164,17 @@ impl Picker {
         self.rebuild_recent();
     }
 
+    /// True while the search filter is capturing raw text (so App must not steal
+    /// `m`/`?`/`^R` as global shortcuts — they belong in the query).
+    pub fn is_searching(&self) -> bool {
+        matches!(self.mode, Mode::Search)
+    }
+
+    /// True while a self-managed overlay (the sections popup) owns input.
+    pub fn popup_open(&self) -> bool {
+        self.sec_off.is_some()
+    }
+
     /// Record a function you just opened in the lens (MRU, newest first).
     pub fn record_open(&mut self, name: &str) {
         if name.is_empty() {
@@ -174,7 +200,11 @@ impl Picker {
         let sec = self.ranges.iter().find(|(s, e, _)| addr >= *s && addr < *e);
         let sec_start = sec.map(|(s, _, _)| *s).unwrap_or(0);
         // nearest symbol at or below the address, but within the same section
-        let sym = self.syms.iter().rev().find(|(a, _)| *a <= addr && *a >= sec_start);
+        let sym = self
+            .syms
+            .iter()
+            .rev()
+            .find(|(a, _)| *a <= addr && *a >= sec_start);
         match (sec, sym) {
             (Some((_, _, name)), Some((sa, sn))) => {
                 let off = addr - sa;
@@ -323,7 +353,10 @@ impl Picker {
         if sp.is_empty() {
             self.sel = 0;
         } else if !sp.contains(&self.sel) {
-            self.sel = *sp.iter().find(|&&i| i >= self.sel).unwrap_or(sp.last().unwrap());
+            self.sel = *sp
+                .iter()
+                .find(|&&i| i >= self.sel)
+                .unwrap_or(sp.last().unwrap());
         }
     }
 
@@ -346,7 +379,16 @@ impl Picker {
         }
     }
 
-    fn draw_item(&self, buf: &mut Buffer, x0: u16, y: u16, w: usize, it: &Item, is_sel: bool, recent: bool) {
+    fn draw_item(
+        &self,
+        buf: &mut Buffer,
+        x0: u16,
+        y: u16,
+        w: usize,
+        it: &Item,
+        is_sel: bool,
+        recent: bool,
+    ) {
         let glyph = if recent {
             match (it.src & YOU != 0, it.src & AGENT != 0) {
                 (true, true) => "★ ",
@@ -358,16 +400,31 @@ impl Picker {
             "  "
         };
         let tail = if it.name.is_empty() {
-            if it.annot.is_empty() { "(addr)".to_string() } else { it.annot.clone() }
+            if it.annot.is_empty() {
+                "(addr)".to_string()
+            } else {
+                it.annot.clone()
+            }
         } else {
             it.name.clone()
         };
         if is_sel {
             let text = format!("{glyph}{:<aw$}  {tail}", it.addr, aw = self.awidth);
-            buf.set_stringn(x0, y, format!("{text:<w$}"), w, Style::default().add_modifier(Modifier::REVERSED));
+            crate::ui::put_str(
+                buf,
+                x0,
+                y,
+                format!("{text:<w$}"),
+                w,
+                Style::default().add_modifier(Modifier::REVERSED),
+            );
             return;
         }
-        let dim = if it.import { Modifier::DIM } else { Modifier::empty() };
+        let dim = if it.import {
+            Modifier::DIM
+        } else {
+            Modifier::empty()
+        };
         let tail_style = if it.name.is_empty() {
             Style::default().fg(Color::Magenta) // data annotation
         } else {
@@ -375,7 +432,10 @@ impl Picker {
         };
         let spans = vec![
             Span::styled(glyph.to_string(), Style::default().fg(theme::MARK)),
-            Span::styled(format!("{:<aw$}", it.addr, aw = self.awidth), Style::default().fg(theme::ADDR).add_modifier(dim)),
+            Span::styled(
+                format!("{:<aw$}", it.addr, aw = self.awidth),
+                Style::default().fg(theme::ADDR).add_modifier(dim),
+            ),
             Span::styled(format!("  {tail}"), tail_style),
         ];
         crate::ui::put_spans(buf, x0, y, w, &spans);
@@ -394,7 +454,11 @@ impl Picker {
 
         let x0 = area.x;
         let w = area.width as usize;
-        let shown = if self.filter.is_empty() { self.all.len() } else { self.filtered_all().len() };
+        let shown = if self.filter.is_empty() {
+            self.all.len()
+        } else {
+            self.filtered_all().len()
+        };
         let mut bar = crate::ui::crumbs(ctx);
         bar.push(Span::styled(
             format!("   {}/{}", shown, self.all.len()),
@@ -415,13 +479,23 @@ impl Picker {
                 " j/k move · / search · Enter open · x xrefs · m menu · i switch · ? help · q quit",
             ),
         };
-        buf.set_stringn(x0, area.y + 1, state, w, Style::default().add_modifier(Modifier::DIM));
+        crate::ui::put_str(
+            buf,
+            x0,
+            area.y + 1,
+            state,
+            w,
+            Style::default().add_modifier(Modifier::DIM),
+        );
         crate::ui::render_bar(
             buf,
             x0,
             area.y + area.height.saturating_sub(1),
             w,
-            &[Span::styled(keys, Style::default().add_modifier(Modifier::DIM))],
+            &[Span::styled(
+                keys,
+                Style::default().add_modifier(Modifier::DIM),
+            )],
         );
 
         for (ri, row) in rows.iter().enumerate().skip(self.top).take(listh) {
@@ -431,9 +505,20 @@ impl Picker {
                     let label = format!("── {h} ");
                     let pad = w.saturating_sub(label.chars().count());
                     let line = format!("{label}{}", "─".repeat(pad));
-                    buf.set_stringn(x0, y, line, w, Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM));
+                    crate::ui::put_str(
+                        buf,
+                        x0,
+                        y,
+                        line,
+                        w,
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    );
                 }
-                Row::Recent(i) => self.draw_item(buf, x0, y, w, &self.recent[*i], ri == self.sel, true),
+                Row::Recent(i) => {
+                    self.draw_item(buf, x0, y, w, &self.recent[*i], ri == self.sel, true)
+                }
                 Row::All(i) => self.draw_item(buf, x0, y, w, &self.all[*i], ri == self.sel, false),
             }
         }
@@ -444,12 +529,33 @@ impl Picker {
             let bh = (area.height.saturating_sub(4)).clamp(8, 30);
             let bx = area.x + (area.width.saturating_sub(bw)) / 2;
             let by = area.y + (area.height.saturating_sub(bh)) / 2;
-            crate::ui::draw_box(buf, bx, by, bw, bh, "sections  ·  r-x=exec  rw-=data  w+x flagged");
+            crate::ui::draw_box(
+                buf,
+                bx,
+                by,
+                bw,
+                bh,
+                "sections  ·  r-x=exec  rw-=data  w+x flagged",
+            );
             let view_h = (bh as usize).saturating_sub(3);
             for (i, ln) in self.sec_lines.iter().skip(off).take(view_h).enumerate() {
-                buf.set_stringn(bx + 2, by + 1 + i as u16, ln, (bw - 4) as usize, Style::default().fg(Color::Yellow));
+                crate::ui::put_str(
+                    buf,
+                    bx + 2,
+                    by + 1 + i as u16,
+                    ln,
+                    (bw - 4) as usize,
+                    Style::default().fg(Color::Yellow),
+                );
             }
-            buf.set_stringn(bx + 2, by + bh - 1, " j/k scroll · ? help · s/q close ", (bw - 4) as usize, Style::default().add_modifier(Modifier::DIM));
+            crate::ui::put_str(
+                buf,
+                bx + 2,
+                by + bh - 1,
+                " j/k scroll · ? help · s/q close ",
+                (bw - 4) as usize,
+                Style::default().add_modifier(Modifier::DIM),
+            );
         }
     }
 
@@ -479,7 +585,9 @@ impl Picker {
                 KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('s') | KeyCode::Enter => {
                     self.sec_off = None
                 }
-                KeyCode::Char('j') | KeyCode::Down => self.sec_off = Some((off + 1).min(n.saturating_sub(1))),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.sec_off = Some((off + 1).min(n.saturating_sub(1)))
+                }
                 KeyCode::Char('k') | KeyCode::Up => self.sec_off = Some(off.saturating_sub(1)),
                 KeyCode::PageDown => self.sec_off = Some((off + 10).min(n.saturating_sub(1))),
                 KeyCode::PageUp => self.sec_off = Some(off.saturating_sub(10)),

@@ -159,7 +159,12 @@ fn parse_hex(s: &str) -> Option<u64> {
 impl StringsList {
     pub fn new(ctx: &Ctx) -> Self {
         let items = Self::build(ctx);
-        let awidth = items.iter().map(|it| it.addr.len()).max().unwrap_or(10).max(10);
+        let awidth = items
+            .iter()
+            .map(|it| it.addr.len())
+            .max()
+            .unwrap_or(10)
+            .max(10);
         StringsList {
             items,
             awidth,
@@ -176,7 +181,13 @@ impl StringsList {
     /// Re-pull strings from a rebuilt ctx (keeps the filter, snaps the cursor).
     pub fn refresh(&mut self, ctx: &Ctx) {
         self.items = Self::build(ctx);
-        self.awidth = self.items.iter().map(|it| it.addr.len()).max().unwrap_or(10).max(10);
+        self.awidth = self
+            .items
+            .iter()
+            .map(|it| it.addr.len())
+            .max()
+            .unwrap_or(10)
+            .max(10);
     }
 
     /// Deduped by address, sorted by address. bn emits the same content at
@@ -211,6 +222,17 @@ impl StringsList {
             return;
         }
         self.sel = (self.sel as i64 + delta).clamp(0, len - 1) as usize;
+    }
+
+    /// True while the search filter is capturing raw text (App must not steal
+    /// `m`/`?`/`^R`).
+    pub fn is_searching(&self) -> bool {
+        matches!(self.mode, Mode::Search)
+    }
+
+    /// True while the usage popup owns input.
+    pub fn popup_open(&self) -> bool {
+        self.usage.is_some()
     }
 
     fn current(&self) -> Option<&StrItem> {
@@ -288,7 +310,9 @@ impl StringsList {
     }
 
     fn usage_key(&mut self, k: KeyEvent) -> Action {
-        let Some(usage) = &mut self.usage else { return Action::None };
+        let Some(usage) = &mut self.usage else {
+            return Action::None;
+        };
         let n = usage.lines.len();
         match k.code {
             KeyCode::Enter | KeyCode::Char('x') => {
@@ -297,7 +321,9 @@ impl StringsList {
                 return Action::OpenXrefs(addr);
             }
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('p') => self.usage = None,
-            KeyCode::Char('j') | KeyCode::Down => usage.off = (usage.off + 1).min(n.saturating_sub(1)),
+            KeyCode::Char('j') | KeyCode::Down => {
+                usage.off = (usage.off + 1).min(n.saturating_sub(1))
+            }
             KeyCode::Char('k') | KeyCode::Up => usage.off = usage.off.saturating_sub(1),
             KeyCode::PageDown => usage.off = (usage.off + 10).min(n.saturating_sub(1)),
             KeyCode::PageUp => usage.off = usage.off.saturating_sub(10),
@@ -431,13 +457,23 @@ impl StringsList {
                 " j/k move · / search · p usage · Enter/x xrefs · m menu · ? help · q quit",
             ),
         };
-        buf.set_stringn(x0, area.y + 1, state, w, Style::default().add_modifier(Modifier::DIM));
+        crate::ui::put_str(
+            buf,
+            x0,
+            area.y + 1,
+            state,
+            w,
+            Style::default().add_modifier(Modifier::DIM),
+        );
         crate::ui::render_bar(
             buf,
             x0,
             area.y + area.height.saturating_sub(1),
             w,
-            &[Span::styled(keys, Style::default().add_modifier(Modifier::DIM))],
+            &[Span::styled(
+                keys,
+                Style::default().add_modifier(Modifier::DIM),
+            )],
         );
 
         for (row, &i) in rows.iter().enumerate().skip(self.top).take(listh) {
@@ -446,12 +482,27 @@ impl StringsList {
             let is_sel = row == self.sel;
             if is_sel {
                 let text = format!("{:<aw$}  \"{}\"", it.addr, it.content, aw = self.awidth);
-                buf.set_stringn(x0, y, format!("{text:<w$}"), w, Style::default().add_modifier(Modifier::REVERSED));
+                crate::ui::put_str(
+                    buf,
+                    x0,
+                    y,
+                    format!("{text:<w$}"),
+                    w,
+                    Style::default().add_modifier(Modifier::REVERSED),
+                );
                 continue;
             }
             let spans = vec![
-                Span::styled(format!("{:<aw$}", it.addr, aw = self.awidth), Style::default().fg(crate::theme::ADDR).add_modifier(Modifier::DIM)),
-                Span::styled(format!("  \"{}\"", it.content), Style::default().fg(Color::Magenta)),
+                Span::styled(
+                    format!("{:<aw$}", it.addr, aw = self.awidth),
+                    Style::default()
+                        .fg(crate::theme::ADDR)
+                        .add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    format!("  \"{}\"", it.content),
+                    Style::default().fg(Color::Magenta),
+                ),
             ];
             crate::ui::put_spans(buf, x0, y, w, &spans);
         }
@@ -469,7 +520,8 @@ impl StringsList {
         crate::ui::draw_box(buf, bx, by, bw, bh, &usage.title);
         let view_h = (bh as usize).saturating_sub(3);
         for (i, line) in usage.lines.iter().skip(usage.off).take(view_h).enumerate() {
-            buf.set_stringn(
+            crate::ui::put_str(
+                buf,
                 bx + 2,
                 by + 1 + i as u16,
                 line,
@@ -477,7 +529,8 @@ impl StringsList {
                 Style::default().fg(Color::Yellow),
             );
         }
-        buf.set_stringn(
+        crate::ui::put_str(
+            buf,
             bx + 2,
             by + bh - 1,
             " j/k scroll · Enter/x opens full xrefs · p/q/Esc close ",

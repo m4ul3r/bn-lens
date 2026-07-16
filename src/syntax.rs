@@ -22,15 +22,14 @@ pub struct Seg {
 pub type Line = Vec<Seg>;
 
 const KEYWORDS: &[&str] = &[
-    "if", "else", "for", "while", "do", "return", "goto", "switch", "case",
-    "break", "continue", "default", "sizeof", "struct", "union", "enum",
-    "typedef", "static", "const", "volatile", "unsigned", "signed", "extern",
-    "register", "inline",
+    "if", "else", "for", "while", "do", "return", "goto", "switch", "case", "break", "continue",
+    "default", "sizeof", "struct", "union", "enum", "typedef", "static", "const", "volatile",
+    "unsigned", "signed", "extern", "register", "inline",
 ];
 
 const TYPES: &[&str] = &[
-    "void", "char", "short", "int", "long", "float", "double", "bool",
-    "size_t", "ssize_t", "wchar_t", "FILE",
+    "void", "char", "short", "int", "long", "float", "double", "bool", "size_t", "ssize_t",
+    "wchar_t", "FILE",
 ];
 
 fn classify_ident(id: &str) -> Tok {
@@ -192,8 +191,8 @@ pub fn tokenize_plain(text: &str) -> Vec<Line> {
                     // it Num so it dims uniformly. 3-4 char stays a Name so
                     // mnemonics like `add`/`adc` aren't dimmed.
                     let t: &[char] = &ch[start..i];
-                    let hexish = (t.len() == 2 || t.len() >= 5)
-                        && t.iter().all(|c| c.is_ascii_hexdigit());
+                    let hexish =
+                        (t.len() == 2 || t.len() >= 5) && t.iter().all(|c| c.is_ascii_hexdigit());
                     segs.push(seg(t, if hexish { Tok::Num } else { Tok::Name }));
                 } else {
                     segs.push(seg(&ch[i..i + 1], Tok::Plain));
@@ -226,7 +225,9 @@ mod tests {
         let lines = tokenize_c("int64_t x0 = msg_alloc();");
         let segs = kinds(&lines[0]);
         assert!(segs.iter().any(|(t, k)| *t == "int64_t" && *k == Tok::Type));
-        assert!(segs.iter().any(|(t, k)| *t == "msg_alloc" && *k == Tok::Name));
+        assert!(segs
+            .iter()
+            .any(|(t, k)| *t == "msg_alloc" && *k == Tok::Name));
         // reassembling the segments round-trips the source text
         let joined: String = lines[0].iter().map(|s| s.text.clone()).collect();
         assert_eq!(joined, "int64_t x0 = msg_alloc();");
@@ -244,19 +245,27 @@ mod tests {
     fn block_comment_spans_lines() {
         let lines = tokenize_c("a /* start\nmiddle\nend */ b");
         assert_eq!(lines[1][0].kind, Tok::Comment); // whole middle line
-        assert!(lines[2].iter().any(|s| s.text == "b" && s.kind != Tok::Comment));
+        assert!(lines[2]
+            .iter()
+            .any(|s| s.text == "b" && s.kind != Tok::Comment));
     }
 
     #[test]
     fn hex_and_numbers() {
         let lines = tokenize_c("y = 0x9c4 + 16;");
-        assert!(lines[0].iter().any(|s| s.text == "0x9c4" && s.kind == Tok::Num));
+        assert!(lines[0]
+            .iter()
+            .any(|s| s.text == "0x9c4" && s.kind == Tok::Num));
     }
 
     #[test]
     fn plain_addresses() {
         let lines = tokenize_plain("  0x402620  build_and_send  (1 site: 0x402658)");
-        assert!(lines[0].iter().any(|s| s.text == "0x402620" && s.kind == Tok::Type));
-        assert!(lines[0].iter().any(|s| s.text == "build_and_send" && s.kind == Tok::Name));
+        assert!(lines[0]
+            .iter()
+            .any(|s| s.text == "0x402620" && s.kind == Tok::Type));
+        assert!(lines[0]
+            .iter()
+            .any(|s| s.text == "build_and_send" && s.kind == Tok::Name));
     }
 }

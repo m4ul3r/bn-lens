@@ -53,8 +53,12 @@ fn parse_section_ranges(lines: &[String]) -> Vec<(u64, u64, String, bool)> {
     for line in lines {
         let cols: Vec<&str> = line.split_whitespace().collect();
         let Some(range) = cols.first() else { continue };
-        let Some((s, e)) = range.split_once('-') else { continue };
-        let (Some(s), Some(e)) = (parse_hex(s), parse_hex(e)) else { continue };
+        let Some((s, e)) = range.split_once('-') else {
+            continue;
+        };
+        let (Some(s), Some(e)) = (parse_hex(s), parse_hex(e)) else {
+            continue;
+        };
         let name = cols.last().copied().unwrap_or("").to_string();
         // perms column (e.g. "r-x") is the 3rd token when present
         let exec = cols.get(2).is_some_and(|p| p.contains('x'));
@@ -66,7 +70,9 @@ fn parse_section_ranges(lines: &[String]) -> Vec<(u64, u64, String, bool)> {
 impl Ctx {
     /// The section containing `addr`, if any.
     pub fn section_of(&self, addr: u64) -> Option<&(u64, u64, String, bool)> {
-        self.section_ranges.iter().find(|(s, e, _, _)| addr >= *s && addr < *e)
+        self.section_ranges
+            .iter()
+            .find(|(s, e, _, _)| addr >= *s && addr < *e)
     }
 
     /// String-literal map (content -> address), built once on first use.
@@ -110,7 +116,13 @@ impl Ctx {
             if Some(&alt.instance_id) == instance.as_ref() {
                 continue;
             }
-            if let Ok(c) = Self::build(&bn_bin, &herdr_bin, &agent_pane, Some(alt.instance_id), None) {
+            if let Ok(c) = Self::build(
+                &bn_bin,
+                &herdr_bin,
+                &agent_pane,
+                Some(alt.instance_id),
+                None,
+            ) {
                 return Ok(c);
             }
         }
@@ -157,8 +169,10 @@ impl Ctx {
             addr_by_name.entry(f.name.clone()).or_insert(f.addr.clone());
         }
         let func_names: HashSet<String> = funcs.iter().map(|f| f.name.clone()).collect();
-        let name_by_addr: HashMap<String, String> =
-            addr_by_name.iter().map(|(n, a)| (a.clone(), n.clone())).collect();
+        let name_by_addr: HashMap<String, String> = addr_by_name
+            .iter()
+            .map(|(n, a)| (a.clone(), n.clone()))
+            .collect();
         let import_names = bn.imports();
         let arch = bn.arch();
         let sections_text = bn.sections();

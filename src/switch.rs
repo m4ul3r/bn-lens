@@ -59,7 +59,9 @@ impl Switcher {
     }
 
     fn cur_inst_id(&self) -> Option<String> {
-        self.instances.get(self.inst_sel).map(|i| i.instance_id.clone())
+        self.instances
+            .get(self.inst_sel)
+            .map(|i| i.instance_id.clone())
     }
 
     fn reload_targets(&mut self) {
@@ -145,7 +147,14 @@ impl Switcher {
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         // clear the whole area
         for y in area.y..area.y + area.height {
-            buf.set_stringn(area.x, y, " ".repeat(area.width as usize), area.width as usize, Style::default());
+            crate::ui::put_str(
+                buf,
+                area.x,
+                y,
+                " ".repeat(area.width as usize),
+                area.width as usize,
+                Style::default(),
+            );
         }
         let w = area.width;
         ui::render_bar(
@@ -171,8 +180,22 @@ impl Switcher {
 
         // column separators
         for y in body_y..body_y + body_h as u16 {
-            buf.set_stringn(c2x - 1, y, "│", 1, Style::default().add_modifier(Modifier::DIM));
-            buf.set_stringn(c3x - 1, y, "│", 1, Style::default().add_modifier(Modifier::DIM));
+            crate::ui::put_str(
+                buf,
+                c2x - 1,
+                y,
+                "│",
+                1,
+                Style::default().add_modifier(Modifier::DIM),
+            );
+            crate::ui::put_str(
+                buf,
+                c3x - 1,
+                y,
+                "│",
+                1,
+                Style::default().add_modifier(Modifier::DIM),
+            );
         }
 
         // column 1 — instances
@@ -190,12 +213,25 @@ impl Switcher {
                 (i.instance_id.clone(), s)
             })
             .collect();
-        render_col(buf, c1x, body_y, c1w, body_h, "INSTANCES", &inst_rows, self.inst_sel, self.focus == Focus::Instances);
+        render_col(
+            buf,
+            c1x,
+            body_y,
+            c1w,
+            body_h,
+            "INSTANCES",
+            &inst_rows,
+            self.inst_sel,
+            self.focus == Focus::Instances,
+        );
 
         // column 2 — targets (placeholder row when the instance has none open)
         let (tgt_rows, tgt_sel): (Vec<(String, Style)>, usize) = if self.targets.is_empty() {
             (
-                vec![("(no targets open)".to_string(), Style::default().add_modifier(Modifier::DIM))],
+                vec![(
+                    "(no targets open)".to_string(),
+                    Style::default().add_modifier(Modifier::DIM),
+                )],
                 usize::MAX, // never highlight the placeholder
             )
         } else {
@@ -204,7 +240,11 @@ impl Switcher {
                     .iter()
                     .map(|t| {
                         (
-                            format!("{}{}", if t.active { "● " } else { "  " }, short_target(&t.selector)),
+                            format!(
+                                "{}{}",
+                                if t.active { "● " } else { "  " },
+                                short_target(&t.selector)
+                            ),
                             Style::default(),
                         )
                     })
@@ -212,15 +252,51 @@ impl Switcher {
                 self.tgt_sel,
             )
         };
-        render_col(buf, c2x, body_y, c2w, body_h, "TARGETS", &tgt_rows, tgt_sel, self.focus == Focus::Targets);
+        render_col(
+            buf,
+            c2x,
+            body_y,
+            c2w,
+            body_h,
+            "TARGETS",
+            &tgt_rows,
+            tgt_sel,
+            self.focus == Focus::Targets,
+        );
 
         // column 3 — target info preview
-        buf.set_stringn(c3x, body_y, " INFO", c3w as usize, Style::default().add_modifier(Modifier::DIM));
+        crate::ui::put_str(
+            buf,
+            c3x,
+            body_y,
+            " INFO",
+            c3w as usize,
+            Style::default().add_modifier(Modifier::DIM),
+        );
         if self.preview.is_empty() {
-            buf.set_stringn(c3x + 1, body_y + 1, "(no target selected)", (c3w - 1) as usize, Style::default().add_modifier(Modifier::DIM));
+            crate::ui::put_str(
+                buf,
+                c3x + 1,
+                body_y + 1,
+                "(no target selected)",
+                (c3w - 1) as usize,
+                Style::default().add_modifier(Modifier::DIM),
+            );
         }
-        for (i, line) in self.preview.iter().take(body_h.saturating_sub(1)).enumerate() {
-            buf.set_stringn(c3x + 1, body_y + 1 + i as u16, line, (c3w - 1) as usize, Style::default().fg(Color::Cyan));
+        for (i, line) in self
+            .preview
+            .iter()
+            .take(body_h.saturating_sub(1))
+            .enumerate()
+        {
+            crate::ui::put_str(
+                buf,
+                c3x + 1,
+                body_y + 1 + i as u16,
+                line,
+                (c3w - 1) as usize,
+                Style::default().fg(Color::Cyan),
+            );
         }
     }
 }
@@ -236,11 +312,22 @@ fn render_col(
     sel: usize,
     focused: bool,
 ) {
-    buf.set_stringn(x, top_y, format!(" {header}"), w as usize, Style::default().add_modifier(Modifier::DIM));
+    crate::ui::put_str(
+        buf,
+        x,
+        top_y,
+        format!(" {header}"),
+        w as usize,
+        Style::default().add_modifier(Modifier::DIM),
+    );
     let view_h = h.saturating_sub(1);
     // guard sel that is out of range (usize::MAX = "highlight nothing") so the
     // scroll offset can't underflow and skip every row.
-    let vtop = if sel < rows.len() && sel >= view_h { sel + 1 - view_h } else { 0 };
+    let vtop = if sel < rows.len() && sel >= view_h {
+        sel + 1 - view_h
+    } else {
+        0
+    };
     for (i, (label, base)) in rows.iter().skip(vtop).take(view_h).enumerate() {
         let idx = vtop + i;
         let y = top_y + 1 + i as u16;
@@ -253,7 +340,14 @@ fn render_col(
         } else {
             *base
         };
-        buf.set_stringn(x, y, format!(" {}", trunc(label, (w - 1) as usize)), w as usize, style);
+        crate::ui::put_str(
+            buf,
+            x,
+            y,
+            format!(" {}", trunc(label, (w - 1) as usize)),
+            w as usize,
+            style,
+        );
     }
 }
 
@@ -279,7 +373,16 @@ fn short_target(sel: &str) -> String {
 }
 
 fn format_info(raw: &str) -> Vec<String> {
-    let keys = ["kind:", "arch:", "platform:", "image base:", "entry:", "analysis:", "functions:", "file:"];
+    let keys = [
+        "kind:",
+        "arch:",
+        "platform:",
+        "image base:",
+        "entry:",
+        "analysis:",
+        "functions:",
+        "file:",
+    ];
     let mut out = Vec::new();
     for line in raw.lines() {
         let t = line.trim();

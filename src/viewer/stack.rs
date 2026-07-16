@@ -202,7 +202,8 @@ impl StackView {
             self.non_stack_count
         );
         let summary = ellipsize_to_width(&summary, inner_width);
-        buffer.set_stringn(
+        crate::ui::put_str(
+            buffer,
             inner_x,
             area.y + 1,
             summary,
@@ -222,7 +223,8 @@ impl StackView {
                 format_offset(local.storage)
             );
             let detail = ellipsize_to_width(&detail, inner_width);
-            buffer.set_stringn(
+            crate::ui::put_str(
+                buffer,
                 inner_x,
                 area.y + 2,
                 detail,
@@ -233,7 +235,8 @@ impl StackView {
             );
         }
 
-        buffer.set_stringn(
+        crate::ui::put_str(
+            buffer,
             inner_x,
             area.y + 3,
             " offset │ span │ local : type",
@@ -312,7 +315,8 @@ impl StackView {
         } else {
             " j/k · Enter jump · r rename · S/q "
         };
-        buffer.set_stringn(
+        crate::ui::put_str(
+            buffer,
             inner_x,
             area.y + area.height - 1,
             footer,

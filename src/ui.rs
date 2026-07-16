@@ -32,16 +32,37 @@ pub fn crumbs(ctx: &Ctx) -> Vec<Span<'static>> {
     ];
     if !ctx.target.is_empty() {
         v.push(Span::styled("  -t ", dim));
-        v.push(Span::styled(ctx.target.clone(), Style::default().fg(Color::White)));
+        v.push(Span::styled(
+            ctx.target.clone(),
+            Style::default().fg(Color::White),
+        ));
     }
     if !ctx.arch.is_empty() {
-        v.push(Span::styled(format!("  · {}", ctx.arch), Style::default().fg(Color::Cyan)));
+        v.push(Span::styled(
+            format!("  · {}", ctx.arch),
+            Style::default().fg(Color::Cyan),
+        ));
     }
     v
 }
 
+/// `set_stringn` that also clips *vertically*. ratatui clips x but panics on a
+/// `y` outside the buffer, so every popup write (drawn at a box-relative `y`
+/// that can fall below a short pane) must go through this to honour the
+/// "clip, never panic" invariant.
+pub fn put_str(buf: &mut Buffer, x: u16, y: u16, s: impl AsRef<str>, w: usize, style: Style) {
+    let area = buf.area();
+    if y >= area.top() && y < area.bottom() && x >= area.left() && x < area.right() {
+        buf.set_stringn(x, y, s, w, style);
+    }
+}
+
 /// Write coloured spans left-to-right, clipped to `max_w`.
 pub fn put_spans(buf: &mut Buffer, x0: u16, y: u16, max_w: usize, spans: &[Span]) {
+    let area = buf.area();
+    if y < area.top() || y >= area.bottom() {
+        return;
+    }
     let mut x = x0;
     let end = x0 + max_w as u16;
     for s in spans {
@@ -69,20 +90,34 @@ pub fn draw_box(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, title: &str) {
     // title isn't cancelled by reset()'s "clear all modifiers".
     let cyan = Style::default().fg(Color::Cyan).bg(POPUP_BG);
     for row in 0..h {
-        buf.set_stringn(x, y + row, " ".repeat(wu), wu, panel);
+        put_str(buf, x, y + row, " ".repeat(wu), wu, panel);
     }
-    // top: ┌─ title ─…─┐  (exactly w columns; box chars are width 1)
+    // top: ┌─ title ─…─┐  (exactly w columns; box chars are width 1). Ellipsize a
+    // title too wide to leave room for the closing corner, so the border always
+    // ends in ┐ instead of a clipped, broken run.
+    let budget = wu.saturating_sub(6); // "┌─ " + " " + "─┐"
+    let title = if title.chars().count() > budget {
+        format!(
+            "{}…",
+            title
+                .chars()
+                .take(budget.saturating_sub(1))
+                .collect::<String>()
+        )
+    } else {
+        title.to_string()
+    };
     let head = format!("┌─ {title} ");
     let dashes = wu.saturating_sub(head.chars().count() + 1); // +1 for the ┐
     let top = format!("{head}{}┐", "─".repeat(dashes));
-    buf.set_stringn(x, y, top, wu, cyan.add_modifier(Modifier::BOLD));
+    put_str(buf, x, y, top, wu, cyan.add_modifier(Modifier::BOLD));
     // bottom: └─…─┘
     let bottom = format!("└{}┘", "─".repeat(wu.saturating_sub(2)));
-    buf.set_stringn(x, y + h - 1, bottom, wu, cyan);
+    put_str(buf, x, y + h - 1, bottom, wu, cyan);
     // sides
     for row in 1..h.saturating_sub(1) {
-        buf.set_stringn(x, y + row, "│", 1, cyan);
-        buf.set_stringn(x + w - 1, y + row, "│", 1, cyan);
+        put_str(buf, x, y + row, "│", 1, cyan);
+        put_str(buf, x + w - 1, y + row, "│", 1, cyan);
     }
 }
 
