@@ -186,6 +186,85 @@ struct CommentItemJson {
     function: Option<String>,
 }
 
+/// One exported symbol for the Exports view: its address, name, and whether
+/// bn tagged it `(data)` (a global) rather than a function.
+#[derive(Clone)]
+pub struct Export {
+    pub addr: String,
+    pub name: String,
+    pub is_data: bool,
+}
+
+/// One basic block of a function's CFG (from `Bn::cfg`): its start address, the
+/// instructions in it, and its outgoing edges.
+#[derive(Clone, Deserialize)]
+pub struct CfgBlock {
+    pub start: String,
+    #[serde(default)]
+    pub insns: Vec<CfgInsn>,
+    #[serde(default)]
+    pub edges: Vec<CfgEdge>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct CfgInsn {
+    /// Instruction address.
+    pub a: String,
+    /// Rendered disassembly text.
+    pub t: String,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct CfgEdge {
+    /// Target block start address.
+    pub to: String,
+    /// Edge kind (`TrueBranch`/`FalseBranch`/`UnconditionalBranch`/…).
+    pub k: String,
+}
+
+#[derive(Deserialize)]
+struct CfgJson {
+    #[serde(default)]
+    blocks: Vec<CfgBlock>,
+}
+
+/// `bn py exec --format json` wraps a script's `print` output in this envelope;
+/// we parse it, then parse the inner JSON the script emitted.
+#[derive(Deserialize)]
+struct PyEnvelope {
+    #[serde(default)]
+    stdout: String,
+}
+
+/// The `bn py exec` program that walks a function's basic blocks and prints the
+/// CFG as JSON. `{IDENT}` is replaced with a single-quote-escaped identifier.
+const CFG_PROGRAM: &str = r#"
+import json
+def _resolve(bv, ident):
+    fns = bv.get_functions_by_name(ident)
+    if fns:
+        return fns[0]
+    try:
+        addr = int(ident, 16) if ident.lower().startswith('0x') else int(ident)
+    except ValueError:
+        return None
+    f = bv.get_function_at(addr)
+    if f:
+        return f
+    fs = bv.get_functions_containing(addr)
+    return fs[0] if fs else None
+fn = _resolve(bv, '{IDENT}')
+blocks = []
+if fn is not None:
+    for bb in fn.basic_blocks:
+        insns = [{'a': hex(l.address), 't': ''.join(str(t) for t in l.tokens)}
+                 for l in bb.disassembly_text]
+        edges = [{'to': hex(e.target.start), 'k': e.type.name}
+                 for e in bb.outgoing_edges if e.target is not None]
+        blocks.append({'start': hex(bb.start), 'insns': insns, 'edges': edges})
+print(json.dumps({'blocks': blocks}))
+"#;
+
 /// A unique temp path for a `--out` capture (`bn-lens-<pid>-<seq>.out`), so
 /// concurrent/sequential captures never share a file (see [`Bn::run_out`]).
 fn unique_tmp() -> String {
@@ -395,6 +474,38 @@ impl Bn {
                     .then(|| (addr.to_string(), name.to_string()))
             })
             .collect()
+    }
+
+    /// `bn exports` -> the exported symbols (public API) for the Exports view.
+    /// `--limit` matches [`functions`]: without it bn caps the listing at 100.
+    pub fn exports_list(&self) -> Vec<Export> {
+        self.run_out(&["exports", "--limit", "5000"])
+            .lines()
+            .filter_map(|line| {
+                let mut it = line.split_whitespace();
+                let addr = it.next()?;
+                let name = it.next()?;
+                addr.starts_with("0x").then(|| Export {
+                    addr: addr.to_string(),
+                    name: name.to_string(),
+                    is_data: line.contains("(data)"),
+                })
+            })
+            .collect()
+    }
+
+    /// Basic blocks + typed edges of `ident`'s control-flow graph, via
+    /// `bn py exec` (there is no first-class CFG command). Empty on any failure
+    /// (unknown function, no blocks, malformed output) — the caller shows a note.
+    pub fn cfg(&self, ident: &str) -> Vec<CfgBlock> {
+        let escaped = ident.replace('\\', "\\\\").replace('\'', "\\'");
+        let program = CFG_PROGRAM.replace("{IDENT}", &escaped);
+        let out = self.run_out(&["py", "exec", "--format", "json", "--code", &program]);
+        serde_json::from_str::<PyEnvelope>(&out)
+            .ok()
+            .and_then(|env| serde_json::from_str::<CfgJson>(&env.stdout).ok())
+            .map(|cfg| cfg.blocks)
+            .unwrap_or_default()
     }
 
     /// `bn exports` -> (name->addr map, set of data-symbol names).

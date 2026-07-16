@@ -3,6 +3,7 @@
 //! ("working"/"done") is always visible on the header bar.
 
 use crate::ctx::Ctx;
+use crate::exports::ExportsList;
 use crate::help::{Help, HelpContext};
 use crate::imports::ImportsList;
 use crate::marks::MarksList;
@@ -39,6 +40,7 @@ enum AppView {
     Symbols,
     Strings,
     Imports,
+    Exports,
     Marks,
 }
 
@@ -48,6 +50,7 @@ struct App {
     picker: Picker,
     strings: Option<StringsList>, // built lazily on first switch to Strings
     imports: Option<ImportsList>, // built lazily on first switch to Imports
+    exports: Option<ExportsList>, // built lazily on first switch to Exports
     marks: Option<MarksList>,     // built lazily on first switch to Marks
     menu: Menu,
     viewer: Option<Viewer>,
@@ -74,6 +77,7 @@ impl App {
             picker,
             strings: None,
             imports: None,
+            exports: None,
             marks: None,
             menu: Menu::default(),
             viewer: None,
@@ -111,6 +115,7 @@ impl App {
             self.picker = Picker::new(&self.ctx);
             self.strings = None;
             self.imports = None;
+            self.exports = None;
             self.marks = None;
             self.view = AppView::Symbols;
             self.viewer = None;
@@ -123,38 +128,61 @@ impl App {
             AppView::Symbols => Choice::Symbols,
             AppView::Strings => Choice::Strings,
             AppView::Imports => Choice::Imports,
+            AppView::Exports => Choice::Exports,
             AppView::Marks => Choice::Marks,
         }
+    }
+
+    /// Switch to a top-level list view, building its (lazy) list on first use.
+    /// Marks rebuild every time — unlike the static Symbols/Strings/Imports/
+    /// Exports lists, annotations change as you add them with `;`/`t`.
+    fn set_view(&mut self, view: AppView) {
+        match view {
+            AppView::Symbols => {}
+            AppView::Strings => {
+                if self.strings.is_none() {
+                    self.strings = Some(StringsList::new(&self.ctx));
+                }
+            }
+            AppView::Imports => {
+                if self.imports.is_none() {
+                    self.imports = Some(ImportsList::new(&self.ctx));
+                }
+            }
+            AppView::Exports => {
+                if self.exports.is_none() {
+                    self.exports = Some(ExportsList::new(&self.ctx));
+                }
+            }
+            AppView::Marks => self.marks = Some(MarksList::new(&self.ctx)),
+        }
+        self.view = view;
+        self.viewer = None;
+    }
+
+    /// `v` from a list: cycle through the top-level views in order (the keyboard
+    /// twin of the `m` menu's view picker).
+    fn cycle_app_view(&mut self, direction: i32) {
+        const ORDER: &[AppView] = &[
+            AppView::Symbols,
+            AppView::Strings,
+            AppView::Imports,
+            AppView::Exports,
+            AppView::Marks,
+        ];
+        let current = ORDER.iter().position(|v| *v == self.view).unwrap_or(0) as i32;
+        let next = ORDER[(current + direction).rem_euclid(ORDER.len() as i32) as usize];
+        self.set_view(next);
     }
 
     /// Act on a menu selection. Returns true to quit the app.
     fn choose(&mut self, choice: Choice) -> bool {
         match choice {
-            Choice::Symbols => {
-                self.view = AppView::Symbols;
-                self.viewer = None;
-            }
-            Choice::Strings => {
-                if self.strings.is_none() {
-                    self.strings = Some(StringsList::new(&self.ctx));
-                }
-                self.view = AppView::Strings;
-                self.viewer = None;
-            }
-            Choice::Imports => {
-                if self.imports.is_none() {
-                    self.imports = Some(ImportsList::new(&self.ctx));
-                }
-                self.view = AppView::Imports;
-                self.viewer = None;
-            }
-            Choice::Marks => {
-                // Rebuild every time: unlike the static Symbols/Strings/Imports
-                // lists, annotations change as you add them with `;`/`t`.
-                self.marks = Some(MarksList::new(&self.ctx));
-                self.view = AppView::Marks;
-                self.viewer = None;
-            }
+            Choice::Symbols => self.set_view(AppView::Symbols),
+            Choice::Strings => self.set_view(AppView::Strings),
+            Choice::Imports => self.set_view(AppView::Imports),
+            Choice::Exports => self.set_view(AppView::Exports),
+            Choice::Marks => self.set_view(AppView::Marks),
             Choice::Refresh => self.start_refresh(),
             Choice::SwitchBn => self.open_switcher(),
             Choice::Help => self.help.open(self.help_context()),
@@ -229,6 +257,9 @@ impl App {
                 }
                 if let Some(imports) = &mut self.imports {
                     imports.refresh(&self.ctx);
+                }
+                if let Some(exports) = &mut self.exports {
+                    exports.refresh(&self.ctx);
                 }
                 if let Some(marks) = &mut self.marks {
                     marks.refresh(&self.ctx);
@@ -341,6 +372,7 @@ impl App {
             AppView::Symbols => self.picker.is_searching(),
             AppView::Strings => self.strings.as_ref().is_some_and(StringsList::is_searching),
             AppView::Imports => self.imports.as_ref().is_some_and(ImportsList::is_searching),
+            AppView::Exports => self.exports.as_ref().is_some_and(ExportsList::is_searching),
             AppView::Marks => self.marks.as_ref().is_some_and(MarksList::is_searching),
         }
     }
@@ -355,6 +387,7 @@ impl App {
             AppView::Symbols => self.picker.popup_open(),
             AppView::Strings => self.strings.as_ref().is_some_and(StringsList::popup_open),
             AppView::Imports => self.imports.as_ref().is_some_and(ImportsList::popup_open),
+            AppView::Exports => self.exports.as_ref().is_some_and(ExportsList::popup_open),
             AppView::Marks => self.marks.as_ref().is_some_and(MarksList::popup_open),
         }
     }
@@ -419,6 +452,17 @@ impl App {
             self.menu.open(self.active_choice());
             return false;
         }
+        // `v` cycles the top-level list views (keyboard twin of the menu picker),
+        // under the same guards as `m`. In the viewer, `v` falls through to the
+        // viewer's own view-cycle instead.
+        if k.code == crossterm::event::KeyCode::Char('v')
+            && self.viewer.is_none()
+            && !capturing
+            && !self.list_popup_open()
+        {
+            self.cycle_app_view(1);
+            return false;
+        }
         match &mut self.viewer {
             Some(v) => {
                 match v.on_key(k, &self.ctx) {
@@ -437,6 +481,10 @@ impl App {
                         .map_or(Action::None, |s| s.on_key(k, &self.ctx)),
                     AppView::Imports => self
                         .imports
+                        .as_mut()
+                        .map_or(Action::None, |s| s.on_key(k, &self.ctx)),
+                    AppView::Exports => self
+                        .exports
                         .as_mut()
                         .map_or(Action::None, |s| s.on_key(k, &self.ctx)),
                     AppView::Marks => self.marks.as_mut().map_or(Action::None, |s| s.on_key(k)),
@@ -488,6 +536,11 @@ impl App {
                         s.on_mouse(m, self.area);
                     }
                 }
+                AppView::Exports => {
+                    if let Some(s) = &mut self.exports {
+                        s.on_mouse(m, self.area);
+                    }
+                }
                 AppView::Marks => {
                     if let Some(s) = &mut self.marks {
                         s.on_mouse(m, self.area);
@@ -512,6 +565,7 @@ impl App {
                 AppView::Symbols => HelpContext::Picker,
                 AppView::Strings => HelpContext::Strings,
                 AppView::Imports => HelpContext::Imports,
+                AppView::Exports => HelpContext::Exports,
                 AppView::Marks => HelpContext::Marks,
             }
         }
@@ -559,6 +613,11 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
                     }
                     AppView::Imports => {
                         if let Some(s) = &mut app.imports {
+                            s.render(app.area, f.buffer_mut(), &app.ctx);
+                        }
+                    }
+                    AppView::Exports => {
+                        if let Some(s) = &mut app.exports {
                             s.render(app.area, f.buffer_mut(), &app.ctx);
                         }
                     }

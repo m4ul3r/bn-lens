@@ -43,24 +43,49 @@ file keyed by instance+target?), what's worth persisting (opens only, or marks/n
 reconciles when the underlying `.bndb` changed between sessions. Tied to the same
 "live-in-instance vs. persistent" question as the `bn save` note above.
 
+## Control-flow graph view (done this pass — box-graph mode can go further)
+
+**Status:** implemented. A per-function **CFG view** is now a fourth viewer view (`v`/`i` cycle
+Decomp → MLIL → Disasm → **CFG**). It walks `func.basic_blocks` + typed `outgoing_edges` via
+`bn py exec` (there is no first-class CFG command; large output goes through `--out` to dodge the
+stdout spill envelope — see `bn.rs::cfg` + `CFG_PROGRAM`). Rendering lives in the pure, tested
+`cfg.rs`:
+
+- **list mode** (default): blocks in address order, each with its instructions and labelled successor
+  edges (`├─ true → block_1`), back-edges flagged `↑loop`. Robust at any block count.
+- **box-graph mode** (`Space` toggles): the same blocks wrapped in ascii boxes with arrow connectors,
+  **size-gated** to ≤ `MAX_GRAPH_BLOCKS` (24) — above that it falls back to the list with a note
+  (a fixed character grid can't route a big CFG readably).
+
+`g`/`Enter` on an edge target jumps to that block **in place** (via the block-addr→line `cfg_index`).
+
+**Next step if wanted:** the box-graph mode stacks boxes vertically with labelled arrows; it does *not*
+do true 2D edge routing (layered ranks, crossing-minimization). That's the genuinely-messy part and was
+deliberately deferred — a real Sugiyama-style layout would be the follow-on.
+
 ## Call-graph / xref-tree view (side-parked, likely hard)
 
-**Status:** not implemented. Today following calls is one-hop at a time (`g` on a Func hotspot); there
-is no "who calls this / what does this reach" overview. A call-tree peek (callers ↑ / callees ↓,
-expandable, `Enter` to jump) would fit the navigator framing without drifting toward decompiler
-parity. `bn` already exposes `xrefs` and `callsites` to build it from.
+**Status:** not implemented. This is the *inter*-function view (distinct from the intra-function CFG
+above): following calls is one-hop at a time (`g` on a Func hotspot); there is no "who calls this /
+what does this reach" overview. A call-tree peek (callers ↑ / callees ↓, expandable, `Enter` to jump)
+would fit the navigator framing without drifting toward decompiler parity. `bn` already exposes
+`xrefs` and `callsites` to build it from.
 
 **Why it's hard:** rendering an interactive, scrollable, expandable tree in ratatui (cycle handling,
 depth limits, lazy expansion to avoid fanning out a whole binary), plus deciding how it composes with
 the existing nav stack and hotspot model. Non-trivial UI work; scope carefully before starting.
 
-## Bookmarks / annotations navigation view (next up)
+## Bookmarks / annotations navigation view (done)
 
-**Status:** not implemented. You can now *create* tags/bookmarks (`t`) and comments (`;`), but there's
-no way to *list and jump between* them — the write half of the "shared map" exists without the read
-half. A menu view over `bn tag list` (and/or `bn comment list --format json`) would let you (and the
-agent) navigate marked spots: `Enter` jumps to the tagged/commented address in the viewer. Fits the
-existing view/menu architecture (mirror `imports.rs`). High value for the pairing loop.
+**Status:** implemented as the **Marks** view (`marks.rs`) — lists comments + tags/bookmarks, `Enter`
+jumps to the annotated function. The read half of the "shared map".
+
+## Exports (public-API) view (done this pass)
+
+**Status:** implemented as the **Exports** view (`exports.rs`, mirrors `imports.rs`). Lists exported
+symbols — functions and data globals shown distinctly; `Enter` opens a function export's decompile (a
+data export's xrefs), `x` cross-references, `p` peeks who-uses-it. Reachable via the `m` menu or the
+new `v` top-level view-cycle.
 
 ## Sink classifier — extend coverage (minor)
 

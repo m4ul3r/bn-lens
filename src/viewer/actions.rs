@@ -13,6 +13,18 @@ impl Viewer {
             return;
         };
         let span = &self.spans[index];
+        // In the CFG view, acting on an edge target (or a block address) jumps to
+        // that block *in place* rather than re-decompiling the function.
+        if self.view == View::Cfg && span.kind == HotKind::Addr {
+            if let Some(&line) = crate::ctx::parse_hex(&span.target)
+                .and_then(|addr| self.cfg_index.get(&addr))
+            {
+                self.cline = line;
+                self.top = line.saturating_sub(3);
+                self.active = None;
+                return;
+            }
+        }
         match span.kind {
             HotKind::Func => {
                 let target = span.target.clone();

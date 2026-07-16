@@ -266,8 +266,9 @@ impl Viewer {
             KeyCode::Char('r') => self.open_rename(),
             KeyCode::Char(';') => self.open_comment(),
             KeyCode::Char('t') => self.open_tag(),
-            KeyCode::Char('i') => self.cycle_view(ctx, 1),
+            KeyCode::Char('i') | KeyCode::Char('v') => self.cycle_view(ctx, 1),
             KeyCode::Char('I') => self.cycle_view(ctx, -1),
+            KeyCode::Char(' ') if self.view == View::Cfg => self.toggle_cfg_graph(ctx),
             KeyCode::Char('b') => return self.back(ctx),
             KeyCode::Char('V') => {
                 self.vmode = true;
@@ -334,12 +335,13 @@ impl Viewer {
         Exit::Stay
     }
 
-    /// `i`/`I`: cycle the current function through Decomp → MLIL → Disasm (and
-    /// back). From an xrefs view, enter Decomp. Reload and reset to the top.
+    /// `i`/`I`/`v`: cycle the current function through Decomp → MLIL → Disasm →
+    /// CFG (and back). From an xrefs view, enter Decomp. Reload and reset to the
+    /// top. (`load_cfg` sets its own status for the CFG view.)
     fn cycle_view(&mut self, ctx: &Ctx, direction: i32) {
-        let order = [View::Decomp, View::Mlil, View::Disasm];
+        let order = [View::Decomp, View::Mlil, View::Disasm, View::Cfg];
         let next = match order.iter().position(|&view| view == self.view) {
-            Some(current) => order[(current as i32 + direction).rem_euclid(3) as usize],
+            Some(current) => order[(current as i32 + direction).rem_euclid(order.len() as i32) as usize],
             None => View::Decomp,
         };
         self.view = next;
@@ -347,7 +349,19 @@ impl Viewer {
         self.top = 0;
         self.cline = 0;
         self.active = None;
-        self.status = format!(" view: {}", self.view.label());
+        if !matches!(self.view, View::Cfg) {
+            self.status = format!(" view: {}", self.view.label());
+        }
+    }
+
+    /// Space (CFG view only): flip between the boxed graph layout and the flat
+    /// block list, rebuilding in place.
+    fn toggle_cfg_graph(&mut self, ctx: &Ctx) {
+        self.cfg_graph = !self.cfg_graph;
+        self.load(ctx);
+        self.top = 0;
+        self.cline = 0;
+        self.active = None;
     }
 
     fn move_cursor(&mut self, delta: i64) {

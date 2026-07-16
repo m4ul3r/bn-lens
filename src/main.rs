@@ -4,8 +4,10 @@
 //!   bn-lens picker   (herdr pane)   — run the TUI
 mod app;
 mod bn;
+mod cfg;
 mod ctx;
 mod decomp;
+mod exports;
 mod help;
 mod herdr;
 mod imports;

@@ -34,19 +34,22 @@ struct Hotspot {
     code: bool, // Addr: inside an executable section (goto vs peek)
 }
 
-/// Which rendering of the current function/target we're showing. The three code
-/// views cycle with `i`/`I`; Xrefs is entered with `x`.
+/// Which rendering of the current function/target we're showing. The code
+/// views cycle with `i`/`I`/`v`; Xrefs is entered with `x`.
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Decomp,
     Mlil,
     Disasm,
+    Cfg,
     Xrefs,
 }
 
 impl View {
+    /// A "code" view exposes locals/stack + rename/comment/tag; the CFG and
+    /// xrefs listings do not.
     fn is_code(self) -> bool {
-        !matches!(self, View::Xrefs)
+        matches!(self, View::Decomp | View::Mlil | View::Disasm)
     }
 
     fn label(self) -> &'static str {
@@ -54,6 +57,7 @@ impl View {
             View::Decomp => "decompile",
             View::Mlil => "mlil",
             View::Disasm => "disasm",
+            View::Cfg => "cfg",
             View::Xrefs => "xrefs",
         }
     }
@@ -149,6 +153,11 @@ pub struct Viewer {
     stack: Vec<Frame>,
     popup: Popup,
     screen_tgts: Vec<(u16, u16, u16, usize)>, // x0,x1,y,target_idx (for mouse)
+    /// CFG view: block start address -> its header line, so acting on an edge
+    /// target jumps within the graph instead of re-decompiling. Empty elsewhere.
+    cfg_index: std::collections::HashMap<u64, usize>,
+    /// CFG view: whether the boxed graph layout is requested (Space toggles it).
+    cfg_graph: bool,
 }
 
 impl Viewer {
@@ -171,6 +180,8 @@ impl Viewer {
             stack: Vec::new(),
             popup: Popup::None,
             screen_tgts: Vec::new(),
+            cfg_index: std::collections::HashMap::new(),
+            cfg_graph: false,
         };
         viewer.load(ctx);
         viewer
@@ -202,11 +213,16 @@ impl Viewer {
     }
 
     fn load(&mut self, ctx: &Ctx) {
+        if matches!(self.view, View::Cfg) {
+            self.load_cfg(ctx);
+            return;
+        }
         let text = match self.view {
             View::Decomp => ctx.bn.decompile(&self.name),
             View::Mlil => ctx.bn.il(&self.name, "mlil"),
             View::Disasm => ctx.bn.disasm(&self.name),
             View::Xrefs => ctx.bn.xrefs(&self.name),
+            View::Cfg => unreachable!("handled above"),
         };
         self.lines = if matches!(self.view, View::Decomp) {
             syntax::tokenize_c(&text)
@@ -228,6 +244,30 @@ impl Viewer {
         };
         self.spans = build_spans(&self.lines, ctx, &self.locals);
         self.active = None;
+    }
+
+    /// Build the CFG view: walk the function's basic blocks via `bn`, render them
+    /// (list or boxed graph) into display lines, and record the block-address →
+    /// line index so acting on an edge target jumps within the graph.
+    fn load_cfg(&mut self, ctx: &Ctx) {
+        let blocks = ctx.bn.cfg(&self.name);
+        let rendered = crate::cfg::render(&blocks, self.cfg_graph);
+        let text = rendered.lines.join("\n");
+        self.lines = syntax::tokenize_plain(&text);
+        self.cfg_index = rendered.index;
+        self.stack_view.set_locals(&[]);
+        self.locals = std::collections::HashMap::new();
+        self.spans = build_spans(&self.lines, ctx, &self.locals);
+        self.active = None;
+        self.status = match rendered.note {
+            Some(note) => format!(" {note}"),
+            None => format!(
+                " cfg · {} blocks · {} · v/i cycles view · Space {} graph",
+                rendered.block_count,
+                if rendered.graph { "graph" } else { "list" },
+                if rendered.graph { "→ list" } else { "→ graph" },
+            ),
+        };
     }
 
     /// The effective selected span: the Tab/click-selected one if it's still on

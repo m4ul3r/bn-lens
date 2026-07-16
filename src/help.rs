@@ -12,6 +12,7 @@ pub enum HelpContext {
     Picker,
     Strings,
     Imports,
+    Exports,
     Marks,
     Viewer,
     Stack,
@@ -24,6 +25,7 @@ impl HelpContext {
             Self::Picker => "picker",
             Self::Strings => "strings",
             Self::Imports => "imports",
+            Self::Exports => "exports",
             Self::Marks => "marks",
             Self::Viewer => "viewer",
             Self::Stack => "stack view",
@@ -36,6 +38,7 @@ impl HelpContext {
             Self::Picker => "PICKER",
             Self::Strings => "STRINGS",
             Self::Imports => "IMPORTS",
+            Self::Exports => "EXPORTS",
             Self::Marks => "MARKS",
             Self::Viewer => "VIEWER",
             Self::Stack => "STACK VIEW",
@@ -48,6 +51,7 @@ impl HelpContext {
             Self::Picker => scope.starts_with("PICKER") || scope == "LIST",
             Self::Strings => scope == "STRINGS" || scope == "LIST",
             Self::Imports => scope == "IMPORTS" || scope == "LIST",
+            Self::Exports => scope == "EXPORTS" || scope == "LIST",
             Self::Marks => scope == "MARKS" || scope == "LIST",
             Self::Viewer => {
                 scope.starts_with("VIEWER") || scope == "VISUAL" || scope == "STACK VIEW"
@@ -83,6 +87,11 @@ const LINES: &[HelpLine] = &[
         scope: "LIST",
         key: "m  ·  click title",
         action: "open the bn lens view menu",
+    },
+    HelpLine::Entry {
+        scope: "LIST",
+        key: "v",
+        action: "cycle top-level views (symbols/strings/imports/exports/marks)",
     },
     HelpLine::Entry {
         scope: "MENU",
@@ -213,6 +222,27 @@ const LINES: &[HelpLine] = &[
         key: "Enter / x",
         action: "cross-reference the import (callers)",
     },
+    HelpLine::Section("EXPORTS"),
+    HelpLine::Entry {
+        scope: "EXPORTS",
+        key: "j/k  ^D/^U  gg/G",
+        action: "move / page / ends",
+    },
+    HelpLine::Entry {
+        scope: "EXPORTS",
+        key: "/",
+        action: "filter by name / address",
+    },
+    HelpLine::Entry {
+        scope: "EXPORTS",
+        key: "p",
+        action: "peek uses (pseudo-C at each callsite)",
+    },
+    HelpLine::Entry {
+        scope: "EXPORTS",
+        key: "Enter / x",
+        action: "open decompile (function) or xrefs · cross-reference",
+    },
     HelpLine::Section("MARKS"),
     HelpLine::Entry {
         scope: "MARKS",
@@ -282,8 +312,18 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "i / I",
-        action: "next / previous code view",
+        key: "v  ·  i / I",
+        action: "cycle view: decompile → mlil → disasm → cfg",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "Space  (in cfg)",
+        action: "toggle boxed graph vs. block list",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "g / Enter  (in cfg)",
+        action: "jump to the edge target block in place",
     },
     HelpLine::Entry {
         scope: "VIEWER",
