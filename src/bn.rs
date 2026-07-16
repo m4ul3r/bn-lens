@@ -281,6 +281,20 @@ impl Bn {
             .collect()
     }
 
+    /// `bn imports` -> [(addr, name)] for the Imports/attack-surface view.
+    pub fn imports_list(&self) -> Vec<(String, String)> {
+        self.run_out(&["imports"])
+            .lines()
+            .filter_map(|line| {
+                let mut it = line.split_whitespace();
+                let addr = it.next()?;
+                let name = it.next()?;
+                addr.starts_with("0x")
+                    .then(|| (addr.to_string(), name.to_string()))
+            })
+            .collect()
+    }
+
     /// `bn exports` -> (name->addr map, set of data-symbol names).
     pub fn symbols(&self) -> (HashMap<String, String>, HashSet<String>) {
         let out = self.run_out(&["exports"]);

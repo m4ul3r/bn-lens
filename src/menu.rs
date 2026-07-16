@@ -15,6 +15,7 @@ pub const TITLE_W: u16 = 9;
 pub enum Choice {
     Symbols,
     Strings,
+    Imports,
     Refresh,
     SwitchBn,
     Help,
@@ -26,6 +27,7 @@ impl Choice {
         match self {
             Choice::Symbols => "Symbols   functions + data",
             Choice::Strings => "Strings   recovered text · xref uses",
+            Choice::Imports => "Imports   attack surface · sinks",
             Choice::Refresh => "Refresh   re-sync the live bn instance",
             Choice::SwitchBn => "Switch bn instance / target…",
             Choice::Help => "Help      shortcut guide",
@@ -37,6 +39,7 @@ impl Choice {
 const ITEMS: &[Choice] = &[
     Choice::Symbols,
     Choice::Strings,
+    Choice::Imports,
     Choice::Refresh,
     Choice::SwitchBn,
     Choice::Help,

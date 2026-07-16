@@ -8,6 +8,7 @@ mod ctx;
 mod decomp;
 mod help;
 mod herdr;
+mod imports;
 mod launch;
 mod menu;
 mod picker;
@@ -16,6 +17,7 @@ mod switch;
 mod syntax;
 mod theme;
 mod ui;
+mod usage;
 mod viewer;
 
 fn main() {

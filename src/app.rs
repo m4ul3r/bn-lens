@@ -4,6 +4,7 @@
 
 use crate::ctx::Ctx;
 use crate::help::{Help, HelpContext};
+use crate::imports::ImportsList;
 use crate::menu::{Choice, Menu};
 use crate::picker::{Action, Picker};
 use crate::strings::StringsList;
@@ -36,6 +37,7 @@ struct Refreshing {
 enum AppView {
     Symbols,
     Strings,
+    Imports,
 }
 
 struct App {
@@ -43,6 +45,7 @@ struct App {
     view: AppView,
     picker: Picker,
     strings: Option<StringsList>, // built lazily on first switch to Strings
+    imports: Option<ImportsList>, // built lazily on first switch to Imports
     menu: Menu,
     viewer: Option<Viewer>,
     switcher: Option<Switcher>,
@@ -67,6 +70,7 @@ impl App {
             view: AppView::Symbols,
             picker,
             strings: None,
+            imports: None,
             menu: Menu::default(),
             viewer: None,
             switcher: None,
@@ -102,6 +106,7 @@ impl App {
             self.ctx = ctx;
             self.picker = Picker::new(&self.ctx);
             self.strings = None;
+            self.imports = None;
             self.view = AppView::Symbols;
             self.viewer = None;
         }
@@ -112,6 +117,7 @@ impl App {
         match self.view {
             AppView::Symbols => Choice::Symbols,
             AppView::Strings => Choice::Strings,
+            AppView::Imports => Choice::Imports,
         }
     }
 
@@ -127,6 +133,13 @@ impl App {
                     self.strings = Some(StringsList::new(&self.ctx));
                 }
                 self.view = AppView::Strings;
+                self.viewer = None;
+            }
+            Choice::Imports => {
+                if self.imports.is_none() {
+                    self.imports = Some(ImportsList::new(&self.ctx));
+                }
+                self.view = AppView::Imports;
                 self.viewer = None;
             }
             Choice::Refresh => self.start_refresh(),
@@ -200,6 +213,9 @@ impl App {
                 self.picker.refresh(&self.ctx);
                 if let Some(strings) = &mut self.strings {
                     strings.refresh(&self.ctx);
+                }
+                if let Some(imports) = &mut self.imports {
+                    imports.refresh(&self.ctx);
                 }
                 if let Some(viewer) = &mut self.viewer {
                     viewer.reload(&self.ctx);
@@ -308,6 +324,7 @@ impl App {
         match self.view {
             AppView::Symbols => self.picker.is_searching(),
             AppView::Strings => self.strings.as_ref().is_some_and(StringsList::is_searching),
+            AppView::Imports => self.imports.as_ref().is_some_and(ImportsList::is_searching),
         }
     }
 
@@ -320,6 +337,7 @@ impl App {
         match self.view {
             AppView::Symbols => self.picker.popup_open(),
             AppView::Strings => self.strings.as_ref().is_some_and(StringsList::popup_open),
+            AppView::Imports => self.imports.as_ref().is_some_and(ImportsList::popup_open),
         }
     }
 
@@ -399,6 +417,10 @@ impl App {
                         .strings
                         .as_mut()
                         .map_or(Action::None, |s| s.on_key(k, &self.ctx)),
+                    AppView::Imports => self
+                        .imports
+                        .as_mut()
+                        .map_or(Action::None, |s| s.on_key(k, &self.ctx)),
                 };
                 self.open_action(action)
             }
@@ -442,6 +464,11 @@ impl App {
                         s.on_mouse(m, self.area);
                     }
                 }
+                AppView::Imports => {
+                    if let Some(s) = &mut self.imports {
+                        s.on_mouse(m, self.area);
+                    }
+                }
             },
         }
         false
@@ -460,6 +487,7 @@ impl App {
             match self.view {
                 AppView::Symbols => HelpContext::Picker,
                 AppView::Strings => HelpContext::Strings,
+                AppView::Imports => HelpContext::Imports,
             }
         }
     }
@@ -501,6 +529,11 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
                     AppView::Symbols => app.picker.render(app.area, f.buffer_mut(), &app.ctx),
                     AppView::Strings => {
                         if let Some(s) = &mut app.strings {
+                            s.render(app.area, f.buffer_mut(), &app.ctx);
+                        }
+                    }
+                    AppView::Imports => {
+                        if let Some(s) = &mut app.imports {
                             s.render(app.area, f.buffer_mut(), &app.ctx);
                         }
                     }

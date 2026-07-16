@@ -11,6 +11,7 @@ use ratatui::text::Span;
 pub enum HelpContext {
     Picker,
     Strings,
+    Imports,
     Viewer,
     Stack,
     Switcher,
@@ -21,6 +22,7 @@ impl HelpContext {
         match self {
             Self::Picker => "picker",
             Self::Strings => "strings",
+            Self::Imports => "imports",
             Self::Viewer => "viewer",
             Self::Stack => "stack view",
             Self::Switcher => "switch bn",
@@ -31,6 +33,7 @@ impl HelpContext {
         match self {
             Self::Picker => "PICKER",
             Self::Strings => "STRINGS",
+            Self::Imports => "IMPORTS",
             Self::Viewer => "VIEWER",
             Self::Stack => "STACK VIEW",
             Self::Switcher => "SWITCH BN",
@@ -41,6 +44,7 @@ impl HelpContext {
         match self {
             Self::Picker => scope.starts_with("PICKER") || scope == "LIST",
             Self::Strings => scope == "STRINGS" || scope == "LIST",
+            Self::Imports => scope == "IMPORTS" || scope == "LIST",
             Self::Viewer => {
                 scope.starts_with("VIEWER") || scope == "VISUAL" || scope == "STACK VIEW"
             }
@@ -178,6 +182,32 @@ const LINES: &[HelpLine] = &[
         scope: "STRINGS",
         key: "m / q",
         action: "view menu / quit",
+    },
+    HelpLine::Section("IMPORTS"),
+    HelpLine::Entry {
+        scope: "IMPORTS",
+        key: "j/k  ^D/^U  gg/G",
+        action: "move / page / ends",
+    },
+    HelpLine::Entry {
+        scope: "IMPORTS",
+        key: "f",
+        action: "toggle sinks-only (⚠ buffer/command, • format/source)",
+    },
+    HelpLine::Entry {
+        scope: "IMPORTS",
+        key: "/",
+        action: "filter by name / address / category",
+    },
+    HelpLine::Entry {
+        scope: "IMPORTS",
+        key: "p",
+        action: "peek callers (pseudo-C at each callsite)",
+    },
+    HelpLine::Entry {
+        scope: "IMPORTS",
+        key: "Enter / x",
+        action: "cross-reference the import (callers)",
     },
     HelpLine::Section("VIEWER"),
     HelpLine::Entry {

@@ -25,9 +25,11 @@ the code is split into small typed modules with unit tests.
 | `syntax.rs` | pure pseudo-C tokenizer → `(text, kind)` runs (**unit-tested**; replaces pygments) |
 | `theme.rs` | token-kind → colour |
 | `help.rs` | global, scrollable `where / key / action` shortcut reference |
-| `menu.rs` | the `bn lens` title dropdown: switch view (Symbols/Strings) + global actions |
+| `menu.rs` | the `bn lens` title dropdown: switch view (Symbols/Strings/Imports) + global actions |
 | `picker.rs` | the **Symbols** list (functions + data): filter, vim nav, colours, mouse |
 | `strings.rs` | the **Strings** list: recovered text, filter, `Enter`/`x` to xref its uses |
+| `imports.rs` | the **Imports** list (attack surface): dangerous-sink flagging, `f` sinks-only, `p` callers |
+| `usage.rs` | shared "where is this used?" report (xref + per-callsite pseudo-C) for Strings/Imports `p` |
 | `viewer.rs` | code-viewer state model and load lifecycle |
 | `viewer/actions.rs` | navigation and data-backed actions: goto/peek/xrefs/rename/comment/tag |
 | `viewer/input.rs` | keyboard/mouse modes, search, view cycling, and agent asks |
@@ -51,13 +53,20 @@ opens immediately; the agent scan on the ~1s poll). Non-function addresses are a
 `/` search filters the full list live and ranks best-match first (`↑`/`↓` pick, `Enter` opens the top
 hit, `Tab` commits the filter to the list); the recent subsection shows only when unfiltered.
 
-**Views + the title menu** — the list pane has two top-level views: **Symbols** (functions + data, the
-default `picker.rs`) and **Strings** (`strings.rs`, an address-ordered list of recovered text where
-`p` peeks a **usage popup** — it parses `bn xrefs` on the string's address, decompiles each
-referencing function once (`--addresses`), and shows the **pseudo-C statement** at each callsite
-(grouped by function; falling back to the disassembled instruction when a site maps to no decompiled
-line), plus any data refs; `Enter`/`x` opens the full navigable xrefs listing instead). Clicking the
-` bn lens ` title (or `m`) opens a small **dropdown** (`menu.rs`) that switches view and reaches the
+**Imports (attack surface)** — `imports.rs`, reached from the menu, lists the binary's imported symbols
+with known-dangerous **sinks flagged** (`sink_category` classifies libc buffer/command/format/source
+calls, normalizing `__*_chk` and catching wrappers like `tsk_sys_System` by substring); sinks sort to
+the top, `f` toggles a sinks-only filter, and `p` peeks **callers** (the `usage.rs` report — pseudo-C
+at each callsite), `Enter`/`x` opens the full xrefs. This is the vuln-researcher's entry point: filter
+to `memcpy`, `p`, read every call in context.
+
+**Views + the title menu** — the list pane has three top-level views: **Symbols** (functions + data, the
+default `picker.rs`), **Strings** (`strings.rs`, recovered text), and **Imports** (`imports.rs`, above).
+In Strings and Imports, `p` peeks a **usage popup** (`usage.rs`) — it parses `bn xrefs` on the selected
+address, decompiles each referencing function once (`--addresses`), and shows the **pseudo-C statement**
+at each callsite (grouped by function; falling back to the disassembled instruction when a site maps to
+no decompiled line), plus any data refs; `Enter`/`x` opens the full navigable xrefs listing instead.
+Clicking the ` bn lens ` title (or `m`) opens a small **dropdown** (`menu.rs`) that switches view and reaches the
 global actions (Refresh, Switch bn, Help, Quit); a click on the title toggles it, a click on an entry
 or click-away dismisses it. `app.rs` owns an `AppView` enum and routes keys/mouse/render to the active
 list; the Strings list is built lazily on first switch and re-pulled by the same refresh path as the
