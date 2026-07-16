@@ -24,8 +24,13 @@ the code is split into small typed modules with unit tests.
 | `herdr.rs` | `herdr` CLI wrappers (pane read, prompt agent, open pane) + context parse |
 | `syntax.rs` | pure pseudo-C tokenizer → `(text, kind)` runs (**unit-tested**; replaces pygments) |
 | `theme.rs` | token-kind → colour |
+| `help.rs` | global, scrollable `where / key / action` shortcut reference |
 | `picker.rs` | the function list: filter, vim nav, colours, mouse |
-| `viewer.rs` | code viewer: wrap, targets, goto/peek, xrefs, back-stack, visual select, ask |
+| `viewer.rs` | code-viewer state model and load lifecycle |
+| `viewer/actions.rs` | navigation and data-backed actions: goto/peek/xrefs/rename |
+| `viewer/input.rs` | keyboard/mouse modes, search, view cycling, and agent asks |
+| `viewer/render.rs` | wrapped code rendering, hotspot styling, and modal layouts |
+| `viewer/hotspots.rs` | pure token promotion, identifier validation, and dump symbolization |
 | `switch.rs` | ranger-style instance/target switcher (miller columns + live target-info preview) |
 
 Data flows one way: `Ctx` is built once and shared by ref; the picker returns an `Action`
@@ -76,7 +81,11 @@ aren't dimmed). The instance/target switcher is
 now **picker-only** (`i` there); the viewer's `i` is view-cycling. **Popups dim the backdrop** — while
 any popup is open the code renders dimmed and un-highlighted, so nothing "spills" around the box.
 
-**Ask the agent** — `?` on the cursor line, or `V` to visual-select a range then `?`, opens a modal.
+**Global help** — `?` is intercepted above every picker, viewer, popup, search, and switcher mode and
+opens one scrollable shortcut guide. Status bars stay compact and context-specific. While composing
+an agent question, `?` remains literal punctuation.
+
+**Ask the agent** — `a` on the cursor line, or `V` to visual-select a range then `a`, opens a modal.
 The message is a single line: `[bn lens] -i <inst> -t <target> · <fn> @ <addr> · lines <lo>-<hi> ·
 code: <code…> · [user] <question>` — a copy-pasteable locator + address anchor (so the agent can
 re-query and pull its own context) plus the highlighted code and the question. One line by necessity:
