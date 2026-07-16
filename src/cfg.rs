@@ -222,7 +222,7 @@ fn edge_color(word: &str) -> u8 {
 
 /// One block's box in the laid-out graph: where it sits on the canvas, plus its
 /// label and full instruction listing (for selection/highlight, hjkl navigation,
-/// and the `e` expand popup).
+/// and the always-on top-left block inspector).
 pub struct GBlock {
     pub addr: u64,
     pub label: String,

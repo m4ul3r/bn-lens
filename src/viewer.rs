@@ -81,16 +81,23 @@ struct CfgGraph {
     /// While true the viewport tracks the selected block (after hjkl). A mouse
     /// pan/scroll clears it so free panning isn't snapped back to the selection.
     follow: bool,
-    /// The expanded block inspector (a corner panel), when open.
-    expand: Option<CfgExpand>,
+    /// Always-on top-left inspector for the currently highlighted block's full
+    /// instructions (updates whenever `sel` changes).
+    expand: CfgExpand,
 }
 
-/// The `e` expand panel: the selected block's full instructions, tokenized for
-/// syntax highlighting, with a scroll offset.
+/// Top-left panel: the selected block's full instructions, tokenized for
+/// syntax highlighting, with a scroll offset. Always present in graph mode.
 struct CfgExpand {
+    /// Start address of the block this panel currently shows (used to keep
+    /// scroll position when the selection hasn't moved).
+    addr: u64,
     title: String,
     lines: Vec<Line>,
     off: usize,
+    /// Last-rendered panel bounds in screen coords `(x, y, w, h)` for mouse
+    /// hit-testing (wheel scroll / ignore clicks through the panel).
+    hit: Option<(u16, u16, u16, u16)>,
 }
 
 /// hjkl navigation direction across the CFG boxes.
@@ -311,19 +318,21 @@ impl Viewer {
                     .and_then(|a| data.blocks.iter().position(|b| b.addr == a))
                     .unwrap_or(data.entry);
                 let count = data.block_count;
+                let expand = Self::build_cfg_expand(&data, sel);
                 self.cfg_graph_view = Some(CfgGraph {
                     data,
                     sel,
                     top: usize::MAX, // sentinel: render positions the entry near the top
                     left: 0,
                     follow: true,
-                    expand: None,
+                    expand,
                 });
                 self.lines = Vec::new();
                 self.spans = Vec::new();
                 self.cfg_index = std::collections::HashMap::new();
-                self.status =
-                    format!(" cfg · {count} blocks · graph · hjkl move · Enter read · Space list");
+                self.status = format!(
+                    " cfg · {count} blocks · graph · hjkl move · PgUp/Dn scroll block · Enter read · Space list"
+                );
                 return;
             }
         }
@@ -387,7 +396,21 @@ impl Viewer {
         if let Some((_, i)) = best {
             g.sel = i;
             g.follow = true; // re-center the viewport on the new selection
+            Self::sync_cfg_expand(g);
         }
+    }
+
+    /// Select CFG graph block `idx` (from a mouse click) and refresh the
+    /// top-left inspector to match.
+    pub(crate) fn cfg_select(&mut self, idx: usize) {
+        let Some(g) = self.cfg_graph_view.as_mut() else {
+            return;
+        };
+        if idx >= g.data.blocks.len() {
+            return;
+        }
+        g.sel = idx;
+        Self::sync_cfg_expand(g);
     }
 
     /// Enter/`g` in the CFG graph: drop into the block list scrolled to the
@@ -409,58 +432,65 @@ impl Viewer {
         self.cfg_graph_view.is_some()
     }
 
-    /// `e` in the CFG graph: toggle a corner panel expanding the highlighted
-    /// block into its full, syntax-highlighted instructions (the box in the graph
-    /// stays compact).
-    pub(crate) fn cfg_expand_selected(&mut self) {
-        let Some(g) = self.cfg_graph_view.as_mut() else {
-            return;
+    /// Build the always-on inspector for `data.blocks[sel]`.
+    fn build_cfg_expand(data: &crate::cfg::GraphData, sel: usize) -> CfgExpand {
+        let (addr, title, text) = match data.blocks.get(sel) {
+            Some(b) if !b.insns.is_empty() => {
+                let title = format!("{}  {:#x}", b.label, b.addr);
+                let text = b
+                    .insns
+                    .iter()
+                    .map(|(a, t)| format!("{a}  {t}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (b.addr, title, text)
+            }
+            Some(b) => (
+                b.addr,
+                format!("{}  {:#x}", b.label, b.addr),
+                "(no instructions)".into(),
+            ),
+            None => (0, "block".into(), "(no block)".into()),
         };
-        if g.expand.is_some() {
-            g.expand = None; // toggle closed
-            return;
-        }
-        let Some(b) = g.data.blocks.get(g.sel) else {
-            return;
-        };
-        if b.insns.is_empty() {
-            self.status = " (block has no instructions)".into();
-            return;
-        }
-        let title = format!("{}  {:#x}", b.label, b.addr);
-        let text = b
-            .insns
-            .iter()
-            .map(|(a, t)| format!("{a}  {t}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        g.expand = Some(CfgExpand {
+        CfgExpand {
+            addr,
             title,
             lines: syntax::tokenize_plain(&text),
             off: 0,
-        });
+            hit: None,
+        }
     }
 
-    /// Scroll the expand panel (if open). Returns true if it consumed the key.
+    /// Refresh the top-left inspector for the current selection. Keeps the
+    /// scroll offset when the same block is still selected; resets it on change.
+    fn sync_cfg_expand(g: &mut CfgGraph) {
+        let prev_addr = g.expand.addr;
+        let prev_off = g.expand.off;
+        let mut exp = Self::build_cfg_expand(&g.data, g.sel);
+        if exp.addr == prev_addr {
+            let max = exp.lines.len().saturating_sub(1);
+            exp.off = prev_off.min(max);
+        }
+        g.expand = exp;
+    }
+
+    /// Scroll the always-on expand panel. Returns true if it consumed the key.
     pub(crate) fn cfg_expand_scroll(&mut self, delta: i64) -> bool {
-        let Some(exp) = self.cfg_graph_view.as_mut().and_then(|g| g.expand.as_mut()) else {
+        let Some(g) = self.cfg_graph_view.as_mut() else {
             return false;
         };
+        let exp = &mut g.expand;
         let max = exp.lines.len().saturating_sub(1);
         exp.off = (exp.off as i64 + delta).clamp(0, max as i64) as usize;
         true
     }
 
-    pub(crate) fn cfg_expand_open(&self) -> bool {
+    /// True when `(col, row)` falls inside the last-rendered expand panel.
+    pub(crate) fn cfg_expand_hit(&self, col: u16, row: u16) -> bool {
         self.cfg_graph_view
             .as_ref()
-            .is_some_and(|g| g.expand.is_some())
-    }
-
-    pub(crate) fn cfg_expand_close(&mut self) {
-        if let Some(g) = self.cfg_graph_view.as_mut() {
-            g.expand = None;
-        }
+            .and_then(|g| g.expand.hit)
+            .is_some_and(|(x, y, w, h)| col >= x && col < x + w && row >= y && row < y + h)
     }
 
     /// The effective selected span: the Tab/click-selected one if it's still on

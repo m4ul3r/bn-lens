@@ -330,24 +330,8 @@ impl Viewer {
         ];
         crate::ui::put_spans(buffer, area.x, area.y + 1, width, &info);
 
-        // Corner hint (top-right): expand the highlighted block.
-        let corner = " e ⤢ expand block ";
-        let cw = corner.chars().count();
-        if (cw as u16) < area.width {
-            crate::ui::put_str(
-                buffer,
-                area.x + area.width - cw as u16,
-                area.y + 1,
-                corner,
-                cw,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            );
-        }
-
-        let hint = " hjkl move · e expand · Enter read · Space list · i/v cycle · q close";
+        let hint =
+            " hjkl move · PgUp/Dn block · Enter read · Space list · i/v cycle · q close";
         crate::ui::render_bar(
             buffer,
             area.x,
@@ -462,10 +446,9 @@ impl Viewer {
             crate::ui::put_str(buffer, area.x + area.width.saturating_sub(1), mid, "›", 1, mark);
         }
 
-        // Expand panel (corner-anchored, syntax-highlighted) draws on top.
-        if let Some(exp) = &g.expand {
-            render_cfg_expand(buffer, area, body_top, bottom, exp);
-        }
+        // Always-on top-left inspector for the highlighted block (syntax-
+        // highlighted full instructions). Drawn last so it sits above the graph.
+        render_cfg_expand(buffer, area, body_top, bottom, &mut g.expand);
         self.cfg_graph_view = Some(g);
     }
 
@@ -685,11 +668,22 @@ impl Viewer {
     }
 }
 
-/// Render the `e` expand panel: the selected block's instructions, syntax-
-/// highlighted with the disasm palette, in a content-sized box anchored to the
-/// top-left corner, with a scroll/close hint in its bottom-right corner.
-fn render_cfg_expand(buffer: &mut Buffer, area: Rect, body_top: u16, bottom: u16, exp: &CfgExpand) {
+/// Render the always-on block inspector: the selected block's instructions,
+/// syntax-highlighted with the disasm palette, in a content-sized box pinned to
+/// the top-left. Caps height so the graph stays visible underneath/around it;
+/// long blocks scroll with PgUp/PgDn (or the wheel when the pointer is over the
+/// panel). Records the panel's screen bounds on `exp.hit` for mouse hit-testing.
+fn render_cfg_expand(
+    buffer: &mut Buffer,
+    area: Rect,
+    body_top: u16,
+    bottom: u16,
+    exp: &mut CfgExpand,
+) {
     let avail_h = bottom.saturating_sub(body_top) as usize;
+    // Leave at least half the body for the graph so the panel never eats the
+    // whole canvas; still tall enough to show a useful window of insns.
+    let max_h = avail_h.max(4).min((avail_h / 2).max(8).min(20));
     let inner_w = exp
         .lines
         .iter()
@@ -698,46 +692,63 @@ fn render_cfg_expand(buffer: &mut Buffer, area: Rect, body_top: u16, bottom: u16
         .unwrap_or(24)
         .clamp(24, (area.width as usize).saturating_sub(6).min(96));
     let panel_w = (inner_w + 4) as u16;
-    let panel_h = (exp.lines.len() + 2).clamp(4, avail_h.max(4)) as u16;
+    let panel_h = (exp.lines.len() + 2).clamp(4, max_h) as u16;
     let panel_x = area.x;
     let panel_y = body_top;
-    crate::ui::draw_box(buffer, panel_x, panel_y, panel_w, panel_h, &exp.title);
+    exp.hit = Some((panel_x, panel_y, panel_w, panel_h));
+    // Solid black fill so the highlighted block's instructions read like a
+    // terminal dump against the graph canvas.
+    let bg = Color::Black;
+    let fg = crate::ui::POPUP_FG;
+    crate::ui::draw_box_colored(
+        buffer,
+        panel_x,
+        panel_y,
+        panel_w,
+        panel_h,
+        &exp.title,
+        bg,
+        fg,
+    );
 
     let view_rows = (panel_h as usize).saturating_sub(2);
+    // Clamp scroll if the panel shrank (e.g. resize).
+    let max_off = exp.lines.len().saturating_sub(view_rows.max(1));
+    if exp.off > max_off {
+        exp.off = max_off;
+    }
     for (i, line) in exp.lines.iter().skip(exp.off).take(view_rows).enumerate() {
         let spans: Vec<Span> = line
             .iter()
             .map(|seg| {
                 let mut st = theme::asm_style(seg.kind);
                 if st.fg.is_none() {
-                    st = st.fg(crate::ui::POPUP_FG);
+                    st = st.fg(fg);
                 }
-                Span::styled(seg.text.clone(), st.bg(crate::ui::POPUP_BG))
+                Span::styled(seg.text.clone(), st.bg(bg))
             })
             .collect();
         crate::ui::put_spans(buffer, panel_x + 2, panel_y + 1 + i as u16, inner_w, &spans);
     }
 
-    // Scroll/close hint in the bottom-right corner of the panel.
+    // Scroll affordance when content overflows the panel.
     let more = exp.off + view_rows < exp.lines.len();
-    let hint = if more || exp.off > 0 {
-        " ↑↓ scroll · q close "
-    } else {
-        " q close "
-    };
-    let hlen = hint.chars().count() as u16;
-    if hlen + 2 < panel_w {
-        crate::ui::put_str(
-            buffer,
-            panel_x + panel_w - hlen - 1,
-            panel_y + panel_h - 1,
-            hint,
-            hlen as usize,
-            Style::default()
-                .fg(Color::Cyan)
-                .bg(crate::ui::POPUP_BG)
-                .add_modifier(Modifier::DIM),
-        );
+    if more || exp.off > 0 {
+        let hint = " PgUp/Dn scroll ";
+        let hlen = hint.chars().count() as u16;
+        if hlen + 2 < panel_w {
+            crate::ui::put_str(
+                buffer,
+                panel_x + panel_w - hlen - 1,
+                panel_y + panel_h - 1,
+                hint,
+                hlen as usize,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .bg(bg)
+                    .add_modifier(Modifier::DIM),
+            );
+        }
     }
 }
 

@@ -368,31 +368,12 @@ impl Viewer {
         self.active = None;
     }
 
-    /// Keys for the 2D CFG graph: hjkl move the selected block, Enter reads it,
-    /// Space drops to the list, i/v cycle the function view.
+    /// Keys for the 2D CFG graph: hjkl move the selected block (the top-left
+    /// inspector always shows that block's instructions), PgUp/PgDn scroll the
+    /// inspector, Enter reads the block as a list, Space drops to the list,
+    /// i/v cycle the function view.
     fn cfg_graph_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
-        // While the expand panel is open it captures scroll/close keys.
-        if self.cfg_expand_open() {
-            match key.code {
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.cfg_expand_scroll(1);
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.cfg_expand_scroll(-1);
-                }
-                KeyCode::PageDown => {
-                    self.cfg_expand_scroll(10);
-                }
-                KeyCode::PageUp => {
-                    self.cfg_expand_scroll(-10);
-                }
-                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('e') | KeyCode::Enter => {
-                    self.cfg_expand_close();
-                }
-                _ => {}
-            }
-            return Exit::Stay;
-        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Exit::Back,
             KeyCode::Char('b') => return self.back(ctx),
@@ -400,7 +381,19 @@ impl Viewer {
             KeyCode::Char('l') | KeyCode::Right => self.cfg_move(CfgDir::Right),
             KeyCode::Char('j') | KeyCode::Down => self.cfg_move(CfgDir::Down),
             KeyCode::Char('k') | KeyCode::Up => self.cfg_move(CfgDir::Up),
-            KeyCode::Char('e') => self.cfg_expand_selected(),
+            // Panel scroll — does not steal hjkl from graph navigation.
+            KeyCode::PageDown => {
+                self.cfg_expand_scroll(10);
+            }
+            KeyCode::PageUp => {
+                self.cfg_expand_scroll(-10);
+            }
+            KeyCode::Char('d') if ctrl => {
+                self.cfg_expand_scroll(10);
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.cfg_expand_scroll(-10);
+            }
             KeyCode::Enter | KeyCode::Char('g') => self.cfg_read_selected(ctx),
             KeyCode::Char(' ') => self.toggle_cfg_graph(ctx),
             KeyCode::Char('i') | KeyCode::Char('v') => self.cycle_view(ctx, 1),
@@ -595,21 +588,16 @@ impl Viewer {
     /// cursor; the wheel scrolls vertically. Panning/scrolling clears follow-mode
     /// so the viewport doesn't snap back to the selection.
     fn cfg_graph_mouse(&mut self, mouse: MouseEvent) {
-        // The expand panel captures the wheel while open; a click closes it.
-        if self.cfg_expand_open() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    self.cfg_expand_scroll(-3);
-                }
-                MouseEventKind::ScrollDown => {
-                    self.cfg_expand_scroll(3);
-                }
-                MouseEventKind::Down(_) => self.cfg_expand_close(),
-                _ => {}
-            }
-            return;
-        }
+        // Wheel over the always-on block inspector scrolls its instructions;
+        // wheel over the canvas pans the graph.
+        let over_expand = self.cfg_expand_hit(mouse.column, mouse.row);
         match mouse.kind {
+            MouseEventKind::ScrollUp if over_expand => {
+                self.cfg_expand_scroll(-3);
+            }
+            MouseEventKind::ScrollDown if over_expand => {
+                self.cfg_expand_scroll(3);
+            }
             MouseEventKind::ScrollUp => {
                 if let Some(g) = self.cfg_graph_view.as_mut() {
                     g.top = g.top.saturating_sub(3);
@@ -634,6 +622,8 @@ impl Viewer {
                     g.follow = false;
                 }
             }
+            // Clicks / drags starting on the inspector don't pan or reselect.
+            MouseEventKind::Down(_) if over_expand => {}
             MouseEventKind::Down(_) => {
                 self.cfg_drag = Some((mouse.column, mouse.row));
                 self.cfg_dragged = false;
@@ -653,8 +643,9 @@ impl Viewer {
                 }
             }
             MouseEventKind::Up(_) => {
-                if !self.cfg_dragged {
-                    // A click (no drag) selects the block under the cursor.
+                if !self.cfg_dragged && !over_expand {
+                    // A click (no drag) selects the block under the cursor and
+                    // refreshes the top-left inspector.
                     let hit = self
                         .cfg_hit
                         .iter()
@@ -666,9 +657,7 @@ impl Viewer {
                         })
                         .map(|&(_, _, _, _, idx)| idx);
                     if let Some(idx) = hit {
-                        if let Some(g) = self.cfg_graph_view.as_mut() {
-                            g.sel = idx;
-                        }
+                        self.cfg_select(idx);
                     }
                 }
                 self.cfg_drag = None;

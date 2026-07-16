@@ -97,6 +97,21 @@ pub fn put_spans(buf: &mut Buffer, x0: u16, y: u16, max_w: usize, spans: &[Span]
 
 /// A cleared, bordered box with a title (used by popups and the switcher).
 pub fn draw_box(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, title: &str) {
+    draw_box_colored(buf, x, y, w, h, title, POPUP_BG, POPUP_FG);
+}
+
+/// Like [`draw_box`], but with an explicit fill colour (e.g. the CFG block
+/// inspector uses solid black so the instructions read like a terminal dump).
+pub fn draw_box_colored(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    title: &str,
+    bg: Color,
+    fg: Color,
+) {
     if w < 2 || h < 2 {
         return;
     }
@@ -106,10 +121,10 @@ pub fn draw_box(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, title: &str) {
     // then set the panel bg + a light default fg. Because writes only patch, any
     // content drawn on top keeps this bg unless it sets its own — so the whole
     // popup reads as one opaque, raised panel.
-    let panel = Style::reset().bg(POPUP_BG).fg(POPUP_FG);
+    let panel = Style::reset().bg(bg).fg(fg);
     // Borders start from a plain style (no reset), so `add_modifier(BOLD)` on the
     // title isn't cancelled by reset()'s "clear all modifiers".
-    let cyan = Style::default().fg(Color::Cyan).bg(POPUP_BG);
+    let cyan = Style::default().fg(Color::Cyan).bg(bg);
     for row in 0..h {
         put_str(buf, x, y + row, " ".repeat(wu), wu, panel);
     }

@@ -418,8 +418,8 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "e  (cfg graph)",
-        action: "expand the highlighted block (full instructions)",
+        key: "PgUp/Dn · ^U/^D  (cfg graph)",
+        action: "scroll the top-left block inspector (always shows the highlight)",
     },
     HelpLine::Entry {
         scope: "VIEWER",
