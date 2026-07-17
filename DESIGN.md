@@ -97,14 +97,16 @@ backing bytes and `x` xrefs the string, both after resolving the content to its 
 `ctx.strings()` map (which prefers the real `.rodata` copy over the `.dynstr`/`.symtab` duplicates; the
 escape rendering matches the decompile, so even a multi-line literal resolves). Constants/offsets (a
 `0x…` in no section, like `hif + 0x120`) stay inert. **`Tab`/`Shift-Tab` step hotspot-to-hotspot**
-over the *interesting* spans (register-temp locals like `v0`/`x0_1`, non-code addresses, and the viewed
-function's own signature name are skipped — a **click** still reaches them), and `g`/`Enter`/`p`/`x`/`n`
-dispatch on the selection's kind. A `j`/`k` line move drops the Tab/click selection, so a stale hotspot
-can't redirect a later rename. Peek resolves internal symbols on-demand via `bn xrefs` and **symbolizes
-the hex dump** (`+off→name` for any 8-byte value that is a known symbol address). `/`+`]`/`[` find in
-function. `b`/`w` walk the nav history back/forward (a new goto/xrefs clears forward, like a browser);
-`q` leaves to the list immediately, while `Esc` backs out **one layer at a time** — popup → stack panel
-→ visual mode → search input → search highlight → nav history → list — and never skips the history.
+over hotspots (non-code addresses and the viewed function's own signature name are skipped; **all
+locals** including register temps like `v0_2` stay in the ring so they can be renamed), and
+`g`/`Enter`/`p`/`x`/`n` dispatch on the selection's kind. `w`/`b` (and Tab/Shift-Tab) step that ring
+like word motion.
+A `j`/`k` line move drops the selection, so a stale hotspot can't redirect a later rename. Peek resolves
+internal symbols on-demand via `bn xrefs` and **symbolizes the hex dump** (`+off→name` for any 8-byte
+value that is a known symbol address). `/`+`]`/`[` find in function. Nav history (function jumplist)
+is `^O`/`^F` back/forward (a new goto/xrefs clears forward, like a browser); `q` leaves to the list
+immediately, while `Esc` backs out **one layer at a time** — popup → stack panel → visual mode →
+search input → search highlight → nav history → list — and never skips the history.
 
 **Stack inspector** — `S` consumes structured `bn local list --format json` data rather than parsing
 decompiler text: stable local IDs, full types, stack/register provenance, signed frame offsets, and

@@ -137,7 +137,7 @@ impl Viewer {
         } else if self.vmode {
             " j/k extend · a ask · Esc cancel · ? help"
         } else {
-            " j/k · Tab hotspot · g act · n/;/t · a ask · / find · i il · v cfg · b/w hist · q list · ? help"
+            " j/k · b/w hotspot · g act · n/;/t · a ask · / find · i il · v cfg · ^O/^F hist · q list · ? help"
         };
         crate::ui::render_bar(
             buffer,
@@ -345,7 +345,7 @@ impl Viewer {
         crate::ui::put_spans(buffer, area.x, area.y + 1, width, &info);
 
         let hint =
-            " hjkl spatial · ]/[ block · PgUp/Dn panel · Enter read · Space list · i il · v linear · b/w hist · q list";
+            " hjkl spatial · b/w·]/[ block · PgUp/Dn panel · Enter read · Space list · i il · v linear · ^O/^F hist · q list";
         crate::ui::render_bar(
             buffer,
             area.x,

@@ -262,8 +262,16 @@ impl Viewer {
                 self.cline = 0;
                 self.active = None;
             }
-            KeyCode::Tab => self.next_symbol(1),
-            KeyCode::BackTab => self.next_symbol(-1),
+            // Hotspot step (vim-ish word motion): functions, data, strings,
+            // and every local (including v0_2-style temps — those get renamed).
+            KeyCode::Char('w') | KeyCode::Tab => self.next_symbol(1),
+            KeyCode::Char('b') | KeyCode::BackTab => self.next_symbol(-1),
+            // Nav history (browser jumplist) — not in-view motion.
+            KeyCode::Char('o') if control => return self.back(ctx),
+            KeyCode::Char('f') if control => {
+                self.go_forward(ctx);
+                return Exit::Stay;
+            }
             KeyCode::Char('g') | KeyCode::Enter => self.act_primary(ctx),
             KeyCode::Char('p') => self.peek_on_line(ctx),
             KeyCode::Char('s') => {
@@ -284,8 +292,6 @@ impl Viewer {
             KeyCode::Char('I') => self.cycle_il(ctx, -1),
             KeyCode::Char('v') => self.toggle_cfg(ctx),
             KeyCode::Char(' ') if self.view == View::Cfg => self.toggle_cfg_graph(ctx),
-            KeyCode::Char('b') => return self.back(ctx),
-            KeyCode::Char('w') => self.go_forward(ctx),
             KeyCode::Char('V') => {
                 self.vmode = true;
                 self.vanchor = self.cline;
@@ -417,27 +423,32 @@ impl Viewer {
         self.active = None;
     }
 
-    /// Keys for the 2D CFG graph: hjkl move spatially, ]/[ step block index
-    /// order, PgUp/PgDn scroll the always-on inspector, Enter reads the block
-    /// as a list, Space toggles graph⇄list, i/I cycle the IL in place, v drops
-    /// back to the linear view.
+    /// Keys for the 2D CFG graph: hjkl move spatially, w/b and ]/[ step block
+    /// index order, PgUp/PgDn scroll the always-on inspector, Enter reads the
+    /// block as a list, Space toggles graph⇄list, i/I cycle the IL in place,
+    /// v drops back to the linear view. History is ^O/^F (same as linear).
     fn cfg_graph_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            // q leaves now; Esc/b pop the nav history. No `esc_back` ladder
+            // q leaves now; Esc pops the nav history. No `esc_back` ladder
             // here: the search highlight only renders in the linear view (the
             // graph has empty `self.lines`, so a match can't be shown), so
             // there's no highlight layer for Esc to clear first.
             KeyCode::Char('q') => return Exit::Back,
-            KeyCode::Esc | KeyCode::Char('b') => return self.back(ctx),
-            KeyCode::Char('w') => self.go_forward(ctx),
+            KeyCode::Esc => return self.back(ctx),
+            KeyCode::Char('o') if ctrl => return self.back(ctx),
+            KeyCode::Char('f') if ctrl => {
+                self.go_forward(ctx);
+                return Exit::Stay;
+            }
             KeyCode::Char('h') | KeyCode::Left => self.cfg_move(CfgDir::Left),
             KeyCode::Char('l') | KeyCode::Right => self.cfg_move(CfgDir::Right),
             KeyCode::Char('j') | KeyCode::Down => self.cfg_move(CfgDir::Down),
             KeyCode::Char('k') | KeyCode::Up => self.cfg_move(CfgDir::Up),
             // Sequential walk (address/layout order) — distinct from spatial hjkl.
-            KeyCode::Char(']') => self.cfg_step(1),
-            KeyCode::Char('[') => self.cfg_step(-1),
+            // `w`/`b` match linear-view "next/prev unit" muscle memory.
+            KeyCode::Char('w') | KeyCode::Char(']') => self.cfg_step(1),
+            KeyCode::Char('b') | KeyCode::Char('[') => self.cfg_step(-1),
             // Panel scroll — does not steal hjkl from graph navigation.
             KeyCode::PageDown => {
                 self.cfg_expand_scroll(10);
@@ -469,10 +480,9 @@ impl Viewer {
         self.active = None;
     }
 
-    /// Tab/Shift-Tab: step through the *interesting* spans one at a time,
-    /// wrapping — register-temp locals, non-code addresses, and the viewed
-    /// function's own name are skipped (still clickable, and `tab_stops` falls
-    /// back to every span when nothing else qualifies).
+    /// `w`/`b`/Tab/Shift-Tab: step interactive spans, wrapping. Non-code
+    /// addresses and the viewed function's own name are skipped; **all locals**
+    /// (including `v0_2` temps) stay in the ring so they can be renamed.
     fn next_symbol(&mut self, direction: i32) {
         if self.spans.is_empty() {
             return;
@@ -642,8 +652,10 @@ impl Viewer {
             return;
         }
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.move_cursor(-3),
-            MouseEventKind::ScrollDown => self.move_cursor(3),
+            // Same step as PgUp/PgDn — a 3-line nudge felt like "changing the
+            // highlight", not scrolling the decompile.
+            MouseEventKind::ScrollUp => self.move_cursor(-20),
+            MouseEventKind::ScrollDown => self.move_cursor(20),
             MouseEventKind::Down(_) => {
                 for &(x0, x1, y, index) in &self.screen_tgts {
                     if mouse.row == y && mouse.column >= x0 && mouse.column < x1 {

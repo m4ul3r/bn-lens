@@ -401,8 +401,8 @@ impl ImportsList {
             return;
         }
         match m.kind {
-            MouseEventKind::ScrollUp => self.move_sel(-3),
-            MouseEventKind::ScrollDown => self.move_sel(3),
+            MouseEventKind::ScrollUp => self.move_sel(-20),
+            MouseEventKind::ScrollDown => self.move_sel(20),
             MouseEventKind::Down(_) => {
                 let row = m.row.saturating_sub(area.y + 2) as usize;
                 let idx = self.top + row;

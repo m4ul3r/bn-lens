@@ -571,8 +571,8 @@ impl Picker {
             return;
         }
         match m.kind {
-            MouseEventKind::ScrollUp => self.move_sel(-3),
-            MouseEventKind::ScrollDown => self.move_sel(3),
+            MouseEventKind::ScrollUp => self.move_sel(-20),
+            MouseEventKind::ScrollDown => self.move_sel(20),
             MouseEventKind::Down(_) => {
                 let rows = self.rows();
                 let ri = self.top + m.row.saturating_sub(area.y + 2) as usize;

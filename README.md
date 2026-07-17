@@ -49,9 +49,9 @@ command = "bn.lens.open"
 SSH into the box → `bn session start` your target(s) → in herdr, keep your agent (claude/codex) in one
 pane and open **bn lens beside it** (`alt+d`).
 
-- **Navigate** in the lens like vim: `/` to a function, `Enter`, then `Tab` through hotspots, `g` to
+- **Navigate** in the lens like vim: `/` to a function, `Enter`, then `w`/`b` through hotspots, `g` to
   follow calls, `x` for xrefs, `p` to peek data/strings, `i`/`I` to cross-check decompile ↔ MLIL ↔
-  disasm.
+  disasm (`^O`/`^F` for nav history).
 - **Hand off to the agent** when something's worth a deeper look: `V` to select a range, `a` to send
   it. The lens delivers a copy-pasteable `-i/-t/fn@addr` locator + the code to the agent's pane; the
   agent re-queries via `bn` (xrefs, taint, types…) and you **follow along in the lens**.
@@ -95,7 +95,7 @@ most useful keys for the current mode.
 |-----|--------|
 | `?` | open the global shortcut guide |
 | `j`/`k` `^D`/`^U` `G` | move the line cursor |
-| `Tab` / `Shift-Tab` | step through the **interesting hotspots** — functions (blue), data (cyan), addresses (yellow), strings (magenta), named locals (gray); register temps (`v0`, `x0_1`) are skipped but stay clickable |
+| `w` / `b` · `Tab` / `Shift-Tab` | step through **hotspots** — functions (blue), data (cyan), addresses (yellow), strings (magenta), locals (gray) including BN temps (`v0_2`, `x0_1`) so you can rename them |
 | `g` / `Enter` | act on the hotspot: goto a function/code address, peek data, show a local's type |
 | `p` | peek — a **code** hotspot (function name, or a `0x…` in an executable section, e.g. a callsite on the xrefs page) shows the **decompile** centered on the use; **data** shows the byte dump (pointers symbolized) |
 | `x` | xrefs of the hotspot (`Enter` on a caller lands on the *use*) |
@@ -109,7 +109,7 @@ most useful keys for the current mode.
 | `/` then `]`/`[` | find in function |
 | `V` then `a` | visual-select a range, then **ask the agent** |
 | `a` | ask the agent about the cursor line |
-| `b` / `w` | back / forward in the nav history |
+| `^O` / `^F` | back / forward in the **nav history** (function jumplist — not in-view motion) |
 | `s` | sections map |
 | `q` | leave to the picker now |
 | `Esc` | back out **one layer**: popup → stack → visual → search → nav history → picker |

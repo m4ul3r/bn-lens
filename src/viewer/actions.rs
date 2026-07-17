@@ -437,8 +437,8 @@ impl Viewer {
         self.cline = frame.cline;
     }
 
-    /// `b` (and Esc at the bottom of its ladder): pop the nav stack, remembering
-    /// the current view on the forward stack so `w` can redo. With no history
+    /// `^O` (and Esc at the bottom of its ladder): pop the nav stack, remembering
+    /// the current view on the forward stack so `^F` can redo. With no history
     /// left, leave to the list.
     pub(super) fn back(&mut self, ctx: &Ctx) -> Exit {
         match self.stack.pop() {
@@ -452,8 +452,8 @@ impl Viewer {
         }
     }
 
-    /// `w`: forward — undo the latest `b`, pushing the current view back onto
-    /// the nav stack so `b`/`w` walk the same trail in both directions.
+    /// `^F`: forward — undo the latest `^O`/Esc history pop, pushing the current
+    /// view back onto the nav stack so `^O`/`^F` walk the same trail both ways.
     pub(super) fn go_forward(&mut self, ctx: &Ctx) {
         match self.forward.pop() {
             Some(frame) => {
@@ -461,7 +461,7 @@ impl Viewer {
                 self.stack.push(here);
                 self.restore(ctx, frame);
             }
-            None => self.status = " no forward history (w redoes a b)".into(),
+            None => self.status = " no forward history (^F redoes a ^O)".into(),
         }
     }
 }

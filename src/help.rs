@@ -373,8 +373,8 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "Tab / Shift-Tab",
-        action: "next / previous interesting hotspot (register temps skipped; click reaches them)",
+        key: "w / b  ·  Tab / Shift-Tab",
+        action: "next / previous hotspot (funcs, data, strings, locals including v0_2 temps)",
     },
     HelpLine::Entry {
         scope: "VIEWER",
@@ -423,7 +423,7 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "] / [  (cfg graph)",
+        key: "w / b · ] / [  (cfg graph)",
         action: "next / previous block in index order (sequential walk)",
     },
     HelpLine::Entry {
@@ -463,8 +463,8 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "b / w",
-        action: "back / forward in the nav history",
+        key: "^O / ^F",
+        action: "back / forward in the nav history (function jumplist; not in-view motion)",
     },
     HelpLine::Entry {
         scope: "VIEWER",
@@ -579,7 +579,7 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "PICKER/VIEWER",
         key: "wheel",
-        action: "scroll",
+        action: "page up/down (same step as PgUp/PgDn)",
     },
     HelpLine::Entry {
         scope: "PICKER/VIEWER",
