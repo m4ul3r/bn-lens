@@ -328,11 +328,11 @@ impl ExportsList {
             ),
             Mode::Normal => (
                 if self.filter.is_empty() {
-                    " exports · public API".to_string()
+                    String::new()
                 } else {
-                    format!(" exports · filter: {}", self.filter)
+                    format!(" filter: {}", self.filter)
                 },
-                " j/k move · / search · p uses · Enter open · x xrefs · m menu · i switch · q quit",
+                " j/k move · / search · p uses · Enter open · x xrefs · m menu · v next list · i switch · q quit",
             ),
         };
         crate::ui::put_str(

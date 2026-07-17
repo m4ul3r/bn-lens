@@ -444,19 +444,16 @@ impl ImportsList {
                 " type · ↑↓ pick · Enter xrefs · Tab list · Esc cancel · ? help",
             ),
             Mode::Normal => (
-                {
-                    let base = if self.sinks_only {
-                        " imports · sinks only"
-                    } else {
-                        " imports"
-                    };
-                    if self.filter.is_empty() {
-                        base.to_string()
-                    } else {
-                        format!("{base} · filter: {}", self.filter)
-                    }
+                if self.sinks_only && self.filter.is_empty() {
+                    " sinks only".to_string()
+                } else if self.sinks_only {
+                    format!(" sinks only · filter: {}", self.filter)
+                } else if self.filter.is_empty() {
+                    String::new()
+                } else {
+                    format!(" filter: {}", self.filter)
                 },
-                " j/k move · / search · f sinks-only · p callers · Enter/x xrefs · m menu · i switch · q quit",
+                " j/k move · / search · f sinks-only · p callers · Enter/x xrefs · m menu · v next list · i switch · q quit",
             ),
         };
         crate::ui::put_str(

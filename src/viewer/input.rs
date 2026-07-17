@@ -262,6 +262,7 @@ impl Viewer {
                     title: "sections  ·  r-x=exec  rw-=data  w+x flagged".into(),
                     lines: ctx.bn.sections(),
                     off: 0,
+                    hoff: 0,
                     focus: None,
                 };
             }
@@ -270,8 +271,9 @@ impl Viewer {
             KeyCode::Char('r') => self.open_rename(),
             KeyCode::Char(';') => self.open_comment(),
             KeyCode::Char('t') => self.open_tag(),
-            KeyCode::Char('i') | KeyCode::Char('v') => self.cycle_view(ctx, 1),
-            KeyCode::Char('I') => self.cycle_view(ctx, -1),
+            KeyCode::Char('i') => self.cycle_il(ctx, 1),
+            KeyCode::Char('I') => self.cycle_il(ctx, -1),
+            KeyCode::Char('v') => self.toggle_cfg(ctx),
             KeyCode::Char(' ') if self.view == View::Cfg => self.toggle_cfg_graph(ctx),
             KeyCode::Char('b') => return self.back(ctx),
             KeyCode::Char('V') => {
@@ -339,18 +341,40 @@ impl Viewer {
         Exit::Stay
     }
 
-    /// `i`/`I`/`v`: cycle the current function through Decomp → MLIL → Disasm →
-    /// CFG (and back). From an xrefs view, enter Decomp. Reload and reset to the
-    /// top. (`load_cfg` sets its own status for the CFG view.)
-    fn cycle_view(&mut self, ctx: &Ctx, direction: i32) {
-        let order = [View::Decomp, View::Mlil, View::Disasm, View::Cfg];
-        let next = match order.iter().position(|&view| view == self.view) {
-            Some(current) => {
-                order[(current as i32 + direction).rem_euclid(order.len() as i32) as usize]
-            }
-            None => View::Decomp,
+    /// `i`/`I`: cycle the IL rendering (Decomp → MLIL → Disasm and back). In a
+    /// linear view the view itself changes; in the CFG view the graph stays up
+    /// and re-fetches its blocks at the new IL. From an xrefs view, enter the
+    /// current IL linearly (no cycle).
+    fn cycle_il(&mut self, ctx: &Ctx, direction: i32) {
+        if self.view != View::Xrefs {
+            let order = [View::Decomp, View::Mlil, View::Disasm];
+            let current = order
+                .iter()
+                .position(|&view| view == self.code_view)
+                .unwrap_or(0);
+            self.code_view =
+                order[(current as i32 + direction).rem_euclid(order.len() as i32) as usize];
+        }
+        if self.view != View::Cfg {
+            self.view = self.code_view;
+        }
+        self.reload_view(ctx);
+    }
+
+    /// `v`: flip linear ⇄ CFG for the current function, keeping the IL
+    /// rendering across the flip. From an xrefs view, enter the CFG.
+    fn toggle_cfg(&mut self, ctx: &Ctx) {
+        self.view = if self.view == View::Cfg {
+            self.code_view
+        } else {
+            View::Cfg
         };
-        self.view = next;
+        self.reload_view(ctx);
+    }
+
+    /// Reload after an `i`/`v` view switch, resetting to the top. (`load_cfg`
+    /// sets its own status for the CFG view.)
+    fn reload_view(&mut self, ctx: &Ctx) {
         self.load(ctx);
         self.top = 0;
         self.cline = 0;
@@ -370,10 +394,10 @@ impl Viewer {
         self.active = None;
     }
 
-    /// Keys for the 2D CFG graph: hjkl move the selected block (the top-left
-    /// inspector always shows that block's instructions), PgUp/PgDn scroll the
-    /// inspector, Enter reads the block as a list, Space drops to the list,
-    /// i/v cycle the function view.
+    /// Keys for the 2D CFG graph: hjkl move spatially, n/N step block index
+    /// order, PgUp/PgDn scroll the always-on inspector, Enter reads the block
+    /// as a list, Space toggles graph⇄list, i/I cycle the IL in place, v drops
+    /// back to the linear view.
     fn cfg_graph_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -383,6 +407,9 @@ impl Viewer {
             KeyCode::Char('l') | KeyCode::Right => self.cfg_move(CfgDir::Right),
             KeyCode::Char('j') | KeyCode::Down => self.cfg_move(CfgDir::Down),
             KeyCode::Char('k') | KeyCode::Up => self.cfg_move(CfgDir::Up),
+            // Sequential walk (address/layout order) — distinct from spatial hjkl.
+            KeyCode::Char('n') => self.cfg_step(1),
+            KeyCode::Char('N') => self.cfg_step(-1),
             // Panel scroll — does not steal hjkl from graph navigation.
             KeyCode::PageDown => {
                 self.cfg_expand_scroll(10);
@@ -398,8 +425,9 @@ impl Viewer {
             }
             KeyCode::Enter | KeyCode::Char('g') => self.cfg_read_selected(ctx),
             KeyCode::Char(' ') => self.toggle_cfg_graph(ctx),
-            KeyCode::Char('i') | KeyCode::Char('v') => self.cycle_view(ctx, 1),
-            KeyCode::Char('I') => self.cycle_view(ctx, -1),
+            KeyCode::Char('i') => self.cycle_il(ctx, 1),
+            KeyCode::Char('I') => self.cycle_il(ctx, -1),
+            KeyCode::Char('v') => self.toggle_cfg(ctx),
             _ => {}
         }
         Exit::Stay
@@ -538,9 +566,19 @@ impl Viewer {
     }
 
     fn peek_key(&mut self, key: KeyEvent) {
-        let Popup::Peek { lines, off, .. } = &mut self.popup else {
+        let Popup::Peek {
+            lines, off, hoff, ..
+        } = &mut self.popup
+        else {
             return;
         };
+        // Widest line, so horizontal pan can't scroll past the content.
+        let max_h = lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => self.popup = Popup::None,
             KeyCode::Char('j') | KeyCode::Down => {
@@ -551,6 +589,9 @@ impl Viewer {
                 *off = (*off + 10).min(lines.len().saturating_sub(1));
             }
             KeyCode::PageUp => *off = off.saturating_sub(10),
+            KeyCode::Char('l') | KeyCode::Right => *hoff = (*hoff + 8).min(max_h),
+            KeyCode::Char('h') | KeyCode::Left => *hoff = hoff.saturating_sub(8),
+            KeyCode::Char('0') | KeyCode::Home => *hoff = 0,
             _ => {}
         }
     }

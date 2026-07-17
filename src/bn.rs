@@ -237,7 +237,12 @@ struct PyEnvelope {
 }
 
 /// The `bn py exec` program that walks a function's basic blocks and prints the
-/// CFG as JSON. `{IDENT}` is replaced with a single-quote-escaped identifier.
+/// CFG as JSON. `{IDENT}` is replaced with a single-quote-escaped identifier;
+/// `{IL}` with the rendering level (`asm`/`mlil`/`hlil`). For IL levels the
+/// block `start`/edge `to` values are IL instruction indexes (hex) — unique
+/// block identities, unlike first-line addresses, which collide when one
+/// assembly instruction expands to several IL blocks — while each line's `a`
+/// stays a real address.
 const CFG_PROGRAM: &str = r#"
 import json
 def _resolve(bv, ident):
@@ -254,6 +259,12 @@ def _resolve(bv, ident):
     fs = bv.get_functions_containing(addr)
     return fs[0] if fs else None
 fn = _resolve(bv, '{IDENT}')
+level = '{IL}'
+if fn is not None and level != 'asm':
+    try:
+        fn = fn.mlil if level == 'mlil' else fn.hlil
+    except Exception:
+        fn = None
 blocks = []
 if fn is not None:
     for bb in fn.basic_blocks:
@@ -683,12 +694,13 @@ impl Bn {
             .collect()
     }
 
-    /// Basic blocks + typed edges of `ident`'s control-flow graph, via
-    /// `bn py exec` (there is no first-class CFG command). Empty on any failure
-    /// (unknown function, no blocks, malformed output) — the caller shows a note.
-    pub fn cfg(&self, ident: &str) -> Vec<CfgBlock> {
+    /// Basic blocks + typed edges of `ident`'s control-flow graph at rendering
+    /// level `il` (`asm`/`mlil`/`hlil`), via `bn py exec` (there is no
+    /// first-class CFG command). Empty on any failure (unknown function, no
+    /// blocks, IL unavailable, malformed output) — the caller shows a note.
+    pub fn cfg(&self, ident: &str, il: &str) -> Vec<CfgBlock> {
         let escaped = ident.replace('\\', "\\\\").replace('\'', "\\'");
-        let program = CFG_PROGRAM.replace("{IDENT}", &escaped);
+        let program = CFG_PROGRAM.replace("{IDENT}", &escaped).replace("{IL}", il);
         let out = self.run_out(&["py", "exec", "--format", "json", "--code", &program]);
         serde_json::from_str::<PyEnvelope>(&out)
             .ok()

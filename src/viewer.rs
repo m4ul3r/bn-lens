@@ -34,8 +34,9 @@ struct Hotspot {
     code: bool, // Addr: inside an executable section (goto vs peek)
 }
 
-/// Which rendering of the current function/target we're showing. The code
-/// views cycle with `i`/`I`/`v`; Xrefs is entered with `x`.
+/// Which rendering of the current function/target we're showing. `i`/`I`
+/// cycle the IL (the code views — also re-rendering the CFG when it's up);
+/// `v` flips linear ⇄ CFG; Xrefs is entered with `x`.
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Decomp,
@@ -59,6 +60,16 @@ impl View {
             View::Disasm => "disasm",
             View::Cfg => "cfg",
             View::Xrefs => "xrefs",
+        }
+    }
+
+    /// The bn rendering level backing a code view, for the CFG fetch:
+    /// decompile→hlil, mlil→mlil, disasm→asm.
+    fn il_level(self) -> &'static str {
+        match self {
+            View::Decomp => "hlil",
+            View::Mlil => "mlil",
+            _ => "asm",
         }
     }
 }
@@ -146,6 +157,10 @@ enum Popup {
         title: String,
         lines: Vec<String>,
         off: usize,
+        /// Horizontal scroll (chars) so a long line — e.g. a call whose trailing
+        /// `length` argument would otherwise clip off the right edge — can be
+        /// panned into view with `h`/`l`.
+        hoff: usize,
         /// Absolute index of a line to highlight (the focused statement of a
         /// decomp peek); `None` for plain scrollable peeks (byte dumps, sections).
         focus: Option<usize>,
@@ -176,7 +191,16 @@ pub enum Exit {
 
 pub struct Viewer {
     name: String,
+    /// The entry address of the function currently in view (`0x…`), kept in sync
+    /// on every successful load. Anchors identity across an *external* rename: a
+    /// `^R` refresh after the agent renames this function finds the name gone,
+    /// and recovers the new name by looking this address up in the rebuilt ctx.
+    entry: Option<String>,
     view: View,
+    /// The IL rendering shared by linear and CFG modes — always a code view.
+    /// `i`/`I` cycle it; `v` flips linear ⇄ CFG keeping it, so toggling back
+    /// and forth stays on the same IL.
+    code_view: View,
     lines: Vec<Line>,
     spans: Vec<Hotspot>,
     locals: std::collections::HashMap<String, String>, // name -> type (this fn)
@@ -192,16 +216,18 @@ pub struct Viewer {
     stack: Vec<Frame>,
     popup: Popup,
     screen_tgts: Vec<(u16, u16, u16, usize)>, // x0,x1,y,target_idx (for mouse)
-    /// CFG view: block start address -> its header line, so acting on an edge
-    /// target jumps within the graph instead of re-decompiling. Empty elsewhere.
+    /// CFG view: block identity *and* displayed head address -> its header
+    /// line, so acting on an edge target or a block header jumps within the
+    /// graph instead of re-decompiling. Empty elsewhere.
     cfg_index: std::collections::HashMap<u64, usize>,
     /// CFG view: whether the boxed graph layout is requested (Space toggles it).
     cfg_graph: bool,
     /// CFG view: the fetched basic blocks for the named function, so layout
-    /// changes (graph↔list toggle, Enter-read, view cycling back to CFG) re-run
+    /// changes (graph↔list toggle, Enter-read, toggling back to CFG) re-run
     /// only the pure render instead of the external `bn cfg` query. Invalidated
-    /// by a reload (^R / rename) or a function change (the key is the name).
-    cfg_cache: Option<(String, Vec<CfgBlock>)>,
+    /// by a reload (^R / rename), a function change, or an IL change (the key
+    /// is name + IL level).
+    cfg_cache: Option<(String, &'static str, Vec<CfgBlock>)>,
     /// CFG graph mode: the laid-out graph + selection, when a 2D graph is shown
     /// (None while in the CFG list fallback or any non-CFG view).
     cfg_graph_view: Option<CfgGraph>,
@@ -218,7 +244,9 @@ impl Viewer {
     pub fn new(ctx: &Ctx, name: String, is_code: bool) -> Self {
         let mut viewer = Viewer {
             name,
+            entry: None,
             view: if is_code { View::Decomp } else { View::Xrefs },
+            code_view: View::Decomp,
             lines: Vec::new(),
             spans: Vec::new(),
             locals: std::collections::HashMap::new(),
@@ -252,6 +280,22 @@ impl Viewer {
     /// and the CFG block cache (the function may have changed under us).
     pub fn reload(&mut self, ctx: &Ctx) {
         self.cfg_cache = None;
+        // Self-heal an external rename: if the current display name no longer
+        // resolves in the rebuilt ctx but we know this function's entry address,
+        // adopt whatever name now lives at that address. Without this, a `^R`
+        // after the agent renames the viewed function keeps the stale name and
+        // the next fetch returns nothing. Only for a *name*-anchored view — when
+        // `self.name` is a bare address (goto/xrefs onto a `0x…` hotspot) the
+        // view is already address-anchored and `entry` may point at a different
+        // function, so recovery there would teleport the view.
+        if !self.name.starts_with("0x") && !ctx.addr_by_name.contains_key(&self.name) {
+            if let Some(name) = self.entry.as_ref().and_then(|a| ctx.name_by_addr.get(a)) {
+                if *name != self.name {
+                    self.status = format!(" ↻ renamed externally: {} → {name}", self.name);
+                    self.name = name.clone();
+                }
+            }
+        }
         self.load(ctx);
     }
 
@@ -274,6 +318,11 @@ impl Viewer {
     }
 
     fn load(&mut self, ctx: &Ctx) {
+        // Keep the entry-address anchor current whenever the name resolves to a
+        // known symbol (see `entry`), so a later reload can recover from a rename.
+        if let Some(addr) = ctx.addr_by_name.get(&self.name) {
+            self.entry = Some(addr.clone());
+        }
         if matches!(self.view, View::Cfg) {
             self.load_cfg(ctx);
             return;
@@ -308,15 +357,17 @@ impl Viewer {
         self.active = None;
     }
 
-    /// Build the CFG view: walk the function's basic blocks via `bn` (reusing
-    /// the cached fetch when it's for the same function — layout toggles and
-    /// re-entries must not re-spawn the external query), render them (list or
-    /// boxed graph) into display lines, and record the block-address → line
-    /// index so acting on an edge target jumps within the graph.
+    /// Build the CFG view at the current IL (`code_view`): walk the function's
+    /// basic blocks via `bn` (reusing the cached fetch when it's for the same
+    /// function *and* IL — layout toggles and re-entries must not re-spawn the
+    /// external query), render them (list or boxed graph) into display lines,
+    /// and record the block-address → line index so acting on an edge target
+    /// jumps within the graph.
     fn load_cfg(&mut self, ctx: &Ctx) {
+        let il = self.code_view.il_level();
         let blocks = match self.cfg_cache.take() {
-            Some((name, blocks)) if name == self.name => blocks,
-            _ => ctx.bn.cfg(&self.name),
+            Some((name, cached_il, blocks)) if name == self.name && cached_il == il => blocks,
+            _ => ctx.bn.cfg(&self.name, il),
         };
         // Try the 2D graph first (when requested); fall back to the block list
         // only when there are too many blocks to lay out.
@@ -344,9 +395,10 @@ impl Viewer {
                 self.spans = Vec::new();
                 self.cfg_index = std::collections::HashMap::new();
                 self.status = format!(
-                    " cfg · {count} blocks · graph · hjkl move · PgUp/Dn scroll block · Enter read · Space list"
+                    " cfg·{} · {count} blocks · graph · hjkl spatial · n/N block · Space list · i il · v linear",
+                    self.code_view.label()
                 );
-                self.cfg_cache = Some((self.name.clone(), blocks));
+                self.cfg_cache = Some((self.name.clone(), il, blocks));
                 return;
             }
         }
@@ -362,19 +414,21 @@ impl Viewer {
         self.active = None;
         self.status = if self.cfg_graph {
             format!(
-                " cfg · {} blocks · list (too many to graph) · Enter jump edge · v/i cycle",
+                " cfg·{} · {} blocks · list (too many to graph) · Enter jump edge · i il · v linear",
+                self.code_view.label(),
                 rendered.block_count
             )
         } else {
             format!(
-                " cfg · {} blocks · list · Space graph · Enter jump edge · v/i cycle",
+                " cfg·{} · {} blocks · list · Space graph · Enter jump edge · i il · v linear",
+                self.code_view.label(),
                 rendered.block_count
             )
         };
-        self.cfg_cache = Some((self.name.clone(), blocks));
+        self.cfg_cache = Some((self.name.clone(), il, blocks));
     }
 
-    /// Move the CFG graph selection to the nearest box in `dir` (hjkl).
+    /// Move the CFG graph selection to the nearest box in `dir` (hjkl — spatial).
     pub(crate) fn cfg_move(&mut self, dir: CfgDir) {
         let Some(g) = self.cfg_graph_view.as_mut() else {
             return;
@@ -415,6 +469,22 @@ impl Viewer {
         }
     }
 
+    /// Step the CFG selection by block index order (`n`/`N` — sequential, not
+    /// spatial). Wraps at the ends so you can walk every block once.
+    pub(crate) fn cfg_step(&mut self, delta: i64) {
+        let Some(g) = self.cfg_graph_view.as_mut() else {
+            return;
+        };
+        let n = g.data.blocks.len() as i64;
+        if n == 0 {
+            return;
+        }
+        let next = (g.sel as i64 + delta).rem_euclid(n) as usize;
+        g.sel = next;
+        g.follow = true;
+        Self::sync_cfg_expand(g);
+    }
+
     /// Select CFG graph block `idx` (from a mouse click) and refresh the
     /// top-left inspector to match.
     pub(crate) fn cfg_select(&mut self, idx: usize) {
@@ -451,7 +521,7 @@ impl Viewer {
     fn build_cfg_expand(data: &crate::cfg::GraphData, sel: usize) -> CfgExpand {
         let (addr, title, text) = match data.blocks.get(sel) {
             Some(b) if !b.insns.is_empty() => {
-                let title = format!("{}  {:#x}", b.label, b.addr);
+                let title = format!("{}  {:#x}", b.label, b.head);
                 let text = b
                     .insns
                     .iter()
@@ -462,7 +532,7 @@ impl Viewer {
             }
             Some(b) => (
                 b.addr,
-                format!("{}  {:#x}", b.label, b.addr),
+                format!("{}  {:#x}", b.label, b.head),
                 "(no instructions)".into(),
             ),
             None => (0, "block".into(), "(no block)".into()),

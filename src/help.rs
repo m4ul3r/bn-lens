@@ -95,7 +95,7 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "LIST",
         key: "v",
-        action: "cycle top-level views (symbols/strings/imports/exports/types/marks)",
+        action: "next list view (symbols→strings→imports→exports→types→marks) — not the IL cycle",
     },
     HelpLine::Entry {
         scope: "MENU",
@@ -408,13 +408,23 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "v  ·  i / I",
-        action: "cycle view: decompile → mlil → disasm → cfg",
+        key: "i / I",
+        action: "cycle IL: decompile → mlil → disasm (also re-renders the cfg in place)",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "v",
+        action: "toggle cfg ⇄ linear, keeping the IL (list-mode v is different)",
     },
     HelpLine::Entry {
         scope: "VIEWER",
         key: "hjkl  (cfg graph)",
-        action: "move between blocks (arrows: green=true red=false blue=branch)",
+        action: "spatial move to nearest block (green=true red=false blue=branch edges)",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "n / N  (cfg graph)",
+        action: "next / previous block in index order (sequential walk)",
     },
     HelpLine::Entry {
         scope: "VIEWER",
@@ -490,8 +500,8 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "PEEK",
-        key: "j/k  PgDn/Up",
-        action: "scroll; q/Esc/Enter close",
+        key: "j/k  PgDn/Up · h/l · 0",
+        action: "scroll · pan long lines · reset pan; q/Esc/Enter close",
     },
     HelpLine::Entry {
         scope: "SECTIONS",

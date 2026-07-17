@@ -209,6 +209,7 @@ impl Viewer {
         });
         self.name = target;
         self.view = View::Decomp;
+        self.code_view = View::Decomp;
         self.load(ctx);
         self.top = 0;
         self.cline = 0;
@@ -255,6 +256,14 @@ impl Viewer {
         }
     }
 
+    /// The first call *site* address on an xrefs caller line
+    /// (`0xENTRY  fn  (N sites: 0xSITE, …)`) — the actual reference, distinct
+    /// from the function-entry address that leads the line. `None` off such a
+    /// line (e.g. the header rows).
+    fn xref_callsite(&self) -> Option<String> {
+        parse_xref_callsite(&self.line_text(self.cline))
+    }
+
     /// `p`: peek the selected span, else the first resolvable symbol or
     /// 0x-address on the cursor line (so internal globals + literals are peekable).
     ///
@@ -262,6 +271,17 @@ impl Viewer {
     /// a callsite on the xrefs page) peek as **pseudo-C**: the containing
     /// function's decompile, centered on the use. Data peeks as a byte dump.
     pub(super) fn peek_on_line(&mut self, ctx: &Ctx) {
+        // On an xrefs caller line the leading hotspot is the *function entry*,
+        // so a default peek centers on the top of the caller (misleading — it
+        // shows the prologue, not the reference). Prefer the actual call site
+        // instead, unless the user Tab-selected a specific hotspot.
+        if self.view == View::Xrefs && self.active.is_none() {
+            if let Some(site) = self.xref_callsite() {
+                let focus = crate::ctx::parse_hex(&site);
+                self.peek_code(ctx, &site, focus, &format!("decomp @ {site}"));
+                return;
+            }
+        }
         if let Some(index) = self.cur_span() {
             let kind = self.spans[index].kind;
             let target = self.spans[index].target.clone();
@@ -303,6 +323,7 @@ impl Viewer {
             title: format!("peek {symbol} @ {address}"),
             lines: symbolize_dump(&dump, &ctx.name_by_addr),
             off: 0,
+            hoff: 0,
             focus: None,
         };
     }
@@ -346,6 +367,7 @@ impl Viewer {
             title,
             lines,
             off,
+            hoff: 0,
             focus: first_hit,
         };
     }
@@ -389,6 +411,9 @@ impl Viewer {
             Some(frame) => {
                 self.name = frame.name;
                 self.view = frame.view;
+                if frame.view.is_code() {
+                    self.code_view = frame.view;
+                }
                 self.load(ctx);
                 self.top = frame.top;
                 self.cline = frame.cline;
@@ -396,5 +421,51 @@ impl Viewer {
             }
             None => Exit::Back,
         }
+    }
+}
+
+/// The first call-site address on an xrefs caller line
+/// (`0xENTRY  fn  (N sites: 0xSITE, …)`) — the reference itself, not the
+/// function-entry address that leads the line. `None` when the line has no
+/// `site:` marker (header rows, blank lines).
+fn parse_xref_callsite(line: &str) -> Option<String> {
+    let (_, tail) = line.split_once("site")?;
+    let start = tail.find("0x")?;
+    let hex: String = tail[start..]
+        .chars()
+        .take_while(|c| *c == 'x' || c.is_ascii_hexdigit())
+        .collect();
+    (hex.len() >= 4).then_some(hex)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_xref_callsite;
+
+    #[test]
+    fn parses_the_first_site_not_the_entry() {
+        // Single site: the address in parens, not the leading entry address.
+        assert_eq!(
+            parse_xref_callsite("  0x403340  main  (1 site: 0x4033a4)").as_deref(),
+            Some("0x4033a4")
+        );
+        // Multiple sites: the first one.
+        assert_eq!(
+            parse_xref_callsite("  0x404af0  sub_404af0  (2 sites: 0x404f6c, 0x404f78)").as_deref(),
+            Some("0x404f6c")
+        );
+    }
+
+    #[test]
+    fn no_callsite_on_non_ref_lines() {
+        assert_eq!(
+            parse_xref_callsite("xrefs to 0x402ae0 (1 code, 0 data)"),
+            None
+        );
+        assert_eq!(
+            parse_xref_callsite("code refs: 1 site across 1 function"),
+            None
+        );
+        assert_eq!(parse_xref_callsite(""), None);
     }
 }

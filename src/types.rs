@@ -608,11 +608,11 @@ impl TypesList {
             ),
             Mode::Normal => (
                 if self.filter.is_empty() {
-                    " types · type system".to_string()
+                    String::new()
                 } else {
-                    format!(" types · filter: {}", self.filter)
+                    format!(" filter: {}", self.filter)
                 },
-                " j/k move · / search · Enter/p layout · n new · m menu · i switch · q quit",
+                " j/k move · / search · Enter/p layout · n new · m menu · v next list · i switch · q quit",
             ),
         };
         crate::ui::put_str(

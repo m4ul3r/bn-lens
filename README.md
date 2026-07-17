@@ -104,7 +104,8 @@ most useful keys for the current mode.
 | `t` | bookmark the address/function (a `Bookmarks` tag, live) |
 | `^R` | refresh from the live bn instance (pick up the agent's renames/edits) |
 | `S` | inspect the recovered stack frame; select slots and jump to local uses |
-| `i` / `I` | cycle view: **decompile → MLIL → disassembly** (forward / back) |
+| `i` / `I` | cycle the IL: **decompile → MLIL → disassembly** (forward / back) — in the CFG too, re-rendering the graph at the new IL |
+| `v` | toggle **CFG ⇄ linear**, keeping the current IL |
 | `/` then `n`/`N` | find in function |
 | `V` then `a` | visual-select a range, then **ask the agent** |
 | `a` | ask the agent about the cursor line |

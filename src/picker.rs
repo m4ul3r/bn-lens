@@ -278,16 +278,21 @@ impl Picker {
                         annot: String::new(),
                         src: AGENT,
                     });
-                } else if seen.insert(format!("a:{tok}")) {
-                    let annot = parse_hex(tok).map(|v| self.annotate(v)).unwrap_or_default();
-                    out.push(Item {
-                        addr: tok.clone(),
-                        name: String::new(),
-                        target: tok.clone(),
-                        import: false,
-                        annot,
-                        src: AGENT,
-                    });
+                } else if let Some(v) = parse_hex(tok) {
+                    // A bare address that lands in no section of *this* target
+                    // isn't ours — skip it rather than present a bogus row (a
+                    // second guard behind the transcript provenance gate).
+                    let in_section = self.ranges.iter().any(|(s, e, _)| v >= *s && v < *e);
+                    if in_section && seen.insert(format!("a:{tok}")) {
+                        out.push(Item {
+                            addr: tok.clone(),
+                            name: String::new(),
+                            target: tok.clone(),
+                            import: false,
+                            annot: self.annotate(v),
+                            src: AGENT,
+                        });
+                    }
                 }
             }
             // a plain non-function identifier is noise — skip it
@@ -463,7 +468,7 @@ impl Picker {
         };
         let mut bar = crate::ui::crumbs(ctx);
         bar.push(Span::styled(
-            format!("   {}/{}", shown, self.all.len()),
+            format!("   symbols  {}/{}", shown, self.all.len()),
             Style::default().add_modifier(Modifier::DIM),
         ));
         crate::ui::render_bar(buf, x0, area.y, w, &bar);
@@ -474,11 +479,11 @@ impl Picker {
             ),
             Mode::Normal => (
                 if self.filter.is_empty() {
-                    " (no filter)".to_string()
+                    String::new()
                 } else {
                     format!(" filter: {}", self.filter)
                 },
-                " j/k move · / search · Enter open · x xrefs · m menu · i switch · ? help · q quit (Esc≠quit)",
+                " j/k move · / search · Enter open · x xrefs · m menu · v next list · i switch · ? help · q quit",
             ),
         };
         crate::ui::put_str(

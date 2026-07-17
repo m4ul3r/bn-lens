@@ -30,10 +30,13 @@ pub struct Ctx {
     strings_map: std::cell::OnceCell<HashMap<String, String>>,
 }
 
-/// Rank a section for string resolution: real rodata beats other data beats the
-/// symbol-table sections (`.dynstr`/`.dynsym`/`.strtab`) that duplicate strings.
+/// Rank a section for string resolution: real read-only data beats other data
+/// beats the symbol-table sections (`.dynstr`/`.dynsym`/`.strtab`) that
+/// duplicate strings. The rodata check must run first — GCC's merged-string
+/// sections (`.rodata.str1.1`) contain "str" and would otherwise sink into the
+/// symbol-table bucket; PE's `.rdata` is the same idea under a different name.
 fn sec_rank(name: &str) -> u8 {
-    if name == ".rodata" {
+    if name.starts_with(".rodata") || name == ".rdata" {
         0
     } else if name.contains("dyn") || name.contains("sym") || name.contains("str") {
         3
@@ -73,6 +76,15 @@ impl Ctx {
         self.section_ranges
             .iter()
             .find(|(s, e, _, _)| addr >= *s && addr < *e)
+    }
+
+    /// Triage priority for a string at `addr` (lower = shown first): real
+    /// `.rodata` literals lead, then other data, then the symbol-table sections
+    /// (`.dynstr`/`.dynsym`/`.strtab`) and header noise that otherwise floats to
+    /// the top under a pure address sort. `4` for an address in no section.
+    pub fn string_rank(&self, addr: u64) -> u8 {
+        self.section_of(addr)
+            .map_or(4, |(_, _, name, _)| sec_rank(name))
     }
 
     /// String-literal map (content -> address), built once on first use.
@@ -199,6 +211,41 @@ impl Ctx {
     }
 }
 
+/// A human-recognizable key for a target selector: its binary basename, with
+/// any path, `.bndb` suffix, and trailing `.<hash>` segment stripped
+/// (`…/mosquitto.65d2…ca.bndb` → `mosquitto`). `None` for an empty selector.
+fn target_key(target: &str) -> Option<String> {
+    let t = target.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let base = t.rsplit(['/', '\\']).next().unwrap_or(t);
+    let base = base.strip_suffix(".bndb").unwrap_or(base);
+    // Drop a trailing `.<hex>` (bn's `name.<contenthash>` bndb convention).
+    let base = match base.rsplit_once('.') {
+        Some((head, tail)) if tail.len() >= 6 && tail.chars().all(|c| c.is_ascii_hexdigit()) => {
+            head
+        }
+        _ => base,
+    };
+    (!base.is_empty()).then(|| base.to_lowercase())
+}
+
+impl Ctx {
+    /// Whether `transcript` plausibly concerns *this* target — the fail-closed
+    /// gate on the agent "recent" scan. Another target's addresses and symbol
+    /// names, mentioned in a transcript about a different binary, must not be
+    /// matched against this one (a mosquitto address resolving to a plausible
+    /// neard function). When the selector is empty there is only one target in
+    /// reach — no sibling to confuse it with — so any transcript is accepted.
+    pub fn transcript_concerns_target(&self, transcript: &str) -> bool {
+        match target_key(&self.target) {
+            Some(key) => transcript.to_lowercase().contains(&key),
+            None => true,
+        }
+    }
+}
+
 /// Identifier / address tokens in `text`, ordered most-recently-mentioned first
 /// (by last occurrence). Feeds the picker's "recently viewed by agent" group.
 /// Identifiers are ≥3 chars; hex addresses are `0x` + ≥3 hex digits.
@@ -233,4 +280,38 @@ pub fn scan_recent(text: &str) -> Vec<String> {
     let mut v: Vec<(String, usize)> = last.into_iter().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1)); // most recent (largest position) first
     v.into_iter().map(|(t, _)| t).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sec_rank, target_key};
+
+    #[test]
+    fn target_key_strips_path_hash_and_extension() {
+        assert_eq!(
+            target_key("/home/u/.cache/bn/bndb/mosquitto.65d26f3541c254ca.bndb").as_deref(),
+            Some("mosquitto")
+        );
+        assert_eq!(target_key("automounter").as_deref(), Some("automounter"));
+        assert_eq!(target_key("neard.bndb").as_deref(), Some("neard"));
+        assert_eq!(target_key(""), None);
+    }
+
+    #[test]
+    fn target_key_keeps_a_non_hash_dotted_name() {
+        // A trailing segment that isn't a hex hash stays put.
+        assert_eq!(target_key("libssl.so").as_deref(), Some("libssl.so"));
+    }
+
+    #[test]
+    fn rodata_ranks_ahead_of_symbol_table_sections() {
+        assert!(sec_rank(".rodata") < sec_rank(".data"));
+        assert!(sec_rank(".data") < sec_rank(".dynstr"));
+        assert!(sec_rank(".text") < sec_rank(".strtab"));
+        // Merged-string rodata and PE .rdata rank as real rodata, not noise,
+        // even though ".rodata.str1.1" contains "str".
+        assert_eq!(sec_rank(".rodata.str1.1"), sec_rank(".rodata"));
+        assert_eq!(sec_rank(".rdata"), 0);
+        assert!(sec_rank(".rodata.str1.8") < sec_rank(".dynstr"));
+    }
 }

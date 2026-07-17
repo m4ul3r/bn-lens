@@ -90,8 +90,11 @@ impl StringsList {
         self.top = self.top.min(self.sel);
     }
 
-    /// Deduped by address, sorted by address. bn emits the same content at
-    /// several addresses (`.rodata`/`.dynstr`); we keep each distinct address.
+    /// Deduped by address. bn emits the same content at several addresses
+    /// (`.rodata`/`.dynstr`); we keep each distinct address. Ordered for triage:
+    /// real `.rodata` literals first, symbol-table/header noise last (by section
+    /// rank), then by address within each rank — so the useful strings lead
+    /// instead of the ELF header junk a pure address sort surfaces first.
     fn build(ctx: &Ctx) -> Vec<StrItem> {
         let mut seen = std::collections::HashSet::new();
         let mut items: Vec<StrItem> = ctx
@@ -101,7 +104,10 @@ impl StringsList {
             .filter(|(_, addr)| addr.starts_with("0x") && seen.insert(addr.clone()))
             .map(|(content, addr)| StrItem { addr, content })
             .collect();
-        items.sort_by_key(|it| parse_hex(&it.addr).unwrap_or(0));
+        items.sort_by_key(|it| {
+            let addr = parse_hex(&it.addr).unwrap_or(0);
+            (ctx.string_rank(addr), addr)
+        });
         items
     }
 
@@ -312,11 +318,11 @@ impl StringsList {
             ),
             Mode::Normal => (
                 if self.filter.is_empty() {
-                    " strings · (no filter)".to_string()
+                    String::new()
                 } else {
-                    format!(" strings · filter: {}", self.filter)
+                    format!(" filter: {}", self.filter)
                 },
-                " j/k move · / search · p usage · Enter/x xrefs · m menu · i switch · q quit",
+                " j/k move · / search · p usage · Enter/x xrefs · m menu · v next list · i switch · q quit",
             ),
         };
         crate::ui::put_str(

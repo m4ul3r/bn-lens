@@ -60,7 +60,13 @@ impl Viewer {
             .get(&self.name)
             .cloned()
             .unwrap_or_default();
-        let kind = self.view.label();
+        // The CFG renders at the shared IL — surface it (`cfg·mlil`), since the
+        // block text alone doesn't always give the level away.
+        let kind = if self.view == View::Cfg {
+            format!("cfg·{}", self.code_view.label())
+        } else {
+            self.view.label().to_string()
+        };
         let dim = Style::default().add_modifier(Modifier::DIM);
         if let Some(query) = &self.search_input {
             crate::ui::put_str(
@@ -131,7 +137,7 @@ impl Viewer {
         } else if self.vmode {
             " j/k extend · a ask · Esc cancel · ? help"
         } else {
-            " j/k move · Tab hotspot · g act · r/;/t edit · a ask · / find · b back · ? help · q list"
+            " j/k · Tab hotspot · g act · r/;/t · a ask · / find · i il · v cfg · b/q list · ? help"
         };
         crate::ui::render_bar(
             buffer,
@@ -309,7 +315,7 @@ impl Viewer {
 
         // Row 1: location + colour legend.
         let dim = Style::default().add_modifier(Modifier::DIM);
-        let sel_addr = g.data.blocks.get(g.sel).map(|b| b.addr).unwrap_or(0);
+        let sel_addr = g.data.blocks.get(g.sel).map(|b| b.head).unwrap_or(0);
         let info = vec![
             Span::styled(
                 format!(" {sel_addr:#x}"),
@@ -317,7 +323,10 @@ impl Viewer {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  cfg  ", Style::default().fg(Color::Blue)),
+            Span::styled(
+                format!("  cfg·{}  ", self.code_view.label()),
+                Style::default().fg(Color::Blue),
+            ),
             Span::styled(
                 self.name.clone(),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -335,7 +344,8 @@ impl Viewer {
         ];
         crate::ui::put_spans(buffer, area.x, area.y + 1, width, &info);
 
-        let hint = " hjkl move · PgUp/Dn block · Enter read · Space list · i/v cycle · q close";
+        let hint =
+            " hjkl spatial · n/N next/prev block · PgUp/Dn panel · Enter read · Space list · i il · v linear · q back";
         crate::ui::render_bar(
             buffer,
             area.x,
@@ -529,6 +539,7 @@ impl Viewer {
                 title,
                 lines,
                 off,
+                hoff,
                 focus,
             } => {
                 let box_width = (area.width.saturating_sub(6)).clamp(50, 90);
@@ -538,6 +549,9 @@ impl Viewer {
                 crate::ui::draw_box(buffer, box_x, box_y, box_width, box_height, title);
                 let view_height = (box_height - 3) as usize;
                 let inner = (box_width - 4) as usize;
+                // Any visible line running past the right edge at the current
+                // horizontal offset means content is clipped — show the h/l hint.
+                let mut clipped = false;
                 for (row, line) in lines.iter().skip(*off).take(view_height).enumerate() {
                     let focused = *focus == Some(*off + row);
                     let style = if focused {
@@ -554,13 +568,23 @@ impl Viewer {
                     if focused {
                         crate::ui::put_str(buffer, box_x + 2, y, " ".repeat(inner), inner, style);
                     }
-                    crate::ui::put_str(buffer, box_x + 2, y, line, inner, style);
+                    // Pan horizontally: drop the first `hoff` chars before clipping.
+                    let visible: String = line.chars().skip(*hoff).collect();
+                    if visible.chars().count() > inner {
+                        clipped = true;
+                    }
+                    crate::ui::put_str(buffer, box_x + 2, y, &visible, inner, style);
                 }
+                let hint = if clipped || *hoff > 0 {
+                    " j/k scroll · h/l pan · 0 reset · ? help · q close "
+                } else {
+                    " j/k scroll · ? help · q close "
+                };
                 crate::ui::put_str(
                     buffer,
                     box_x + 2,
                     box_y + box_height - 1,
-                    " j/k scroll · ? help · q close ",
+                    hint,
                     (box_width - 4) as usize,
                     Style::default().add_modifier(Modifier::DIM),
                 );

@@ -33,7 +33,8 @@ const NODE_MAX_W: usize = 34; // max inner content width (keeps a box narrow)
 /// so the viewer can jump to a block by its start address.
 pub struct Rendered {
     pub lines: Vec<String>,
-    /// block start address -> index of the line to land the cursor on.
+    /// block identity (start) *and* displayed head address -> index of the
+    /// line to land the cursor on (they coincide at the asm level).
     pub index: HashMap<u64, usize>,
     pub block_count: usize,
 }
@@ -48,6 +49,23 @@ struct Block<'a> {
 impl Block<'_> {
     fn start_str(&self) -> &str {
         &self.inner.start
+    }
+
+    /// The address a human should read for this block: its first instruction's
+    /// address. For IL-level CFGs `start` is an IL instruction index (the
+    /// unique block identity — see `Bn::cfg`), not a location; the first line
+    /// carries the real address. At the asm level the two coincide. Falls back
+    /// to `start` for an instruction-less block.
+    fn head_str(&self) -> &str {
+        self.inner
+            .insns
+            .first()
+            .map(|i| i.a.as_str())
+            .unwrap_or_else(|| self.start_str())
+    }
+
+    fn head(&self) -> u64 {
+        parse_hex(self.head_str()).unwrap_or(self.start)
     }
 }
 
@@ -64,12 +82,20 @@ fn prepare(blocks: &[CfgBlock]) -> (Vec<Block<'_>>, Option<u64>) {
     (parsed, entry)
 }
 
-/// `block_<k>` labels keyed by start address, in the address-sorted display order.
+/// `block_<k>` labels keyed by start (identity), in the sorted display order.
 fn labels_of(blocks: &[Block]) -> HashMap<u64, String> {
     blocks
         .iter()
         .enumerate()
         .map(|(i, b)| (b.start, format!("block_{i}")))
+        .collect()
+}
+
+/// Display (head) address per block identity, for labelling edge targets.
+fn heads_of(blocks: &[Block]) -> HashMap<u64, String> {
+    blocks
+        .iter()
+        .map(|b| (b.start, b.head_str().to_string()))
         .collect()
 }
 
@@ -115,17 +141,28 @@ fn clip(text: &str, max: usize) -> String {
 // List layout (scalable fallback).
 // ---------------------------------------------------------------------------
 
-/// The `block_k  0xADDR` label for an edge target, or `0xADDR (external)` when
-/// the target isn't a block of this function.
-fn target_label(labels: &HashMap<u64, String>, to_str: &str) -> String {
-    match parse_hex(to_str).and_then(|to| labels.get(&to)) {
-        Some(label) => format!("{label}  {to_str}"),
+/// The `block_k  0xADDR` label for an edge target (showing the target's head
+/// address), or `0xADDR (external)` when the target isn't a block of this
+/// function.
+fn target_label(
+    labels: &HashMap<u64, String>,
+    heads: &HashMap<u64, String>,
+    to_str: &str,
+) -> String {
+    let known = parse_hex(to_str).and_then(|to| Some((labels.get(&to)?, heads.get(&to)?)));
+    match known {
+        Some((label, head)) => format!("{label}  {head}"),
         None => format!("{to_str}  (external)"),
     }
 }
 
 /// The successor-edge lines for a block in list mode.
-fn edge_lines(block: &Block, labels: &HashMap<u64, String>, indent: &str) -> Vec<String> {
+fn edge_lines(
+    block: &Block,
+    labels: &HashMap<u64, String>,
+    heads: &HashMap<u64, String>,
+    indent: &str,
+) -> Vec<String> {
     let edges = &block.inner.edges;
     if edges.is_empty() {
         return vec![format!("{indent}└─ (returns)")];
@@ -149,7 +186,7 @@ fn edge_lines(block: &Block, labels: &HashMap<u64, String>, indent: &str) -> Vec
                 .map(|to| to <= block.start)
                 .unwrap_or(false);
             let loop_note = if is_loop { "   ↑loop" } else { "" };
-            let target = target_label(labels, &e.to);
+            let target = target_label(labels, heads, &e.to);
             if word.is_empty() && word_w == 0 {
                 format!("{indent}{connector}─▶ {target}{loop_note}")
             } else {
@@ -171,24 +208,28 @@ fn list_header(labels: &HashMap<u64, String>, block: &Block, entry: Option<u64>)
     };
     format!(
         "{label}  {}{tag}  ({} insns)",
-        block.start_str(),
+        block.head_str(),
         block.inner.insns.len()
     )
 }
 
 fn render_list(blocks: &[Block], labels: &HashMap<u64, String>, entry: Option<u64>) -> Rendered {
+    let heads = heads_of(blocks);
     let mut lines = Vec::new();
     let mut index = HashMap::new();
     for (i, block) in blocks.iter().enumerate() {
         if i > 0 {
             lines.push(String::new());
         }
+        // Jumps resolve by identity (edge targets) *and* by the displayed head
+        // address (the header hotspot) — at IL levels these differ.
         index.insert(block.start, lines.len());
+        index.entry(block.head()).or_insert(lines.len());
         lines.push(list_header(labels, block, entry));
         for insn in &block.inner.insns {
             lines.push(format!("    {}  {}", insn.a, insn.t));
         }
-        lines.extend(edge_lines(block, labels, "    "));
+        lines.extend(edge_lines(block, labels, &heads, "    "));
     }
     Rendered {
         lines,
@@ -230,7 +271,11 @@ fn edge_color(word: &str) -> u8 {
 /// label and full instruction listing (for selection/highlight, hjkl navigation,
 /// and the always-on top-left block inspector).
 pub struct GBlock {
+    /// Block identity — the parsed `start` (an IL instruction index at IL
+    /// levels). Used for selection bookkeeping, not display.
     pub addr: u64,
+    /// The block's displayed (first-instruction) address; == `addr` at asm.
+    pub head: u64,
     pub label: String,
     /// Full instructions: (address, disassembly text).
     pub insns: Vec<(String, String)>,
@@ -548,7 +593,7 @@ fn box_content(labels: &HashMap<u64, String>, block: &Block, entry: Option<u64>)
         format!("{n} insns{ext_note}")
     };
     [
-        format!("{label}  {}", block.start_str()),
+        format!("{label}  {}", block.head_str()),
         summary,
         terminator(block),
     ]
@@ -703,6 +748,7 @@ fn build_graph(
     let mut gblocks: Vec<GBlock> = (0..n)
         .map(|_| GBlock {
             addr: 0,
+            head: 0,
             label: String::new(),
             insns: Vec::new(),
             top: 0,
@@ -727,6 +773,7 @@ fn build_graph(
                 );
                 gblocks[bi] = GBlock {
                     addr: blocks[bi].start,
+                    head: blocks[bi].head(),
                     label: labels
                         .get(&blocks[bi].start)
                         .cloned()
@@ -1193,6 +1240,48 @@ mod tests {
         ];
         let g = graph(&blocks).expect("lays out");
         assert!(as_text(&g).contains("⇢ ext ×2"), "external count surfaced");
+    }
+
+    /// IL-level CFGs use IL instruction indexes as block identity (`start`) —
+    /// display must show the block's first-instruction (head) address instead,
+    /// in headers, boxes, and edge-target labels alike.
+    #[test]
+    fn il_blocks_display_head_addresses_not_il_indexes() {
+        let blocks = vec![
+            CfgBlock {
+                start: "0x0".into(),
+                insns: vec![insn("0x401000", "if (x == 0)")],
+                edges: vec![edge("0x5", "TrueBranch"), edge("0x3", "FalseBranch")],
+            },
+            CfgBlock {
+                start: "0x3".into(),
+                insns: vec![insn("0x401010", "y = 1")],
+                edges: vec![edge("0x5", "UnconditionalBranch")],
+            },
+            CfgBlock {
+                start: "0x5".into(),
+                insns: vec![insn("0x401020", "return y")],
+                edges: vec![],
+            },
+        ];
+        let r = list(&blocks);
+        assert!(
+            r.lines[0].starts_with("block_0  0x401000"),
+            "header shows the head address: {}",
+            r.lines[0]
+        );
+        let joined = r.lines.join("\n");
+        assert!(
+            joined.contains("─▶ block_2  0x401020"),
+            "edge target labelled with the head address"
+        );
+        assert!(!joined.contains("block_2  0x5"), "no raw IL index shown");
+        // In-place jumps resolve through both the identity and the head.
+        assert_eq!(r.index.get(&0x5), r.index.get(&0x401020));
+        let g = graph(&blocks).expect("lays out");
+        assert!(as_text(&g).contains("block_0  0x401000"));
+        assert_eq!(g.blocks[g.entry].addr, 0x0, "identity stays the IL index");
+        assert_eq!(g.blocks[g.entry].head, 0x401000);
     }
 
     /// Long forward edge (rank gap > 1) threads a dummy column, so it must not

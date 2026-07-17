@@ -332,23 +332,32 @@ impl App {
             } else {
                 crate::herdr::pane_agent(&self.herdr, &self.agent_pane)
             };
-            // refresh the "recently viewed by agent" set from the pane's scrollback
+            // refresh the "recently viewed by agent" set from the pane's
+            // scrollback — but only trust it when the transcript actually
+            // concerns this target, so another binary's addresses/names don't
+            // get matched against the one in view (fail-closed provenance).
             if !self.agent_pane.is_empty() {
                 let text = crate::herdr::pane_read(&self.herdr, &self.agent_pane, 400);
-                self.picker.update_agent(crate::ctx::scan_recent(&text));
+                let tokens = if self.ctx.transcript_concerns_target(&text) {
+                    crate::ctx::scan_recent(&text)
+                } else {
+                    Vec::new()
+                };
+                self.picker.update_agent(tokens);
             }
             self.last_poll = Some(now);
         }
     }
 
-    /// Overlay the ask destination + partner status on the right of the header:
-    /// `◐ → wD:p1 working`, or an explicit warning when no agent will receive an ask.
+    /// Overlay ask routing on the right of the header. Healthy pairing is short
+    /// (`ask · ◐ grok working`); failures stay loud with the pane id so a
+    /// mis-wired launch is diagnosable.
     fn draw_partner(&self, buf: &mut Buffer, area: Rect) {
         let (color, label) = if self.agent_pane.is_empty() {
-            (Color::Red, " ⚠ ask off: no launching pane ".to_string())
+            (Color::Red, " ⚠ ask off ".to_string())
         } else {
             match &self.partner {
-                None => (Color::Red, format!(" ⚠ {} has no agent ", self.agent_pane)),
+                None => (Color::Red, format!(" ⚠ no agent on {} ", self.agent_pane)),
                 Some(a) => {
                     let (g, c) = match a.status.as_str() {
                         "working" => ("◐", Color::Yellow),
@@ -357,10 +366,12 @@ impl App {
                         "idle" => ("○", Color::Green),
                         _ => ("·", Color::Gray),
                     };
-                    (
-                        c,
-                        format!(" {g} → {} {} {} ", self.agent_pane, a.agent, a.status),
-                    )
+                    let name = if a.agent.is_empty() {
+                        "agent"
+                    } else {
+                        a.agent.as_str()
+                    };
+                    (c, format!(" ask · {g} {name} {} ", a.status))
                 }
             }
         };
