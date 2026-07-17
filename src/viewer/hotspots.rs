@@ -66,6 +66,45 @@ pub(super) fn symbolize_dump(dump: &str, reverse_symbols: &HashMap<String, Strin
         .collect()
 }
 
+/// A register-temp local from BN's decompiler (`v0`, `x0_1`, `w19`, `arg3`,
+/// `temp2_1`): a register-style prefix followed only by digits, with optional
+/// `_N` SSA-suffix parts. These read as spill noise, so Tab skips them — they
+/// stay clickable and renamable like any other local.
+pub(super) fn is_noise_local(name: &str) -> bool {
+    const PREFIXES: [&str; 10] = ["temp", "arg", "v", "w", "x", "q", "d", "s", "h", "b"];
+    let Some(rest) = PREFIXES.iter().find_map(|prefix| name.strip_prefix(prefix)) else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .split('_')
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+/// Indices of the spans Tab visits: hotspots interesting on their own —
+/// functions other than the one in view (its signature name is only a
+/// self-goto), data globals, executable addresses, strings, and locals that
+/// look deliberately named. Falls back to every span when nothing qualifies,
+/// so Tab never goes dead on a view made only of "noise".
+pub(super) fn tab_stops(spans: &[Hotspot], viewed: &str) -> Vec<usize> {
+    let stops: Vec<usize> = spans
+        .iter()
+        .enumerate()
+        .filter(|(_, span)| match span.kind {
+            HotKind::Func => span.target != viewed,
+            HotKind::Data | HotKind::Str => true,
+            HotKind::Addr => span.code,
+            HotKind::Local => !is_noise_local(&span.target),
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if stops.is_empty() {
+        (0..spans.len()).collect()
+    } else {
+        stops
+    }
+}
+
 /// Is `token` a data global we can resolve/peek? Exports, imported data, any
 /// known symbol, or an auto-named `data_<hex>` global.
 fn is_data_symbol(ctx: &Ctx, token: &str) -> bool {
@@ -83,7 +122,7 @@ fn is_data_symbol(ctx: &Ctx, token: &str) -> bool {
 /// inert, while known locals and string literals get their own hotspot kinds.
 ///
 /// The function currently in view is promoted too (so its signature name on
-/// line 1 is click/`x`/`r`-able); `act_primary` no-ops the self-goto.
+/// line 1 is click/`x`/`n`-able); `act_primary` no-ops the self-goto.
 pub(super) fn build_spans(
     lines: &[Line],
     ctx: &Ctx,
@@ -156,8 +195,63 @@ pub(super) fn build_spans(
 
 #[cfg(test)]
 mod tests {
-    use super::{symbolize_dump, valid_ident};
+    use super::{is_noise_local, symbolize_dump, tab_stops, valid_ident, HotKind, Hotspot};
     use std::collections::HashMap;
+
+    fn spot(target: &str, kind: HotKind, code: bool, line: usize) -> Hotspot {
+        Hotspot {
+            line,
+            col: 0,
+            target: target.into(),
+            kind,
+            code,
+        }
+    }
+
+    #[test]
+    fn register_temps_are_noise_named_locals_are_not() {
+        // aarch64 register temps and SSA-suffixed spills.
+        for name in [
+            "v0", "v7", "x0", "x19", "w0", "x0_1", "v7_2", "q3", "arg1", "temp2_1",
+        ] {
+            assert!(is_noise_local(name), "{name} should be noise");
+        }
+        // Deliberately-named locals (including ones sharing a register prefix).
+        for name in [
+            "buf",
+            "frame_len",
+            "s2_len",
+            "dest",
+            "var_10",
+            "x_coord",
+            "value",
+        ] {
+            assert!(!is_noise_local(name), "{name} should not be noise");
+        }
+    }
+
+    #[test]
+    fn tab_skips_noise_and_the_viewed_functions_own_name() {
+        let spans = vec![
+            spot("parse_frame", HotKind::Func, true, 0), // signature self-name
+            spot("v0", HotKind::Local, false, 2),        // register temp
+            spot("frame_len", HotKind::Local, false, 3),
+            spot("strcpy", HotKind::Func, true, 4),
+            spot("0x1000", HotKind::Addr, false, 5), // non-code address
+            spot("0x4010", HotKind::Addr, true, 6),
+            spot("boot", HotKind::Str, false, 7),
+        ];
+        assert_eq!(tab_stops(&spans, "parse_frame"), vec![2, 3, 5, 6]);
+    }
+
+    #[test]
+    fn tab_falls_back_to_everything_when_all_spans_are_noise() {
+        let spans = vec![
+            spot("v0", HotKind::Local, false, 1),
+            spot("x0_1", HotKind::Local, false, 2),
+        ];
+        assert_eq!(tab_stops(&spans, "sub_1234"), vec![0, 1]);
+    }
 
     #[test]
     fn validates_c_identifiers() {

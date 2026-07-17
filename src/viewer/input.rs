@@ -244,15 +244,24 @@ impl Viewer {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let line_count = self.lines.len();
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Exit::Back,
+            // `q` leaves the viewer now; Esc backs out one layer at a time
+            // (search highlight → nav history → list) — never skips history.
+            KeyCode::Char('q') => return Exit::Back,
+            KeyCode::Esc => return self.esc_back(ctx),
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
             KeyCode::Char('d') if control => self.move_cursor(10),
             KeyCode::Char('u') if control => self.move_cursor(-10),
             KeyCode::PageDown => self.move_cursor(20),
             KeyCode::PageUp => self.move_cursor(-20),
-            KeyCode::Char('G') => self.cline = line_count.saturating_sub(1),
-            KeyCode::Char('H') | KeyCode::Home => self.cline = 0,
+            KeyCode::Char('G') => {
+                self.cline = line_count.saturating_sub(1);
+                self.active = None;
+            }
+            KeyCode::Char('H') | KeyCode::Home => {
+                self.cline = 0;
+                self.active = None;
+            }
             KeyCode::Tab => self.next_symbol(1),
             KeyCode::BackTab => self.next_symbol(-1),
             KeyCode::Char('g') | KeyCode::Enter => self.act_primary(ctx),
@@ -268,7 +277,7 @@ impl Viewer {
             }
             KeyCode::Char('S') => self.open_stack_view(),
             KeyCode::Char('x') => self.open_xrefs(ctx),
-            KeyCode::Char('r') => self.open_rename(),
+            KeyCode::Char('n') => self.open_rename(ctx),
             KeyCode::Char(';') => self.open_comment(),
             KeyCode::Char('t') => self.open_tag(),
             KeyCode::Char('i') => self.cycle_il(ctx, 1),
@@ -276,17 +285,31 @@ impl Viewer {
             KeyCode::Char('v') => self.toggle_cfg(ctx),
             KeyCode::Char(' ') if self.view == View::Cfg => self.toggle_cfg_graph(ctx),
             KeyCode::Char('b') => return self.back(ctx),
+            KeyCode::Char('w') => self.go_forward(ctx),
             KeyCode::Char('V') => {
                 self.vmode = true;
                 self.vanchor = self.cline;
             }
             KeyCode::Char('/') => self.search_input = Some(String::new()),
-            KeyCode::Char('n') => self.jump_match(1),
-            KeyCode::Char('N') => self.jump_match(-1),
+            KeyCode::Char(']') => self.jump_match(1),
+            KeyCode::Char('[') => self.jump_match(-1),
             KeyCode::Char('a') => self.open_ask_line(ctx),
             _ => {}
         }
         Exit::Stay
+    }
+
+    /// Esc in the normal path backs out exactly one layer. The modal layers
+    /// (popup, stack panel, search input, visual mode) each consume Esc in
+    /// their own handlers before this runs, so what's left is: clear an active
+    /// search highlight, then pop the nav history, then leave to the list.
+    fn esc_back(&mut self, ctx: &Ctx) -> Exit {
+        if !self.search.is_empty() {
+            self.search.clear();
+            self.status = " search cleared".into();
+            return Exit::Stay;
+        }
+        self.back(ctx)
     }
 
     fn open_stack_view(&mut self) {
@@ -394,22 +417,27 @@ impl Viewer {
         self.active = None;
     }
 
-    /// Keys for the 2D CFG graph: hjkl move spatially, n/N step block index
+    /// Keys for the 2D CFG graph: hjkl move spatially, ]/[ step block index
     /// order, PgUp/PgDn scroll the always-on inspector, Enter reads the block
     /// as a list, Space toggles graph⇄list, i/I cycle the IL in place, v drops
     /// back to the linear view.
     fn cfg_graph_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Exit::Back,
-            KeyCode::Char('b') => return self.back(ctx),
+            // q leaves now; Esc/b pop the nav history. No `esc_back` ladder
+            // here: the search highlight only renders in the linear view (the
+            // graph has empty `self.lines`, so a match can't be shown), so
+            // there's no highlight layer for Esc to clear first.
+            KeyCode::Char('q') => return Exit::Back,
+            KeyCode::Esc | KeyCode::Char('b') => return self.back(ctx),
+            KeyCode::Char('w') => self.go_forward(ctx),
             KeyCode::Char('h') | KeyCode::Left => self.cfg_move(CfgDir::Left),
             KeyCode::Char('l') | KeyCode::Right => self.cfg_move(CfgDir::Right),
             KeyCode::Char('j') | KeyCode::Down => self.cfg_move(CfgDir::Down),
             KeyCode::Char('k') | KeyCode::Up => self.cfg_move(CfgDir::Up),
             // Sequential walk (address/layout order) — distinct from spatial hjkl.
-            KeyCode::Char('n') => self.cfg_step(1),
-            KeyCode::Char('N') => self.cfg_step(-1),
+            KeyCode::Char(']') => self.cfg_step(1),
+            KeyCode::Char('[') => self.cfg_step(-1),
             // Panel scroll — does not steal hjkl from graph navigation.
             KeyCode::PageDown => {
                 self.cfg_expand_scroll(10);
@@ -436,27 +464,46 @@ impl Viewer {
     fn move_cursor(&mut self, delta: i64) {
         let line_count = self.lines.len() as i64;
         self.cline = (self.cline as i64 + delta).clamp(0, (line_count - 1).max(0)) as usize;
+        // Drop the Tab/click selection: a line move means the user is reading,
+        // and a stale selection must not redirect a later rename/goto.
+        self.active = None;
     }
 
-    /// Tab/Shift-Tab: step through interactive spans one at a time, wrapping.
+    /// Tab/Shift-Tab: step through the *interesting* spans one at a time,
+    /// wrapping — register-temp locals, non-code addresses, and the viewed
+    /// function's own name are skipped (still clickable, and `tab_stops` falls
+    /// back to every span when nothing else qualifies).
     fn next_symbol(&mut self, direction: i32) {
         if self.spans.is_empty() {
             return;
         }
-        let span_count = self.spans.len() as i64;
-        let index = match self.cur_span() {
-            Some(current) => (current as i64 + direction as i64).rem_euclid(span_count) as usize,
-            None if direction > 0 => self
-                .spans
+        let stops = super::hotspots::tab_stops(&self.spans, &self.name);
+        let count = stops.len() as i64;
+        let position = if let Some(current) = self.cur_span() {
+            match stops.iter().position(|&index| index == current) {
+                // On a stop: step within the ring.
+                Some(at) => (at as i64 + direction as i64).rem_euclid(count) as usize,
+                // On a skipped span: the nearest stop past it, wrapping.
+                None if direction > 0 => {
+                    stops.iter().position(|&index| index > current).unwrap_or(0)
+                }
+                None => stops
+                    .iter()
+                    .rposition(|&index| index < current)
+                    .unwrap_or(stops.len() - 1),
+            }
+        } else if direction > 0 {
+            stops
                 .iter()
-                .position(|span| span.line > self.cline)
-                .unwrap_or(0),
-            None => self
-                .spans
+                .position(|&index| self.spans[index].line > self.cline)
+                .unwrap_or(0)
+        } else {
+            stops
                 .iter()
-                .rposition(|span| span.line < self.cline)
-                .unwrap_or(self.spans.len() - 1),
+                .rposition(|&index| self.spans[index].line < self.cline)
+                .unwrap_or(stops.len() - 1)
         };
+        let index = stops[position];
         self.active = Some(index);
         self.cline = self.spans[index].line;
     }

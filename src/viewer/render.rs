@@ -131,13 +131,13 @@ impl Viewer {
         }
 
         let hint = if self.stack_view.is_open() {
-            " stack · j/k slots · Enter jump · r rename · S/q close · ? help"
+            " stack · j/k slots · Enter jump · n rename · S/q close · ? help"
         } else if self.search_input.is_some() {
             " type to find · Enter jump · Esc cancel · ? help"
         } else if self.vmode {
             " j/k extend · a ask · Esc cancel · ? help"
         } else {
-            " j/k · Tab hotspot · g act · r/;/t · a ask · / find · i il · v cfg · b/q list · ? help"
+            " j/k · Tab hotspot · g act · n/;/t · a ask · / find · i il · v cfg · b/w hist · q list · ? help"
         };
         crate::ui::render_bar(
             buffer,
@@ -345,7 +345,7 @@ impl Viewer {
         crate::ui::put_spans(buffer, area.x, area.y + 1, width, &info);
 
         let hint =
-            " hjkl spatial · n/N next/prev block · PgUp/Dn panel · Enter read · Space list · i il · v linear · q back";
+            " hjkl spatial · ]/[ block · PgUp/Dn panel · Enter read · Space list · i il · v linear · b/w hist · q list";
         crate::ui::render_bar(
             buffer,
             area.x,

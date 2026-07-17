@@ -31,7 +31,7 @@ impl Viewer {
                 // The signature name is a hotspot for x/r, but g on it is a
                 // self-goto — nothing to navigate to.
                 if self.view.is_code() && target == self.name {
-                    self.status = format!(" {}   (x xrefs · r rename · ; comment)", self.name);
+                    self.status = format!(" {}   (x xrefs · n rename · ; comment)", self.name);
                 } else {
                     self.goto_to(ctx, target);
                 }
@@ -71,17 +71,24 @@ impl Viewer {
             .get(&name)
             .cloned()
             .unwrap_or_else(|| "?".into());
-        self.status = format!(" {name} : {ty}   (local · r to rename)");
+        self.status = format!(" {name} : {ty}   (local · n to rename)");
     }
 
-    /// `r`: rename. A selected Local → local rename; a selected Func hotspot →
-    /// that function; otherwise the function currently in view.
-    pub(super) fn open_rename(&mut self) {
+    /// `n`: rename. A selected Local → local rename; a selected Func hotspot
+    /// naming *another* function → that symbol; otherwise (no selection, or a
+    /// Data/Addr/Str selection) the function currently in view. Imported
+    /// symbols are refused outright — renaming a PLT import retexts every call
+    /// site and corrupts the decompile, so it must never happen just because
+    /// Tab happened to rest on a call name.
+    pub(super) fn open_rename(&mut self, ctx: &Ctx) {
         let (old, scope) = match self.cur_span() {
             Some(index) if self.spans[index].kind == HotKind::Local => {
                 (self.spans[index].target.clone(), RenameScope::Local)
             }
-            Some(index) if self.spans[index].kind == HotKind::Func => {
+            Some(index)
+                if self.spans[index].kind == HotKind::Func
+                    && self.spans[index].target != self.name =>
+            {
                 (self.spans[index].target.clone(), RenameScope::Symbol)
             }
             _ if self.view.is_code() => (self.name.clone(), RenameScope::Symbol),
@@ -90,6 +97,11 @@ impl Viewer {
                 return;
             }
         };
+        if scope == RenameScope::Symbol && ctx.import_names.contains(&old) {
+            self.status =
+                format!(" ✗ {old} is an import — not renaming (use bn directly if you mean it)");
+            return;
+        }
         self.popup = Popup::Rename {
             old,
             buf: String::new(),
@@ -201,12 +213,7 @@ impl Viewer {
         } else {
             Some(self.name.clone())
         };
-        self.stack.push(Frame {
-            name: self.name.clone(),
-            view: self.view,
-            top: self.top,
-            cline: self.cline,
-        });
+        self.push_nav();
         self.name = target;
         self.view = View::Decomp;
         self.code_view = View::Decomp;
@@ -393,12 +400,7 @@ impl Viewer {
             },
             None => self.name.clone(),
         };
-        self.stack.push(Frame {
-            name: self.name.clone(),
-            view: self.view,
-            top: self.top,
-            cline: self.cline,
-        });
+        self.push_nav();
         self.name = target;
         self.view = View::Xrefs;
         self.load(ctx);
@@ -406,20 +408,60 @@ impl Viewer {
         self.cline = 0;
     }
 
+    /// Snapshot the current location for the nav history.
+    fn frame(&self) -> Frame {
+        Frame {
+            name: self.name.clone(),
+            view: self.view,
+            top: self.top,
+            cline: self.cline,
+        }
+    }
+
+    /// Record the current location before a *new* navigation (goto/xrefs).
+    /// Like a browser, branching off invalidates the forward history.
+    fn push_nav(&mut self) {
+        let frame = self.frame();
+        self.stack.push(frame);
+        self.forward.clear();
+    }
+
+    fn restore(&mut self, ctx: &Ctx, frame: Frame) {
+        self.name = frame.name;
+        self.view = frame.view;
+        if frame.view.is_code() {
+            self.code_view = frame.view;
+        }
+        self.load(ctx);
+        self.top = frame.top;
+        self.cline = frame.cline;
+    }
+
+    /// `b` (and Esc at the bottom of its ladder): pop the nav stack, remembering
+    /// the current view on the forward stack so `w` can redo. With no history
+    /// left, leave to the list.
     pub(super) fn back(&mut self, ctx: &Ctx) -> Exit {
         match self.stack.pop() {
             Some(frame) => {
-                self.name = frame.name;
-                self.view = frame.view;
-                if frame.view.is_code() {
-                    self.code_view = frame.view;
-                }
-                self.load(ctx);
-                self.top = frame.top;
-                self.cline = frame.cline;
+                let here = self.frame();
+                self.forward.push(here);
+                self.restore(ctx, frame);
                 Exit::Stay
             }
             None => Exit::Back,
+        }
+    }
+
+    /// `w`: forward — undo the latest `b`, pushing the current view back onto
+    /// the nav stack so `b`/`w` walk the same trail in both directions.
+    pub(super) fn go_forward(&mut self, ctx: &Ctx) {
+        match self.forward.pop() {
+            Some(frame) => {
+                let here = self.frame();
+                self.stack.push(here);
+                self.restore(ctx, frame);
+            }
+            None => self.status = " no forward history (w redoes a b)".into(),
         }
     }
 }

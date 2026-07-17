@@ -2,7 +2,7 @@
 
 ## Persisting renames to disk (`bn save`)
 
-**Status:** not implemented. The write paths — local rename, **function rename** (`r`), **comments**
+**Status:** not implemented. The write paths — local rename, **function rename** (`n`), **comments**
 (`;`), and **bookmarks/tags** (`t`) — all mutate the **live bn instance in-memory** only: instantly
 visible to every `bn` command against that instance, but **not written to the on-disk `.bndb`**. So
 any annotation is lost if the instance restarts (GC'd, rebooted) or the target is reloaded in the GUI.
@@ -123,7 +123,7 @@ names (`__isoc99_sscanf` → normalize `__isoc99_` too). Keep the substring set 
 
 ## Done this pass (for context)
 
-- Write paths: local + **function rename** (`r`), **comments** (`;`), **bookmarks/tags** (`t`).
+- Write paths: local + **function rename** (`n`), **comments** (`;`), **bookmarks/tags** (`t`).
 - Live **refresh** (`^R`/menu, threaded + counting banner).
 - **View menu** (clickable title) + **Strings** view + **Imports** (attack-surface) view.
 - **Decomp peek** (`p` on a code hotspot → pseudo-C at the use) + Strings/Imports usage popups.

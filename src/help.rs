@@ -374,7 +374,7 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "VIEWER",
         key: "Tab / Shift-Tab",
-        action: "next / previous hotspot",
+        action: "next / previous interesting hotspot (register temps skipped; click reaches them)",
     },
     HelpLine::Entry {
         scope: "VIEWER",
@@ -393,8 +393,8 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "r",
-        action: "rename local / function",
+        key: "n",
+        action: "rename — selected local, else the function in view (imports refused)",
     },
     HelpLine::Entry {
         scope: "VIEWER",
@@ -423,7 +423,7 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "n / N  (cfg graph)",
+        key: "] / [  (cfg graph)",
         action: "next / previous block in index order (sequential walk)",
     },
     HelpLine::Entry {
@@ -438,7 +438,7 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "/  then n/N",
+        key: "/  then ] / [",
         action: "find; next / previous match",
     },
     HelpLine::Entry {
@@ -458,13 +458,23 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "s / b",
-        action: "sections / back in history",
+        key: "s",
+        action: "sections map",
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "q / Esc",
-        action: "return to picker",
+        key: "b / w",
+        action: "back / forward in the nav history",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "q",
+        action: "leave to the list now",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "Esc",
+        action: "back out one layer: popup → stack → visual → search → history → list",
     },
     HelpLine::Section("VISUAL"),
     HelpLine::Entry {
@@ -531,7 +541,7 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "STACK VIEW",
-        key: "Enter / r",
+        key: "Enter / n",
         action: "jump to use / rename local",
     },
     HelpLine::Entry {

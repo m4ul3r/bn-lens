@@ -120,7 +120,7 @@ pub(crate) enum CfgDir {
     Right,
 }
 
-/// What `r` is renaming: a function-local (retexted in place) or a function
+/// What `n` is renaming: a function-local (retexted in place) or a function
 /// symbol (needs a ctx rebuild so every callsite/name map picks it up).
 #[derive(Clone, Copy, PartialEq)]
 enum RenameScope {
@@ -211,9 +211,12 @@ pub struct Viewer {
     status: String,
     vmode: bool,
     vanchor: usize,
-    search: String,               // committed query (for n/N)
+    search: String,               // committed query (for ]/[)
     search_input: Option<String>, // Some while typing after `/`
     stack: Vec<Frame>,
+    /// Views popped by `b`, so `w` can walk forward again. Cleared whenever a
+    /// *new* navigation (goto/xrefs) branches off the history.
+    forward: Vec<Frame>,
     popup: Popup,
     screen_tgts: Vec<(u16, u16, u16, usize)>, // x0,x1,y,target_idx (for mouse)
     /// CFG view: block identity *and* displayed head address -> its header
@@ -260,6 +263,7 @@ impl Viewer {
             search: String::new(),
             search_input: None,
             stack: Vec::new(),
+            forward: Vec::new(),
             popup: Popup::None,
             screen_tgts: Vec::new(),
             cfg_index: std::collections::HashMap::new(),
@@ -395,7 +399,7 @@ impl Viewer {
                 self.spans = Vec::new();
                 self.cfg_index = std::collections::HashMap::new();
                 self.status = format!(
-                    " cfg·{} · {count} blocks · graph · hjkl spatial · n/N block · Space list · i il · v linear",
+                    " cfg·{} · {count} blocks · graph · hjkl spatial · ]/[ block · Space list · i il · v linear",
                     self.code_view.label()
                 );
                 self.cfg_cache = Some((self.name.clone(), il, blocks));

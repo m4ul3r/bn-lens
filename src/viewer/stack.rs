@@ -125,7 +125,7 @@ impl StackView {
                 .get(self.selected)
                 .map(|local| StackAction::Jump(local.name.clone()))
                 .unwrap_or(StackAction::None),
-            KeyCode::Char('r') => self
+            KeyCode::Char('n') => self
                 .rows
                 .get(self.selected)
                 .filter(|local| !local.is_synthetic())
@@ -311,9 +311,9 @@ impl StackView {
         }
 
         let footer = if area.width >= 70 {
-            " j/k slots · Enter jump · r rename · S/q close · ? help "
+            " j/k slots · Enter jump · n rename · S/q close · ? help "
         } else {
-            " j/k · Enter jump · r rename · S/q "
+            " j/k · Enter jump · n rename · S/q "
         };
         crate::ui::put_str(
             buffer,
@@ -447,7 +447,7 @@ mod tests {
             StackAction::Jump(name) if name == "second"
         ));
         assert!(matches!(
-            view.on_key(key(KeyCode::Char('r'))),
+            view.on_key(key(KeyCode::Char('n'))),
             StackAction::Rename(name) if name == "second"
         ));
         assert!(matches!(

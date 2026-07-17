@@ -55,7 +55,7 @@ pane and open **bn lens beside it** (`alt+d`).
 - **Hand off to the agent** when something's worth a deeper look: `V` to select a range, `a` to send
   it. The lens delivers a copy-pasteable `-i/-t/fn@addr` locator + the code to the agent's pane; the
   agent re-queries via `bn` (xrefs, taint, types…) and you **follow along in the lens**.
-- **Annotate as you learn:** `r` renames a local (live in the instance). Recover names, then keep
+- **Annotate as you learn:** `n` renames a local (live in the instance). Recover names, then keep
   moving.
 - **Chase a cross-binary trail:** `i` (picker) re-points the lens at another `.bndb`; the agent and
   lens stay in sync per instance/target.
@@ -95,21 +95,24 @@ most useful keys for the current mode.
 |-----|--------|
 | `?` | open the global shortcut guide |
 | `j`/`k` `^D`/`^U` `G` | move the line cursor |
-| `Tab` / `Shift-Tab` | step through **hotspots** — functions (blue), data (cyan), addresses (yellow), strings (magenta), locals (gray) |
+| `Tab` / `Shift-Tab` | step through the **interesting hotspots** — functions (blue), data (cyan), addresses (yellow), strings (magenta), named locals (gray); register temps (`v0`, `x0_1`) are skipped but stay clickable |
 | `g` / `Enter` | act on the hotspot: goto a function/code address, peek data, show a local's type |
 | `p` | peek — a **code** hotspot (function name, or a `0x…` in an executable section, e.g. a callsite on the xrefs page) shows the **decompile** centered on the use; **data** shows the byte dump (pointers symbolized) |
 | `x` | xrefs of the hotspot (`Enter` on a caller lands on the *use*) |
-| `r` | rename (live) — the selected **local**, a selected **function** hotspot, or the function in view; persist with `bn save` |
+| `n` | rename (live) — the selected **local**, another selected **function** hotspot, or the function in view; **imports are refused**; persist with `bn save` |
 | `;` | comment (live) — an address (disasm/hotspot) or the function's doc comment |
 | `t` | bookmark the address/function (a `Bookmarks` tag, live) |
 | `^R` | refresh from the live bn instance (pick up the agent's renames/edits) |
 | `S` | inspect the recovered stack frame; select slots and jump to local uses |
 | `i` / `I` | cycle the IL: **decompile → MLIL → disassembly** (forward / back) — in the CFG too, re-rendering the graph at the new IL |
 | `v` | toggle **CFG ⇄ linear**, keeping the current IL |
-| `/` then `n`/`N` | find in function |
+| `/` then `]`/`[` | find in function |
 | `V` then `a` | visual-select a range, then **ask the agent** |
 | `a` | ask the agent about the cursor line |
-| `s` | sections · `b` back · `q` to the picker |
+| `b` / `w` | back / forward in the nav history |
+| `s` | sections map |
+| `q` | leave to the picker now |
+| `Esc` | back out **one layer**: popup → stack → visual → search → nav history → picker |
 
 ## Configuration (env)
 

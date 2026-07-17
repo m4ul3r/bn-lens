@@ -92,21 +92,25 @@ the interactive ones into typed **hotspots**: **Func** (blue; in `func_names`) �
 (cyan; exports/imports/`addr_by_name`/`data_<hex>`) → peek/xrefs; **Addr** (yellow; a `0x…` that lands
 inside a mapped section, via `ctx.section_ranges`) → peek, or goto if the section is executable;
 **Local** (gray; from `bn local list`) → `p` shows its type, all its occurrences highlight while it's
-selected, and **`r` renames it** (see below); **Str** (magenta; any string literal) → `p` peeks the
+selected, and **`n` renames it** (see below); **Str** (magenta; any string literal) → `p` peeks the
 backing bytes and `x` xrefs the string, both after resolving the content to its address via a lazy
 `ctx.strings()` map (which prefers the real `.rodata` copy over the `.dynstr`/`.symtab` duplicates; the
 escape rendering matches the decompile, so even a multi-line literal resolves). Constants/offsets (a
 `0x…` in no section, like `hif + 0x120`) stay inert. **`Tab`/`Shift-Tab` step hotspot-to-hotspot**
-(granular — both calls in `f(g(x))` are reachable), **click** selects one, and `g`/`Enter`/`p`/`x`/`r`
-dispatch on its kind. Peek resolves internal symbols on-demand via `bn xrefs` and **symbolizes the hex
-dump** (`+off→name` for any 8-byte value that is a known symbol address). `/`+`n`/`N` find in function,
-`b` back (nav stack), `q` to the list.
+over the *interesting* spans (register-temp locals like `v0`/`x0_1`, non-code addresses, and the viewed
+function's own signature name are skipped — a **click** still reaches them), and `g`/`Enter`/`p`/`x`/`n`
+dispatch on the selection's kind. A `j`/`k` line move drops the Tab/click selection, so a stale hotspot
+can't redirect a later rename. Peek resolves internal symbols on-demand via `bn xrefs` and **symbolizes
+the hex dump** (`+off→name` for any 8-byte value that is a known symbol address). `/`+`]`/`[` find in
+function. `b`/`w` walk the nav history back/forward (a new goto/xrefs clears forward, like a browser);
+`q` leaves to the list immediately, while `Esc` backs out **one layer at a time** — popup → stack panel
+→ visual mode → search input → search highlight → nav history → list — and never skips the history.
 
 **Stack inspector** — `S` consumes structured `bn local list --format json` data rather than parsing
 decompiler text: stable local IDs, full types, stack/register provenance, signed frame offsets, and
 `span_to_next` slot spans. Slots render high-to-low with saved/compiler entries dimmed and overlapping
 offsets grouped. The selected code local seeds the stack selection; stack selection highlights all
-rendered uses, `Enter` jumps to the first use, and `r` reuses local rename. At 120+ columns it is a
+rendered uses, `Enter` jumps to the first use, and `n` reuses local rename. At 120+ columns it is a
 side panel beside the code; narrower terminals get a centered modal. Slot span is labeled separately
 from type size because recovered spacing can include alignment/padding.
 
@@ -173,9 +177,12 @@ in a herdr pane.
 The lens was read-only by construction until **local rename**; the write surface is now four
 annotation actions, all live in the bn instance, none auto-saved:
 
-- **`r` rename** — context-aware. A selected **Local** hotspot renames the local; a selected **Func**
-  hotspot (or, with no useful hotspot, the function in view) renames the **function**. The new name is
-  validated as a C identifier (spaces/invalid rejected inline).
+- **`n` rename** — context-aware, safety-first. A selected **Local** hotspot renames the local; a
+  selected **Func** hotspot naming *another* function renames that symbol; otherwise (no selection, or
+  a Data/Addr/Str selection) the **function in view**. Renaming an **imported** symbol is refused with
+  a status line — a one-shot rename of a PLT import (which corrupts every call site) must be impossible
+  by accident; use `bn` directly for the rare deliberate case. The new name is validated as a C
+  identifier (spaces/invalid rejected inline).
 - **`;` comment** — targets a concrete address when one is resolvable (a selected Addr hotspot, or the
   address leading a disasm/MLIL line), else the current function's doc comment (`bn comment set
   --function`). After a set, the current view reloads so an inline note renders.
@@ -196,7 +203,7 @@ manually, so edits the **agent** made to the shared instance (renames, new symbo
 The rebuild (~1s of sequential `bn` calls) runs on a **worker thread** so the UI keeps drawing: the
 event loop shows a centered bottom banner counting elapsed seconds, ticks at 100 ms for a smooth
 counter, and swallows input until the new `Ctx` arrives over a channel and is swapped in. The current
-function's own signature name is a `Func` hotspot too (so it's click/`x`/`r`-able); `act_primary`
+function's own signature name is a `Func` hotspot too (so it's click/`x`/`n`-able); `act_primary`
 no-ops the degenerate self-goto.
 
 ## Non-goals (kept deliberately)
