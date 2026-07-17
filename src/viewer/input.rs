@@ -477,32 +477,19 @@ impl Viewer {
         if self.spans.is_empty() {
             return;
         }
+        // `tab_stops` is non-empty whenever `spans` is (it falls back to every
+        // span), so indexing `stops` below is safe.
         let stops = super::hotspots::tab_stops(&self.spans, &self.name);
-        let count = stops.len() as i64;
-        let position = if let Some(current) = self.cur_span() {
-            match stops.iter().position(|&index| index == current) {
-                // On a stop: step within the ring.
-                Some(at) => (at as i64 + direction as i64).rem_euclid(count) as usize,
-                // On a skipped span: the nearest stop past it, wrapping.
-                None if direction > 0 => {
-                    stops.iter().position(|&index| index > current).unwrap_or(0)
-                }
-                None => stops
-                    .iter()
-                    .rposition(|&index| index < current)
-                    .unwrap_or(stops.len() - 1),
-            }
-        } else if direction > 0 {
-            stops
-                .iter()
-                .position(|&index| self.spans[index].line > self.cline)
-                .unwrap_or(0)
-        } else {
-            stops
-                .iter()
-                .rposition(|&index| self.spans[index].line < self.cline)
-                .unwrap_or(stops.len() - 1)
-        };
+        // Only ring-step from a *deliberate* selection (Tab or click) that is
+        // itself a stop on the cursor line. A span merely derived from the
+        // cursor line (arrived via search or j/k) must not be stepped past —
+        // otherwise the first Tab after a `/find` skips the match's own hotspot.
+        let active_pos = self
+            .active
+            .filter(|&index| self.spans.get(index).is_some_and(|s| s.line == self.cline))
+            .and_then(|index| stops.iter().position(|&stop| stop == index));
+        let stop_lines: Vec<usize> = stops.iter().map(|&index| self.spans[index].line).collect();
+        let position = super::hotspots::next_stop(&stop_lines, active_pos, self.cline, direction);
         let index = stops[position];
         self.active = Some(index);
         self.cline = self.spans[index].line;

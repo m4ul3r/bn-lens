@@ -105,6 +105,38 @@ pub(super) fn tab_stops(spans: &[Hotspot], viewed: &str) -> Vec<usize> {
     }
 }
 
+/// Choose the next Tab landing position within `stop_lines` (the line of each
+/// interesting span, in ascending span order; must be non-empty). `active_pos`
+/// is the position of the currently Tab/click-selected stop when one is active
+/// on the cursor line, else `None`. Stepping from an active stop advances one
+/// around the ring; arriving fresh (no active selection — e.g. after a search
+/// or a `j`/`k` move) lands on the nearest stop, **preferring the cursor line**
+/// (`line >= cline` forward, `line <= cline` back) before wrapping. This is why
+/// a `Tab` right after a `/find` selects the match's own hotspot rather than
+/// skipping to the next line.
+pub(super) fn next_stop(
+    stop_lines: &[usize],
+    active_pos: Option<usize>,
+    cline: usize,
+    direction: i32,
+) -> usize {
+    let count = stop_lines.len() as i64;
+    if let Some(at) = active_pos {
+        return (at as i64 + direction as i64).rem_euclid(count) as usize;
+    }
+    if direction > 0 {
+        stop_lines
+            .iter()
+            .position(|&line| line >= cline)
+            .unwrap_or(0)
+    } else {
+        stop_lines
+            .iter()
+            .rposition(|&line| line <= cline)
+            .unwrap_or(stop_lines.len() - 1)
+    }
+}
+
 /// Is `token` a data global we can resolve/peek? Exports, imported data, any
 /// known symbol, or an auto-named `data_<hex>` global.
 fn is_data_symbol(ctx: &Ctx, token: &str) -> bool {
@@ -242,6 +274,38 @@ mod tests {
             spot("boot", HotKind::Str, false, 7),
         ];
         assert_eq!(tab_stops(&spans, "parse_frame"), vec![2, 3, 5, 6]);
+    }
+
+    #[test]
+    fn tab_from_a_fresh_cursor_prefers_a_stop_on_the_current_line() {
+        // Stops sit on lines 2, 5, 5, 8. With the cursor on line 5 and no active
+        // selection (the search/j-k case), forward Tab lands on the first stop
+        // *on* line 5 — not the next line — which is the /find regression fix.
+        let lines = [2usize, 5, 5, 8];
+        assert_eq!(super::next_stop(&lines, None, 5, 1), 1);
+        // Backward prefers the current line too (its last stop).
+        assert_eq!(super::next_stop(&lines, None, 5, -1), 2);
+    }
+
+    #[test]
+    fn tab_from_an_empty_line_moves_to_the_neighboring_stop() {
+        let lines = [2usize, 5, 8];
+        // Cursor on line 6 (no stop there): forward → next stop below.
+        assert_eq!(super::next_stop(&lines, None, 6, 1), 2);
+        // Backward → previous stop above.
+        assert_eq!(super::next_stop(&lines, None, 6, -1), 1);
+        // Past the last stop wraps to the top; before the first wraps to bottom.
+        assert_eq!(super::next_stop(&lines, None, 99, 1), 0);
+        assert_eq!(super::next_stop(&lines, None, 0, -1), 2);
+    }
+
+    #[test]
+    fn tab_from_an_active_selection_steps_the_ring() {
+        let lines = [2usize, 5, 5, 8];
+        assert_eq!(super::next_stop(&lines, Some(1), 5, 1), 2); // forward
+        assert_eq!(super::next_stop(&lines, Some(1), 5, -1), 0); // back
+        assert_eq!(super::next_stop(&lines, Some(3), 8, 1), 0); // wrap end→start
+        assert_eq!(super::next_stop(&lines, Some(0), 2, -1), 3); // wrap start→end
     }
 
     #[test]
