@@ -1,8 +1,13 @@
-//! The marks view: every annotation on the binary — comments (`;`) and
-//! tags/bookmarks (`t`), plus BN's own analysis tags — merged into one
-//! navigable list. This is the read half of the "shared map": `Enter` jumps to
-//! the annotated function so you (and the agent) can move between marked spots.
-//! Your own marks (comments, Bookmarks) sort to the top.
+//! The marks view: annotations on the binary — address-scoped comments (`;` on a
+//! selected address) and tags/bookmarks (`t`), plus BN's own analysis tags —
+//! merged into one navigable list. This is the read half of the "shared map":
+//! `Enter` jumps to the annotated function so you (and the agent) can move
+//! between marked spots. Your own marks (comments, Bookmarks) sort to the top.
+//!
+//! Caveat: a bare `;` on a *function* sets bn's function-documentation comment
+//! (`fn.comment`), which `bn comment list` does not enumerate — so those do NOT
+//! appear here (see TODO.md → "function-doc comments are invisible in Marks").
+//! Only address-scoped comments list.
 
 use crate::bn::Mark;
 use crate::ctx::Ctx;
