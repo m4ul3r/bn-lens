@@ -15,7 +15,7 @@ use crate::syntax::{self, Line};
 use hotspots::build_spans;
 use stack::StackView;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum HotKind {
     Func,  // a function symbol  -> goto / xrefs
     Data,  // a data global      -> peek / xrefs
@@ -44,6 +44,9 @@ enum View {
     Disasm,
     Cfg,
     Xrefs,
+    /// A Binary Ninja-style linear listing of the data section around an
+    /// address — entered with `g` on a data hotspot, part of the nav history.
+    Data,
 }
 
 impl View {
@@ -60,6 +63,7 @@ impl View {
             View::Disasm => "disasm",
             View::Cfg => "cfg",
             View::Xrefs => "xrefs",
+            View::Data => "data",
         }
     }
 
@@ -181,9 +185,27 @@ enum Popup {
         err: String,
         scope: RenameScope,
     },
+    Retype {
+        /// Function owning the local, and the local's name (passed to bn).
+        func: String,
+        var: String,
+        old_type: String,
+        buf: String,
+        /// Validation feedback: `Ok` after a passing `^P`/commit check, `Err`
+        /// with the parser message after a failing one, `None` while unchecked.
+        checked: Option<Result<(), String>>,
+        /// Available type names (builtins + the target's declared types) for
+        /// autocomplete, fetched once when the composer opens.
+        types: Vec<String>,
+        /// Selected autocomplete suggestion.
+        sel: usize,
+    },
     Comment {
         target: AnnTarget,
         buf: String,
+        /// Insertion caret as a **char** index into `buf` (0..=char count), for
+        /// full in-place editing (move, insert/delete mid-string).
+        cursor: usize,
     },
     Tag {
         target: AnnTarget,
@@ -197,6 +219,11 @@ pub enum Exit {
     /// A structural mutation (function rename) landed — the app rebuilds ctx and
     /// reloads the viewer so name maps and callsites reflect it.
     Reload,
+    /// A local, non-structural mutation (comment / tag) landed — reload just this
+    /// view so the annotation renders, *without* a full ctx rebuild. ctx maps
+    /// don't change, and the Marks list rebuilds on its own when next opened, so
+    /// the ~1s worker refresh (and its input-pausing banner) is unwarranted here.
+    ReloadView,
 }
 
 pub struct Viewer {
@@ -255,6 +282,10 @@ pub struct Viewer {
     /// and whether this press has moved (so a click still selects, a drag pans).
     cfg_drag: Option<(u16, u16)>,
     cfg_dragged: bool,
+    /// Content width the comment composer last wrapped at, stashed by the (`&self`)
+    /// popup renderer so `Up`/`Down` in the editor can move the caret by one
+    /// visual row. `Cell` for interior mutability during render.
+    comment_wrap: std::cell::Cell<usize>,
 }
 
 impl Viewer {
@@ -288,6 +319,7 @@ impl Viewer {
             cfg_hit: Vec::new(),
             cfg_drag: None,
             cfg_dragged: false,
+            comment_wrap: std::cell::Cell::new(60),
         };
         viewer.load(ctx);
         viewer
@@ -315,7 +347,17 @@ impl Viewer {
                 }
             }
         }
+        // The data view recentres on its focus address every build, which is
+        // right on first entry but would discard the reading position on a
+        // reload (^R, or a rename of a pointer-target function from within it).
+        // Preserve the scroll position across the reload for that view.
+        let keep = (self.view == View::Data).then_some((self.cline, self.top));
         self.load(ctx);
+        if let Some((cline, top)) = keep {
+            let max = self.lines.len().saturating_sub(1);
+            self.cline = cline.min(max);
+            self.top = top.min(self.cline);
+        }
     }
 
     /// True while the viewer is capturing raw text — composing an ask, editing a
@@ -327,6 +369,7 @@ impl Viewer {
                 self.popup,
                 Popup::Ask { .. }
                     | Popup::Rename { .. }
+                    | Popup::Retype { .. }
                     | Popup::Comment { .. }
                     | Popup::Tag { .. }
             )
@@ -345,6 +388,10 @@ impl Viewer {
         if matches!(self.view, View::Cfg) {
             self.load_cfg(ctx);
             self.apply_focus();
+            return;
+        }
+        if matches!(self.view, View::Data) {
+            self.load_data(ctx);
             return;
         }
         // Leave CFG state before loading a linear view. An interior-address
@@ -385,7 +432,7 @@ impl Viewer {
             View::Mlil => ctx.bn.il(&self.name, "mlil"),
             View::Disasm => ctx.bn.disasm(&self.name),
             View::Xrefs => ctx.bn.xrefs(&self.name),
-            View::Cfg => unreachable!("handled above"),
+            View::Cfg | View::Data => unreachable!("handled above"),
         };
         self.lines = if matches!(self.view, View::Decomp) {
             syntax::tokenize_c(&text)
@@ -540,6 +587,56 @@ impl Viewer {
             )
         };
         self.cfg_cache = Some((self.name.clone(), il, blocks));
+    }
+
+    /// Build the linear data view: resolve the section around `focus_addr`
+    /// (or `self.name`), fetch its typed data vars + raw bytes, and render the
+    /// Binary Ninja-style listing. Names/strings/pointer targets become hotspots
+    /// via `build_spans`, so you can step, peek, xref, or follow them.
+    fn load_data(&mut self, ctx: &Ctx) {
+        self.cfg_graph_view = None;
+        let addr = self
+            .focus_addr
+            .or_else(|| crate::ctx::parse_hex(&self.name));
+        let Some(addr) = addr else {
+            self.lines = Vec::new();
+            self.spans = Vec::new();
+            self.status = " ✗ no address for the data view".into();
+            return;
+        };
+        // Window: the whole section when small, else a bounded slice centred on
+        // the address (a huge .rodata mustn't be read/rendered in full).
+        const CAP: u64 = 0x2000;
+        let (lo, hi, label) = match ctx.section_of(addr) {
+            Some((start, end, name, _)) => {
+                let (lo, hi) = if end - start <= CAP {
+                    (*start, *end)
+                } else {
+                    let lo = addr.saturating_sub(CAP / 3).max(*start);
+                    (lo, (lo + CAP).min(*end))
+                };
+                (lo, hi, format!("{name}  0x{start:x}–0x{end:x}"))
+            }
+            None => (
+                addr.saturating_sub(0x40),
+                addr + 0x200,
+                "(no section)".to_string(),
+            ),
+        };
+        let lo_str = format!("0x{lo:x}");
+        let hi_str = format!("0x{hi:x}");
+        let vars = ctx.bn.data_vars(&lo_str, &hi_str);
+        let dump = ctx.bn.read_dump(&lo_str, (hi - lo) as usize);
+        let bytes = crate::datamap::parse_hexdump(&dump, lo);
+        let result = crate::datamap::linear(&label, lo, hi, &vars, &bytes, addr);
+        self.lines = result.lines;
+        self.locals = std::collections::HashMap::new();
+        self.stack_view.set_locals(&[]);
+        self.spans = build_spans(&self.lines, ctx, &self.locals);
+        self.active = None;
+        let line = result.focus.unwrap_or(0);
+        self.cline = line;
+        self.top = line.saturating_sub(3);
     }
 
     /// Move the CFG graph selection to the nearest box in `dir` (hjkl — spatial).

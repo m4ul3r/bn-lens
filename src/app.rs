@@ -570,10 +570,26 @@ impl App {
         }
         match &mut self.viewer {
             Some(v) => {
-                match v.on_key(k, &self.ctx) {
+                let exit = v.on_key(k, &self.ctx);
+                match exit {
                     Exit::Back => self.viewer = None,
                     Exit::Stay => {}
                     Exit::Reload => self.start_refresh(),
+                    // Comment/tag: reload just the viewer so the annotation
+                    // renders, without the full-ctx worker refresh.
+                    Exit::ReloadView => {
+                        if let Some(v) = &mut self.viewer {
+                            v.reload(&self.ctx);
+                        }
+                        // The annotation also changed the Marks inventory. It's
+                        // cached and only rebuilt on an explicit view switch, so
+                        // returning to it via q/Back would show stale data —
+                        // refresh it now (annotations live in the bn instance, so
+                        // no ctx rebuild is needed).
+                        if let Some(marks) = &mut self.marks {
+                            marks.refresh(&self.ctx);
+                        }
+                    }
                 }
                 false
             }

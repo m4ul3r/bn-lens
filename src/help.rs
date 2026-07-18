@@ -416,13 +416,23 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
+        key: "W / B",
+        action: "next / previous call or code target only (skip locals & data)",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
         key: "g / Enter",
-        action: "act on hotspot",
+        action: "act on hotspot: goto fn/code · open data in the linear data view (header previews)",
     },
     HelpLine::Entry {
         scope: "VIEWER",
         key: "p",
-        action: "peek — code→decompile, data→bytes",
+        action: "peek popup — code→decompile, data→quick typed field map",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "(data view)",
+        action: "g on data opens a BN-style listing: addresses, data_ labels, hex+ascii, string decls; ^O returns",
     },
     HelpLine::Entry {
         scope: "VIEWER",
@@ -436,8 +446,13 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
+        key: "y",
+        action: "retype the selected local — autocomplete + preview-validate before commit",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
         key: ";",
-        action: "comment (address or function)",
+        action: "comment — edits the existing one in place (address or function), pre-filled",
     },
     HelpLine::Entry {
         scope: "VIEWER",

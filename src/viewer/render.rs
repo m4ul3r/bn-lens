@@ -11,6 +11,11 @@ use std::collections::HashMap;
 
 const GUTTER_WIDTH: u16 = 7; // "NNNN │ "
 
+/// Inline display cap for a string-literal segment. Longer literals ellipsize
+/// (the full content stays reachable via peek/xref) so a boilerplate string
+/// can't push real code off screen across several wrapped rows.
+const STR_DISPLAY_LIMIT: usize = 48;
+
 /// Turn a tokenized pseudo-C line into coloured spans, dropping the first
 /// `hoff` characters (horizontal pan). Splits inside a segment when the pan
 /// lands mid-token so colours stay aligned to the panned text.
@@ -55,6 +60,48 @@ fn tail_wrapped_lines(input: &str, width: usize, max_lines: usize) -> Vec<String
         lines.drain(0..lines.len() - max_lines);
     }
     lines
+}
+
+/// Wrap `input` into `width`-char rows and return the visible window of up to
+/// `max_lines` rows that keeps the caret (char index `cursor`) in view (the
+/// window bottom-pins to the caret's row), the caret's position within the
+/// window `(row, col)`, and whether the window includes the text's first row
+/// (so only that row gets the `>` prompt marker).
+fn wrap_cursor(
+    input: &str,
+    width: usize,
+    max_lines: usize,
+    cursor: usize,
+) -> (Vec<String>, usize, usize, bool) {
+    let width = width.max(1);
+    let chars: Vec<char> = input.chars().collect();
+    let mut rows: Vec<String> = if chars.is_empty() {
+        vec![String::new()]
+    } else {
+        chars
+            .chunks(width)
+            .map(|chunk| chunk.iter().collect())
+            .collect()
+    };
+    let cursor = cursor.min(chars.len());
+    let (caret_row, caret_col) = (cursor / width, cursor % width);
+    // A caret one past a full final row sits at the start of a fresh row.
+    if caret_row >= rows.len() {
+        rows.push(String::new());
+    }
+    let total = rows.len();
+    let start = if caret_row + 1 > max_lines {
+        caret_row + 1 - max_lines
+    } else {
+        0
+    };
+    let end = (start + max_lines).min(total);
+    (
+        rows[start..end].to_vec(),
+        caret_row - start,
+        caret_col,
+        start == 0,
+    )
 }
 
 impl Viewer {
@@ -150,6 +197,19 @@ impl Viewer {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             );
+        } else if let Some(hint) = self.hotspot_hint(ctx) {
+            // A deliberately-selected hotspot: preview what it is and what `g`
+            // does, so the action is legible without the colour highlight.
+            crate::ui::put_str(
+                buffer,
+                area.x,
+                area.y + 1,
+                hint,
+                code_width,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            );
         } else {
             let mut location = Vec::new();
             if !address.is_empty() {
@@ -183,7 +243,7 @@ impl Viewer {
         } else if self.vmode {
             " j/k extend · a ask · Esc cancel · ? help"
         } else {
-            " j/k · b/w hotspot · g act · n/;/t · a ask · / find · i il · v cfg · ^O/^F hist · q list · ? help"
+            " j/k · w/b hotspot · W/B calls · g act · n/;/t · a ask · / find · i il · v cfg · ^O/^F hist · q · ? help"
         };
         crate::ui::render_bar(
             buffer,
@@ -304,7 +364,20 @@ impl Viewer {
                     theme::tok_style(segment.kind)
                 };
 
-                let chars: Vec<char> = segment.text.chars().collect();
+                // Ellipsize an over-long string literal for display; the hotspot
+                // keeps the full content. `full_len` lets us re-sync the logical
+                // column afterwards so later hotspots on this line stay aligned.
+                let full_len = segment.text.chars().count();
+                let draw_text = if segment.kind == crate::syntax::Tok::Str {
+                    super::hotspots::truncate_str_segment(&segment.text, STR_DISPLAY_LIMIT)
+                } else {
+                    None
+                };
+                let chars: Vec<char> = draw_text
+                    .as_deref()
+                    .unwrap_or(&segment.text)
+                    .chars()
+                    .collect();
                 let mut char_index = 0;
                 let mut first_chunk = true;
                 while char_index < chars.len() {
@@ -339,6 +412,9 @@ impl Viewer {
                     x += chunk_len as u16;
                     col += chunk_len;
                 }
+                // Advance the logical column past any elided characters so
+                // `hotspot_at` lookups for later segments on this line align.
+                col += full_len - chars.len();
             }
             y += 1;
             line += 1;
@@ -717,14 +793,152 @@ impl Viewer {
                     Style::default().add_modifier(Modifier::DIM),
                 );
             }
-            Popup::Comment { target, buf: input } => {
-                self.render_input_box(
-                    area,
+            Popup::Retype {
+                var,
+                old_type,
+                buf: input,
+                checked,
+                types,
+                sel,
+                ..
+            } => {
+                let suggestions = super::hotspots::type_matches(types, input, 6);
+                let sug_rows = suggestions.len() as u16;
+                let box_width = (area.width.saturating_sub(6)).clamp(48, 96);
+                let box_height = 6 + sug_rows;
+                let box_x = area.x + (area.width.saturating_sub(box_width)) / 2;
+                let box_y = area.y + (area.height.saturating_sub(box_height)) / 2;
+                let inner = (box_width - 4) as usize;
+                crate::ui::draw_box(
                     buffer,
+                    box_x,
+                    box_y,
+                    box_width,
+                    box_height,
+                    "retype local  (live in the bn instance)",
+                );
+                crate::ui::put_str(
+                    buffer,
+                    box_x + 2,
+                    box_y + 1,
+                    format!("{var} : {old_type}  →"),
+                    inner,
+                    Style::default().fg(Color::Cyan),
+                );
+                crate::ui::put_str(
+                    buffer,
+                    box_x + 2,
+                    box_y + 2,
+                    format!("> {input}"),
+                    inner,
+                    Style::default(),
+                );
+                let (verdict, vstyle) = match checked {
+                    Some(Ok(())) => (
+                        format!("✓ valid — Enter applies {} → {}", var, input.trim()),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Some(Err(error)) => (format!("✗ {error}"), Style::default().fg(Color::Red)),
+                    None => (
+                        "Tab completes · ^P checks the type".to_string(),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
+                };
+                crate::ui::put_str(buffer, box_x + 2, box_y + 3, verdict, inner, vstyle);
+                for (row, name) in suggestions.iter().enumerate() {
+                    let selected = row == *sel;
+                    let style = if selected {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::Blue)
+                    };
+                    let marker = if selected { "▸ " } else { "  " };
+                    crate::ui::put_str(
+                        buffer,
+                        box_x + 2,
+                        box_y + 4 + row as u16,
+                        format!("{marker}{name}"),
+                        inner,
+                        style,
+                    );
+                }
+                crate::ui::put_str(
+                    buffer,
+                    box_x + 2,
+                    box_y + box_height - 1,
+                    " Tab complete · ↑↓ pick · ^P check · Enter apply · Esc cancel ",
+                    inner,
+                    Style::default().add_modifier(Modifier::DIM),
+                );
+            }
+            Popup::Comment {
+                target,
+                buf: input,
+                cursor,
+            } => {
+                // Comments can be long (and are pre-filled for edit-in-place), so
+                // wrap the value, keep the caret in view, and draw it as a block.
+                let box_width = (area.width.saturating_sub(6)).clamp(46, 100);
+                let content_width = (box_width as usize).saturating_sub(6).max(1);
+                self.comment_wrap.set(content_width);
+                let (window, caret_row, caret_col, at_top) =
+                    wrap_cursor(input, content_width, 5, *cursor);
+                let box_height = 4 + window.len() as u16;
+                let box_x = area.x + (area.width.saturating_sub(box_width)) / 2;
+                let box_y = area.y + (area.height.saturating_sub(box_height)) / 2;
+                let inner = (box_width - 4) as usize;
+                crate::ui::draw_box(
+                    buffer,
+                    box_x,
+                    box_y,
+                    box_width,
+                    box_height,
                     "comment  (live in the bn instance)",
-                    &format!("comment {}", target.label()),
-                    input,
-                    " Enter set · Esc cancel · ? help ",
+                );
+                crate::ui::put_str(
+                    buffer,
+                    box_x + 2,
+                    box_y + 1,
+                    format!(
+                        "comment {}  ·  {} chars",
+                        target.label(),
+                        input.chars().count()
+                    ),
+                    inner,
+                    Style::default().fg(Color::Cyan),
+                );
+                for (row, line) in window.iter().enumerate() {
+                    let prefix = if row == 0 && at_top { "> " } else { "  " };
+                    crate::ui::put_str(
+                        buffer,
+                        box_x + 2,
+                        box_y + 2 + row as u16,
+                        format!("{prefix}{line}"),
+                        inner,
+                        Style::default(),
+                    );
+                }
+                // The caret: reverse-video the char under it (a space at line end).
+                let caret_char = input
+                    .chars()
+                    .nth(*cursor)
+                    .filter(|ch| *ch != '\n')
+                    .unwrap_or(' ');
+                crate::ui::put_str(
+                    buffer,
+                    box_x + 4 + caret_col as u16,
+                    box_y + 2 + caret_row as u16,
+                    caret_char.to_string(),
+                    1,
+                    Style::default().add_modifier(Modifier::REVERSED),
+                );
+                crate::ui::put_str(
+                    buffer,
+                    box_x + 2,
+                    box_y + box_height - 1,
+                    " ←→ move · Home/End · ⌫/Del · Enter set · Esc cancel ",
+                    inner,
+                    Style::default().add_modifier(Modifier::DIM),
                 );
             }
             Popup::Tag { target, buf: input } => {
@@ -893,7 +1107,7 @@ fn cfg_cell_style(col: u8, selected: bool) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{pan_syntax_spans, tail_wrapped_lines};
+    use super::{pan_syntax_spans, tail_wrapped_lines, wrap_cursor};
     use crate::syntax::{Seg, Tok};
 
     #[test]
@@ -903,6 +1117,22 @@ mod tests {
             vec!["uvwxy", "z"]
         );
         assert_eq!(tail_wrapped_lines("short", 20, 2), vec!["short"]);
+    }
+
+    #[test]
+    fn wrap_cursor_places_caret_and_windows() {
+        // 10 chars at width 4 → rows abcd / efgh / ij; caret index 5 → row 1 col 1.
+        let (win, row, col, top) = wrap_cursor("abcdefghij", 4, 5, 5);
+        assert_eq!(win, vec!["abcd", "efgh", "ij"]);
+        assert_eq!((row, col, top), (1, 1, true));
+        // Caret past a full final row opens a fresh row for it.
+        let (win, row, col, _top) = wrap_cursor("abcd", 4, 5, 4);
+        assert_eq!(win, vec!["abcd", ""]);
+        assert_eq!((row, col), (1, 0));
+        // Overflow: the window bottom-pins to the caret's row, dropping the top.
+        let (win, row, _col, top) = wrap_cursor("aaaabbbbccccdddd", 4, 2, 16);
+        assert_eq!(win.len(), 2);
+        assert_eq!((row, top), (1, false));
     }
 
     fn seg(text: &str, kind: Tok) -> Seg {

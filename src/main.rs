@@ -7,6 +7,7 @@ mod bn;
 mod cfg;
 mod classes;
 mod ctx;
+mod datamap;
 mod decomp;
 mod exports;
 mod help;

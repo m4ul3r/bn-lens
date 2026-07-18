@@ -1,6 +1,6 @@
 //! Viewer actions that load data or change navigation state.
 
-use super::hotspots::{build_spans, ellipsize, symbolize_dump};
+use super::hotspots::{build_spans, data_symbol_addr, ellipsize, symbolize_dump};
 use super::{AnnTarget, Exit, Frame, HotKind, Popup, RenameScope, View, Viewer};
 use crate::ctx::Ctx;
 use crate::syntax::Tok;
@@ -56,11 +56,47 @@ impl Viewer {
             }
             HotKind::Data | HotKind::Addr => {
                 let target = span.target.clone();
-                self.peek(ctx, &target);
+                self.enter_data_view(ctx, &target);
             }
             HotKind::Local => self.show_local(index),
             HotKind::Str => self.peek_string(ctx, index),
         }
+    }
+
+    /// A one-line preview of the deliberately-selected hotspot (Tab/`w`/`W`/
+    /// click, or a `/find` that landed on a token) resting on the cursor line,
+    /// and what `g` will do to it. Rendered on the header row so the pending
+    /// action — and *which* token is selected — is legible without leaning on the
+    /// colour highlight. `None` while merely reading (plain `j`/`k` drops the
+    /// selection), so the location readout shows instead.
+    pub(super) fn hotspot_hint(&self, ctx: &Ctx) -> Option<String> {
+        let index = self
+            .active
+            .filter(|&i| self.spans.get(i).is_some_and(|s| s.line == self.cline))?;
+        let span = &self.spans[index];
+        let hint = match span.kind {
+            HotKind::Local => {
+                let ty = self
+                    .locals
+                    .get(&span.target)
+                    .map(String::as_str)
+                    .unwrap_or("?");
+                format!(" {} : {ty}   ·  local · n rename", span.target)
+            }
+            HotKind::Func if self.is_current_function(ctx, &span.target) => format!(
+                " {}   ·  this fn · x xrefs · n rename · ; comment",
+                ctx.display_name(&span.target)
+            ),
+            HotKind::Func => format!(" → {}   ·  g goto · x xrefs · n rename", span.target),
+            HotKind::Addr if span.code => format!(" {}   ·  g goto · x xrefs", span.target),
+            HotKind::Addr => format!(" {}   ·  g open data · p peek · x xrefs", span.target),
+            HotKind::Data => format!(" {}   ·  g open data · p peek · x xrefs", span.target),
+            HotKind::Str => format!(
+                " \"{}\"   ·  g peek bytes · x xrefs",
+                ellipsize(&span.target, 40)
+            ),
+        };
+        Some(hint)
     }
 
     /// Peek a string literal: resolve its content to a `.rodata` address, then
@@ -124,17 +160,73 @@ impl Viewer {
         };
     }
 
+    /// `y`: retype the selected **local**. Opens a composer with type
+    /// autocomplete (builtins + the target's declared types) that validates via
+    /// `--preview` before committing — so a bad type never touches the instance.
+    pub(super) fn open_retype(&mut self, ctx: &Ctx) {
+        let Some(index) = self
+            .cur_span()
+            .filter(|&i| self.spans[i].kind == HotKind::Local && self.view.is_code())
+        else {
+            self.status = " ✗ y retypes a local — select one (w/b) first".into();
+            return;
+        };
+        let var = self.spans[index].target.clone();
+        let old_type = self.locals.get(&var).cloned().unwrap_or_default();
+        // Autocomplete source: builtin primitives + every declared type, deduped.
+        let mut types: Vec<String> = super::hotspots::BUILTIN_TYPES
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        types.extend(ctx.bn.types_list().into_iter().map(|item| item.name));
+        types.sort();
+        types.dedup();
+        self.popup = Popup::Retype {
+            func: self.name.clone(),
+            var,
+            old_type,
+            buf: String::new(),
+            checked: None,
+            types,
+            sel: 0,
+        };
+    }
+
     /// `;`: comment. Targets a concrete address (selected Addr hotspot, or the
     /// address that leads a disasm/MLIL line), else the function doc comment.
-    pub(super) fn open_comment(&mut self) {
+    pub(super) fn open_comment(&mut self, ctx: &Ctx) {
         if !self.view.is_code() {
             self.status = " ✗ comments apply in a code view".into();
             return;
         }
+        let (target, buf) = self.comment_edit_target(ctx);
+        let cursor = buf.chars().count();
         self.popup = Popup::Comment {
-            target: self.ann_target(),
-            buf: String::new(),
+            target,
+            buf,
+            cursor,
         };
+    }
+
+    /// Resolve where `;` comments *and* the current text to edit (empty for a
+    /// new comment). A deliberately-selected address (or the disasm/MLIL line
+    /// address) edits that address's comment; otherwise the function — preferring
+    /// its `function_doc`, then any comment at the entry address (what BN and the
+    /// agent render atop the function) — so `;` edits whichever note is shown.
+    fn comment_edit_target(&self, ctx: &Ctx) -> (AnnTarget, String) {
+        if let Some(addr) = self.explicit_addr() {
+            let text = ctx.bn.comment_get_addr(&addr).unwrap_or_default();
+            return (AnnTarget::Addr(addr), text);
+        }
+        let existing = ctx.bn.comment_get_func(&self.name);
+        if !existing.doc.trim().is_empty() {
+            (AnnTarget::Func(self.name.clone()), existing.doc)
+        } else if let (Some(text), false) = (existing.entry_comment, existing.entry_addr.is_empty())
+        {
+            (AnnTarget::Addr(existing.entry_addr), text)
+        } else {
+            (AnnTarget::Func(self.name.clone()), String::new())
+        }
     }
 
     /// `t`: bookmark/tag. Same target resolution as [`open_comment`].
@@ -151,15 +243,27 @@ impl Viewer {
 
     /// Resolve where a comment/tag should land from the current selection/line.
     fn ann_target(&self) -> AnnTarget {
-        if let Some(index) = self.cur_span() {
-            if self.spans[index].kind == HotKind::Addr {
-                return AnnTarget::Addr(self.spans[index].target.clone());
+        self.explicit_addr()
+            .map(AnnTarget::Addr)
+            .unwrap_or_else(|| AnnTarget::Func(self.name.clone()))
+    }
+
+    /// The explicit address `;`/`t` should annotate: a *deliberately* selected
+    /// address hotspot (Tab/`w`/click), else the address leading the current
+    /// disasm/MLIL line. Deliberate-only so the cursor merely resting on an
+    /// address token inside a rendered comment doesn't hijack the target — a
+    /// bare `;` then means "the function".
+    fn explicit_addr(&self) -> Option<String> {
+        if let Some(index) = self.active {
+            if self
+                .spans
+                .get(index)
+                .is_some_and(|span| span.kind == HotKind::Addr && span.line == self.cline)
+            {
+                return Some(self.spans[index].target.clone());
             }
         }
-        if let Some(addr) = self.line_leading_addr() {
-            return AnnTarget::Addr(addr);
-        }
-        AnnTarget::Func(self.name.clone())
+        self.line_leading_addr()
     }
 
     /// The address that leads the current disasm/MLIL line, if any. Disasm emits
@@ -219,6 +323,32 @@ impl Viewer {
         self.spans = build_spans(&self.lines, ctx, &self.locals);
     }
 
+    /// `g` on a data hotspot: resolve it and open the full **linear data view**
+    /// (nav-history aware) — the inspectable counterpart to `p`'s quick popup.
+    fn enter_data_view(&mut self, ctx: &Ctx, symbol: &str) {
+        match self.resolve_addr(ctx, symbol) {
+            Some(address) => self.open_data_view(ctx, &address),
+            None => self.status = format!(" ✗ can't resolve {symbol}"),
+        }
+    }
+
+    fn open_data_view(&mut self, ctx: &Ctx, address: &str) {
+        let Some(addr) = crate::ctx::parse_hex(address) else {
+            // Nothing to anchor a section on — fall back to the popup.
+            self.show_data_map(ctx, address, address);
+            return;
+        };
+        self.push_nav();
+        self.focus_addr = Some(addr);
+        self.name = address.to_string();
+        // A data address has no owning function. Clear the entry anchor so it
+        // can't leak the previously-viewed function's entry into the ask
+        // locator or make `is_current_function` misfire in the data view.
+        self.entry = None;
+        self.view = View::Data;
+        self.load(ctx);
+    }
+
     /// Navigate to `target` (a function name or code address), pushing the nav
     /// stack. From an xrefs view, land on the *use* of the current symbol.
     pub(super) fn goto_to(&mut self, ctx: &Ctx, target: String) {
@@ -260,6 +390,11 @@ impl Viewer {
         if symbol.starts_with("0x") && symbol.len() >= 4 {
             return Some(symbol.to_string());
         }
+        // An auto-named `data_<hex>` global encodes its own address; bn can't
+        // resolve the synthetic name, so recover it directly instead of failing.
+        if let Some(address) = data_symbol_addr(symbol) {
+            return Some(address);
+        }
         let output = ctx.bn.xrefs(symbol);
         for line in output.lines() {
             if let Some(position) = line.find("xrefs to 0x") {
@@ -278,9 +413,50 @@ impl Viewer {
 
     fn peek(&mut self, ctx: &Ctx, symbol: &str) {
         match self.resolve_addr(ctx, symbol) {
-            Some(address) => self.show_peek(ctx, symbol, &address),
+            Some(address) => self.show_data_map(ctx, symbol, &address),
             None => self.status = format!(" ✗ can't resolve {symbol}"),
         }
+    }
+
+    /// Peek a data address as a **structured field map**: the BN-typed data
+    /// variables around it (address · name · type · value), pointers symbolized,
+    /// section boundaries marked, centred on `address`. Falls back to a raw byte
+    /// dump when BN exposes no typed data in range.
+    fn show_data_map(&mut self, ctx: &Ctx, symbol: &str, address: &str) {
+        let Some(addr) = crate::ctx::parse_hex(address) else {
+            self.show_peek(ctx, symbol, address);
+            return;
+        };
+        // A little context before, more after (fields tend to follow the one you
+        // land on); clamp the low end to the containing section so the window
+        // doesn't bleed into an unrelated prior section.
+        let section = ctx.section_of(addr);
+        let lo = match section {
+            Some((start, _, _, _)) => addr.saturating_sub(0x40).max(*start),
+            None => addr.saturating_sub(0x40),
+        };
+        let hi = addr + 0x200;
+        let hint = section.map_or("", |(_, _, name, _)| name.as_str());
+        let vars = ctx.bn.data_vars(&format!("0x{lo:x}"), &format!("0x{hi:x}"));
+        if vars.is_empty() {
+            self.show_peek(ctx, symbol, address);
+            return;
+        }
+        let map = crate::datamap::render(&vars, Some(addr), hint);
+        let title = if hint.is_empty() {
+            format!("data · {symbol} @ {address}")
+        } else {
+            format!("data · {hint} @ {address}")
+        };
+        self.popup = Popup::Peek {
+            title,
+            off: map.focus.map_or(0, |index| index.saturating_sub(4)),
+            focus: map.focus,
+            lines: map.lines,
+            tokens: None,
+            goto: None,
+            hoff: 0,
+        };
     }
 
     /// The first call *site* address on an xrefs caller line
@@ -337,7 +513,7 @@ impl Viewer {
             .collect();
         for token in tokens {
             if let Some(address) = self.resolve_addr(ctx, &token) {
-                self.show_peek(ctx, &token, &address);
+                self.show_data_map(ctx, &token, &address);
                 return;
             }
         }
@@ -431,7 +607,12 @@ impl Viewer {
                         }
                     }
                 }
-                _ => self.spans[index].target.clone(),
+                _ => {
+                    let raw = self.spans[index].target.clone();
+                    // A synthetic `data_<hex>` name isn't bn-resolvable; xref its
+                    // encoded address instead. Named symbols/addresses pass through.
+                    data_symbol_addr(&raw).unwrap_or(raw)
+                }
             },
             None => self.name.clone(),
         };

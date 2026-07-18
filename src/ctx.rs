@@ -68,8 +68,29 @@ fn parse_section_ranges(lines: &[String]) -> Vec<(u64, u64, String, bool)> {
             continue;
         };
         let name = cols.last().copied().unwrap_or("").to_string();
-        // perms column (e.g. "r-x") is the 3rd token when present
-        let exec = cols.get(2).is_some_and(|p| p.contains('x'));
+        // Classify "executable" primarily by section *semantics*, not the perms
+        // x-bit: an r-x `ReadOnlyData` section (.rodata) holds strings/constants,
+        // not code, so `g`/`p` on such an address must open the data view rather
+        // than try to decompile it. But BN only labels some sections `…Code`/
+        // `…Data`; a code section can carry `DefaultSection`/`ExternalSection`
+        // semantics (common on raw/mapped firmware views), and sections with no
+        // backing segment omit the perms column entirely, shifting positions.
+        // So classify by *content* of the tokens between length and name, not a
+        // fixed index: prefer the semantics verdict, fall back to the perms
+        // x-bit when semantics is non-committal.
+        let middle = cols.get(2..cols.len().saturating_sub(1)).unwrap_or(&[]);
+        let perms_exec = middle
+            .iter()
+            .find(|t| t.len() == 3 && t.chars().all(|c| "rwx-".contains(c)))
+            .is_some_and(|perms| perms.contains('x'));
+        let semantics = middle
+            .iter()
+            .find(|t| t.contains("Code") || t.contains("Data"));
+        let exec = match semantics {
+            Some(s) if s.contains("Code") => true,
+            Some(_) => false,   // an r-x `…Data` section is data, not code
+            None => perms_exec, // DefaultSection / ExternalSection / no semantics
+        };
         out.push((s, e, name, exec));
     }
     out
@@ -216,7 +237,7 @@ impl Ctx {
             return Err(format!("{instance:?} / {target_sel} has no functions"));
         }
 
-        let (mut addr_by_name, data_names) = bn.symbols_checked()?;
+        let (mut addr_by_name, mut data_names) = bn.symbols_checked()?;
         let mut func_names = HashSet::new();
         let mut name_by_addr = HashMap::new();
         let mut display_by_name = HashMap::new();
@@ -233,6 +254,19 @@ impl Ctx {
             name_by_addr
                 .entry(f.addr.clone())
                 .or_insert_with(|| f.name.clone());
+        }
+        // Named *internal* data symbols the exports list omits — e.g. a global
+        // you renamed from `data_<hex>` to something meaningful. Without these,
+        // renaming a data global makes it stop being a hotspot (w/b skip it, p/x
+        // can't target it). Best-effort:
+        // an empty result just falls back to exports + `data_<hex>` recognition.
+        // Inserted before the name_by_addr fill below so it picks them up too.
+        for (addr, name) in bn.data_symbols() {
+            if name.is_empty() || func_names.contains(&name) {
+                continue;
+            }
+            data_names.insert(name.clone());
+            addr_by_name.entry(name).or_insert(addr);
         }
         for (name, addr) in &addr_by_name {
             name_by_addr
@@ -374,7 +408,49 @@ pub fn scan_recent(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_recent_for_target, sec_rank, target_key};
+    use super::{parse_section_ranges, scan_recent_for_target, sec_rank, target_key};
+
+    fn ranges(lines: &[&str]) -> Vec<(u64, u64, String, bool)> {
+        parse_section_ranges(&lines.iter().map(|l| l.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn section_exec_classified_by_semantics_then_perms() {
+        // `bn sections` rows: `start-end  length  perms  semantics  name`.
+        let rows = ranges(&[
+            "0x1000-0x2000      4096  r-x  ReadOnlyCode          .text",
+            "0x2000-0x3000      4096  r--  ReadOnlyData          .rodata",
+            "0x3000-0x4000      4096  rw-  ReadWriteData         .data",
+        ]);
+        assert_eq!(rows[0].3, true, ".text (ReadOnlyCode) is executable");
+        assert_eq!(rows[1].3, false, ".rodata (ReadOnlyData) is not code");
+        assert_eq!(rows[2].3, false, ".data (ReadWriteData) is not code");
+    }
+
+    #[test]
+    fn code_section_with_default_semantics_falls_back_to_perms() {
+        // A firmware/mapped view can label an executable section `DefaultSection`
+        // (non-committal semantics): the perms x-bit must still classify it as
+        // code, or every call target there stops decompiling.
+        let rows = ranges(&["0x8000-0x20000      98304  r-x  DefaultSection        .flash"]);
+        assert_eq!(rows[0].3, true, "r-x DefaultSection is code via perms");
+
+        // Non-executable DefaultSection (no x-bit) stays data.
+        let ro = ranges(&["0x8000-0x9000      4096  r--  DefaultSection        .meta"]);
+        assert_eq!(ro[0].3, false);
+    }
+
+    #[test]
+    fn section_row_without_perms_column_still_parses() {
+        // A section with no backing segment omits perms entirely, so the row has
+        // one fewer column — a fixed-index parse would read the name as the
+        // semantics. Content-based classification must not shift.
+        let rows = ranges(&["0x0-0x1000      4096  ExternalSection        .extern"]);
+        assert_eq!(rows[0].0, 0x0);
+        assert_eq!(rows[0].1, 0x1000);
+        assert_eq!(rows[0].2, ".extern");
+        assert_eq!(rows[0].3, false, "no perms, non-committal semantics → data");
+    }
 
     #[test]
     fn target_key_strips_path_hash_and_extension() {

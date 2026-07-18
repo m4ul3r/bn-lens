@@ -20,6 +20,7 @@ impl Viewer {
                 return Exit::Stay;
             }
             Popup::Rename { .. } => return self.rename_key(key, ctx),
+            Popup::Retype { .. } => return self.retype_key(key, ctx),
             Popup::Comment { .. } => return self.comment_key(key, ctx),
             Popup::Tag { .. } => return self.tag_key(key, ctx),
             Popup::None => {}
@@ -118,9 +119,149 @@ impl Viewer {
         }
     }
 
-    fn comment_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
-        let Popup::Comment { target, buf } = &mut self.popup else {
+    /// Max autocomplete suggestions shown/navigable in the retype composer.
+    const RETYPE_SUGGESTIONS: usize = 6;
+
+    fn retype_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter => return self.retype_commit(ctx),
+            // ^P: preview/validate the type without committing.
+            KeyCode::Char('p') if control => self.retype_check(ctx),
+            // Tab accepts the highlighted suggestion; ↑/↓ move the highlight.
+            KeyCode::Tab => self.retype_accept_suggestion(),
+            KeyCode::Down => self.retype_move_suggestion(1),
+            KeyCode::Up => self.retype_move_suggestion(-1),
+            KeyCode::Esc => self.popup = Popup::None,
+            KeyCode::Backspace => {
+                if let Popup::Retype {
+                    buf, checked, sel, ..
+                } = &mut self.popup
+                {
+                    buf.pop();
+                    *checked = None;
+                    *sel = 0;
+                }
+            }
+            KeyCode::Char(ch) if !control => {
+                if let Popup::Retype {
+                    buf, checked, sel, ..
+                } = &mut self.popup
+                {
+                    buf.push(ch);
+                    *checked = None;
+                    *sel = 0;
+                }
+            }
+            _ => {}
+        }
+        Exit::Stay
+    }
+
+    /// Enter: validate the new type via `--preview` and, only if it parses,
+    /// commit the retype. An invalid type shows the parser error and stays open.
+    fn retype_commit(&mut self, ctx: &Ctx) -> Exit {
+        let Popup::Retype {
+            func,
+            var,
+            old_type,
+            buf,
+            ..
+        } = &self.popup
+        else {
             return Exit::Stay;
+        };
+        let (func, var, old, new) = (
+            func.clone(),
+            var.clone(),
+            old_type.trim().to_string(),
+            buf.trim().to_string(),
+        );
+        if new.is_empty() || new == old {
+            self.popup = Popup::None;
+            return Exit::Stay;
+        }
+        if let Err(message) = ctx.bn.local_retype_check(&func, &var, &new) {
+            if let Popup::Retype { checked, .. } = &mut self.popup {
+                *checked = Some(Err(message));
+            }
+            return Exit::Stay;
+        }
+        self.popup = Popup::None;
+        if ctx.bn.local_retype(&func, &var, &new) {
+            self.status = format!(" ✓ retyped {var} → {new}   (`bn save` to persist)");
+            // Re-decompile so the new type (and any casts it removes) render.
+            Exit::ReloadView
+        } else {
+            self.status = format!(" ✗ retype {var} → {new} failed");
+            Exit::Stay
+        }
+    }
+
+    /// `^P`: validate the current type without committing, storing the verdict.
+    fn retype_check(&mut self, ctx: &Ctx) {
+        let Popup::Retype { func, var, buf, .. } = &self.popup else {
+            return;
+        };
+        let (func, var, new) = (func.clone(), var.clone(), buf.trim().to_string());
+        let result = if new.is_empty() {
+            Ok(())
+        } else {
+            ctx.bn.local_retype_check(&func, &var, &new)
+        };
+        if let Popup::Retype { checked, .. } = &mut self.popup {
+            *checked = Some(result);
+        }
+    }
+
+    fn retype_accept_suggestion(&mut self) {
+        if let Popup::Retype {
+            buf,
+            types,
+            sel,
+            checked,
+            ..
+        } = &mut self.popup
+        {
+            let matches = super::hotspots::type_matches(types, buf, Self::RETYPE_SUGGESTIONS);
+            if let Some(pick) = matches.get(*sel).or_else(|| matches.first()) {
+                *buf = pick.clone();
+                *checked = None;
+                *sel = 0;
+            }
+        }
+    }
+
+    fn retype_move_suggestion(&mut self, delta: i32) {
+        if let Popup::Retype {
+            buf, types, sel, ..
+        } = &mut self.popup
+        {
+            let count = super::hotspots::type_matches(types, buf, Self::RETYPE_SUGGESTIONS).len();
+            if count > 0 {
+                *sel = (*sel as i32 + delta).rem_euclid(count as i32) as usize;
+            }
+        }
+    }
+
+    fn comment_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
+        let wrap = self.comment_wrap.get().max(1);
+        let Popup::Comment {
+            target,
+            buf,
+            cursor,
+        } = &mut self.popup
+        else {
+            return Exit::Stay;
+        };
+        let len = buf.chars().count();
+        // Byte offset of char index `i` (== buf.len() at the end), for editing at
+        // the caret without splitting a multi-byte char.
+        let byte_at = |buf: &str, i: usize| {
+            buf.char_indices()
+                .nth(i)
+                .map(|(b, _)| b)
+                .unwrap_or(buf.len())
         };
         match key.code {
             KeyCode::Enter => {
@@ -136,18 +277,36 @@ impl Viewer {
                 if ok {
                     self.status =
                         format!(" ✓ comment set {}   (`bn save` to persist)", target.label());
-                    // Refresh the viewer and every cached list (especially
-                    // Marks) so a lens mutation is never stale on return.
-                    return Exit::Reload;
+                    // Reload just this view so the comment renders inline. A
+                    // comment doesn't touch ctx maps, and Marks rebuilds when
+                    // next opened — so skip the full worker refresh + its stall.
+                    return Exit::ReloadView;
                 } else {
                     self.status = format!(" ✗ comment {} failed", target.label());
                 }
             }
             KeyCode::Esc => self.popup = Popup::None,
+            KeyCode::Left => *cursor = cursor.saturating_sub(1),
+            KeyCode::Right => *cursor = (*cursor + 1).min(len),
+            KeyCode::Home => *cursor = 0,
+            KeyCode::End => *cursor = len,
+            KeyCode::Up => *cursor = cursor.saturating_sub(wrap),
+            KeyCode::Down => *cursor = (*cursor + wrap).min(len),
             KeyCode::Backspace => {
-                buf.pop();
+                if *cursor > 0 {
+                    buf.remove(byte_at(buf, *cursor - 1));
+                    *cursor -= 1;
+                }
             }
-            KeyCode::Char(ch) => buf.push(ch),
+            KeyCode::Delete => {
+                if *cursor < len {
+                    buf.remove(byte_at(buf, *cursor));
+                }
+            }
+            KeyCode::Char(ch) => {
+                buf.insert(byte_at(buf, *cursor), ch);
+                *cursor += 1;
+            }
             _ => {}
         }
         Exit::Stay
@@ -168,7 +327,9 @@ impl Viewer {
                 if ok {
                     self.status =
                         format!(" ✓ bookmarked {}   (`bn save` to persist)", target.label());
-                    return Exit::Reload;
+                    // Live tag; no ctx change — reload just this view (Marks
+                    // refreshes on its next open) instead of a full rebuild.
+                    return Exit::ReloadView;
                 } else {
                     self.status = format!(" ✗ tag {} failed", target.label());
                 }
@@ -224,9 +385,26 @@ impl Viewer {
         for _ in 0..line_count {
             line = (line + direction).rem_euclid(line_count as i64);
             let candidate = line as usize;
-            if self.line_text(candidate).to_lowercase().contains(&query) {
+            let original = self.line_text(candidate);
+            let lower = original.to_lowercase();
+            if lower.contains(&query) {
                 self.cline = candidate;
                 self.top = candidate.saturating_sub(3);
+                // Select the *matched* token's hotspot (if the match lands on
+                // one) so `g` follows the call you searched for instead of the
+                // line's leftmost hotspot. The column is a char count into the
+                // lowercased line; that equals the original-line column (which
+                // spans/covering_span use) only when lowercasing preserves
+                // length — true for ASCII, i.e. all of decompiled C outside
+                // string bytes. If some char folded to a different length, skip
+                // the selection rather than land it a column off. A match off
+                // any hotspot clears the selection, falling back to the default.
+                let aligned = original.chars().count() == lower.chars().count();
+                self.active = aligned
+                    .then(|| lower.find(&query))
+                    .flatten()
+                    .map(|byte| lower[..byte].chars().count())
+                    .and_then(|col| super::hotspots::covering_span(&self.spans, candidate, col));
                 let rank = hits
                     .iter()
                     .position(|&hit| hit == candidate)
@@ -264,6 +442,10 @@ impl Viewer {
             // and every local (including v0_2-style temps — those get renamed).
             KeyCode::Char('w') | KeyCode::Tab => self.next_symbol(ctx, 1),
             KeyCode::Char('b') | KeyCode::BackTab => self.next_symbol(ctx, -1),
+            // `W`/`B`: step only call/jump targets, skipping locals and data —
+            // for following control flow without stopping on every temp.
+            KeyCode::Char('W') => self.next_call(ctx, 1),
+            KeyCode::Char('B') => self.next_call(ctx, -1),
             // Nav history (browser jumplist) — not in-view motion.
             KeyCode::Char('o') if control => return self.back(ctx),
             KeyCode::Char('f') if control => {
@@ -286,7 +468,8 @@ impl Viewer {
             KeyCode::Char('S') => self.open_stack_view(),
             KeyCode::Char('x') => self.open_xrefs(ctx),
             KeyCode::Char('n') => self.open_rename(ctx),
-            KeyCode::Char(';') => self.open_comment(),
+            KeyCode::Char('y') => self.open_retype(ctx),
+            KeyCode::Char(';') => self.open_comment(ctx),
             KeyCode::Char('t') => self.open_tag(),
             KeyCode::Char('i') => self.cycle_il(ctx, 1),
             KeyCode::Char('I') => self.cycle_il(ctx, -1),
@@ -375,6 +558,10 @@ impl Viewer {
     /// and re-fetches its blocks at the new IL. From an xrefs view, enter the
     /// current IL linearly (no cycle).
     fn cycle_il(&mut self, ctx: &Ctx, direction: i32) {
+        // The data view has no IL rendering; `i`/`I` are no-ops there.
+        if self.view == View::Data {
+            return;
+        }
         if self.view != View::Xrefs {
             let order = [View::Decomp, View::Mlil, View::Disasm];
             let current = order
@@ -393,6 +580,10 @@ impl Viewer {
     /// `v`: flip linear ⇄ CFG for the current function, keeping the IL
     /// rendering across the flip. From an xrefs view, enter the CFG.
     fn toggle_cfg(&mut self, ctx: &Ctx) {
+        // No CFG for a data address; `v` is a no-op in the data view.
+        if self.view == View::Data {
+            return;
+        }
         self.view = if self.view == View::Cfg {
             self.code_view
         } else {
@@ -492,12 +683,31 @@ impl Viewer {
             return;
         }
         // `tab_stops` is non-empty whenever `spans` is (it falls back to every
-        // span), so indexing `stops` below is safe.
+        // span), so `step_stops` always lands on a stop.
         let stops = super::hotspots::tab_stops(&self.spans, ctx.display_name(&self.name));
-        // Only ring-step from a *deliberate* selection (Tab or click) that is
-        // itself a stop on the cursor line. A span merely derived from the
-        // cursor line (arrived via search or j/k) must not be stepped past —
-        // otherwise the first Tab after a `/find` skips the match's own hotspot.
+        self.step_stops(stops, direction);
+    }
+
+    /// `W`/`B`: step only call/jump targets (functions and code addresses),
+    /// skipping locals and data — for following control flow without stopping on
+    /// every temp. Reports when the view has no calls (no ring to step).
+    fn next_call(&mut self, ctx: &Ctx, direction: i32) {
+        let stops = super::hotspots::call_stops(&self.spans, ctx.display_name(&self.name));
+        if stops.is_empty() {
+            self.status = " no calls or code targets in this view".into();
+            return;
+        }
+        self.step_stops(stops, direction);
+    }
+
+    /// Shared stepping for `next_symbol`/`next_call`: ring-step from a
+    /// *deliberate* selection (Tab/click, or a `/find` that selected a token) on
+    /// the cursor line, else land on the nearest stop — preferring one on the
+    /// cursor line (the `j`/`k`-then-step case). `stops` must be non-empty.
+    fn step_stops(&mut self, stops: Vec<usize>, direction: i32) {
+        if stops.is_empty() {
+            return;
+        }
         let active_pos = self
             .active
             .filter(|&index| self.spans.get(index).is_some_and(|s| s.line == self.cline))

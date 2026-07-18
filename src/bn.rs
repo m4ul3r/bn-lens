@@ -229,6 +229,16 @@ struct DecompiledFn {
     function: FnRef,
 }
 
+/// A function's existing comments, split by where BN stores them: its dedicated
+/// `function_doc` string and any comment at the entry `address`. Both render
+/// atop the function; `;` edits whichever is present.
+#[derive(Clone, Default)]
+pub struct FuncComment {
+    pub doc: String,
+    pub entry_addr: String,
+    pub entry_comment: Option<String>,
+}
+
 /// One annotation for the Marks view — a comment or a tag, unified.
 #[derive(Clone)]
 pub struct Mark {
@@ -486,6 +496,55 @@ struct PyEnvelope {
     stdout: String,
 }
 
+/// One typed data variable recovered from BN's `data_vars`, with its address,
+/// symbol (if named), type, current value, and — for pointers — the target it
+/// points at (symbolized, or a string preview). The building block of the
+/// structured data-section view: a data address reads as a struct field.
+#[derive(Clone, Deserialize)]
+pub struct DataVar {
+    #[serde(rename = "a")]
+    pub addr: String,
+    #[serde(rename = "n", default)]
+    pub name: String,
+    #[serde(rename = "t", default)]
+    pub type_name: String,
+    #[serde(rename = "w", default)]
+    pub width: u64,
+    /// Decoded value for scalars ≤ 8 bytes (unsigned); `None` for aggregates.
+    #[serde(rename = "v", default)]
+    pub value: Option<i64>,
+    /// Pointer target address (`0x…`), when the type is a pointer.
+    #[serde(rename = "p", default)]
+    pub ptr: Option<String>,
+    /// Symbol at the pointer target, if any.
+    #[serde(rename = "ps", default)]
+    pub ptr_sym: Option<String>,
+    /// ASCII string at the pointer target, if any (preview, truncated).
+    #[serde(rename = "pstr", default)]
+    pub ptr_str: Option<String>,
+    /// Section name the variable lives in (for boundary headers).
+    #[serde(rename = "sec", default)]
+    pub section: String,
+}
+
+#[derive(Deserialize)]
+struct DataMapJson {
+    #[serde(default)]
+    vars: Vec<DataVar>,
+}
+
+#[derive(Deserialize)]
+struct DataSym {
+    a: String,
+    n: String,
+}
+
+#[derive(Deserialize)]
+struct DataSymsJson {
+    #[serde(default)]
+    syms: Vec<DataSym>,
+}
+
 /// The `bn py exec` program that walks a function's basic blocks and prints the
 /// CFG as JSON. `{IDENT}` is replaced with a single-quote-escaped identifier;
 /// `{IL}` with the rendering level (`asm`/`mlil`/`hlil`). For IL levels the
@@ -524,6 +583,74 @@ if fn is not None:
                  for e in bb.outgoing_edges if e.target is not None]
         blocks.append({'start': hex(bb.start), 'insns': insns, 'edges': edges})
 print(json.dumps({'blocks': blocks}))
+"#;
+
+/// The `bn py exec` program that enumerates BN's typed data variables in the
+/// half-open address window `[{LO}, {HI})` and prints them as JSON. Each var
+/// carries its address, symbol, type string, width, decoded scalar value, and —
+/// for pointer types — the target (symbolized, or a short ASCII preview) and its
+/// section. Bounded to 400 rows so a huge `.rodata` window can't flood output.
+const DATA_MAP_PROGRAM: &str = r#"
+import json
+lo = int('{LO}', 16); hi = int('{HI}', 16)
+psz = bv.address_size
+mask = (1 << (psz * 8)) - 1
+out = []
+for a in sorted(bv.data_vars):
+    if a < lo or a >= hi:
+        continue
+    dv = bv.data_vars[a]
+    t = dv.type
+    try:
+        w = int(t.width)
+    except Exception:
+        w = 0
+    sym = bv.get_symbol_at(a)
+    ts = str(t)
+    row = {'a': hex(a), 'n': sym.name if sym else '', 't': ts, 'w': w}
+    secs = bv.get_sections_at(a)
+    if secs:
+        row['sec'] = secs[0].name
+    try:
+        # Treat only a pointer-*sized* pointer type as a single pointer. An
+        # array of pointers (e.g. `void* [8]`, width = 8*psz) also contains '*'
+        # but must NOT collapse to its first element — leave it untyped so the
+        # renderer shows the whole array as bytes instead of hiding elements.
+        if '*' in ts and w == psz:
+            tgt = bv.read_int(a, psz) & mask
+            row['p'] = hex(tgt)
+            tsym = bv.get_symbol_at(tgt)
+            if tsym:
+                row['ps'] = tsym.name
+            else:
+                s = bv.get_ascii_string_at(tgt, 2)
+                if s:
+                    row['pstr'] = s.value[:48]
+        elif '*' not in ts and 0 < w <= 8:
+            row['v'] = bv.read_int(a, w)
+    except Exception:
+        pass
+    out.append(row)
+    if len(out) >= 400:
+        break
+print(json.dumps({'vars': out}))
+"#;
+
+/// The `bn py exec` program that lists every *named* data symbol (address +
+/// name), including internal ones the exports list omits — so a renamed data
+/// global stays interactive. Degrades to an empty list if the enum import fails.
+const DATA_SYMBOLS_PROGRAM: &str = r#"
+import json
+try:
+    from binaryninja import SymbolType
+    syms = bv.get_symbols_of_type(SymbolType.DataSymbol)
+except Exception:
+    syms = []
+out = []
+for s in syms:
+    if s.name:
+        out.append({'a': hex(s.address), 'n': s.name})
+print(json.dumps({'syms': out}))
 "#;
 
 /// One entry in the Types view: a type's name and kind (`struct`/`union`/
@@ -886,6 +1013,18 @@ impl Bn {
     fn run(&self, args: &[&str]) -> String {
         self.run_checked(args)
             .unwrap_or_else(|error| format!("✗ {error}"))
+    }
+
+    /// Run `args` and return stdout *regardless of exit status* — for commands
+    /// whose useful payload is printed even when they exit non-zero, e.g. a
+    /// failed `--preview` validation whose `--summary` JSON still carries the
+    /// `first_error`. Empty when bn can't be started.
+    fn run_stdout(&self, args: &[&str]) -> String {
+        self.cmd()
+            .args(args)
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default()
     }
 
     /// Run a subcommand capturing the FULL output via `--out` to a temp file —
@@ -1262,6 +1401,40 @@ impl Bn {
             .unwrap_or_default()
     }
 
+    /// BN's typed data variables in the half-open address window `[lo, hi)`
+    /// (`0x…` strings), ascending — the backing for the structured data-section
+    /// view. Empty on any failure (bad window, py unavailable, malformed output),
+    /// so the caller can fall back to a raw byte dump.
+    pub fn data_vars(&self, lo: &str, hi: &str) -> Vec<DataVar> {
+        let program = DATA_MAP_PROGRAM.replace("{LO}", lo).replace("{HI}", hi);
+        let out = self.run_out(&["py", "exec", "--format", "json", "--code", &program]);
+        serde_json::from_str::<PyEnvelope>(&out)
+            .ok()
+            .and_then(|env| serde_json::from_str::<DataMapJson>(&env.stdout).ok())
+            .map(|d| d.vars)
+            .unwrap_or_default()
+    }
+
+    /// `(address, name)` for every named data symbol — including internal ones
+    /// the exports list omits — so a renamed data global stays interactive
+    /// (hotspots, peek, xref). Via `bn py exec`; empty on failure, in which case
+    /// the lens degrades to exports + `data_<hex>` recognition.
+    pub fn data_symbols(&self) -> Vec<(String, String)> {
+        let out = self.run_out(&[
+            "py",
+            "exec",
+            "--format",
+            "json",
+            "--code",
+            DATA_SYMBOLS_PROGRAM,
+        ]);
+        serde_json::from_str::<PyEnvelope>(&out)
+            .ok()
+            .and_then(|env| serde_json::from_str::<DataSymsJson>(&env.stdout).ok())
+            .map(|d| d.syms.into_iter().map(|s| (s.a, s.n)).collect())
+            .unwrap_or_default()
+    }
+
     /// Export aliases -> address, plus every data-symbol alias.
     pub fn symbols_checked(&self) -> Result<(HashMap<String, String>, HashSet<String>), String> {
         let mut addr = HashMap::new();
@@ -1424,6 +1597,44 @@ impl Bn {
         mutation_ok(&out)
     }
 
+    /// Retype a local (`bn local retype`). Live in-memory; not persisted until a
+    /// deliberate `bn save`. Returns whether it committed.
+    pub fn local_retype(&self, func: &str, var: &str, new_type: &str) -> bool {
+        let out = self.run(&["local", "retype", func, var, new_type, "--summary"]);
+        mutation_ok(&out)
+    }
+
+    /// Validate a retype *without* committing (`--preview`: apply, diff, revert).
+    /// `Ok(())` if the type parses and applies cleanly, else the parser error —
+    /// so the composer can confirm a change before it touches the instance.
+    pub fn local_retype_check(&self, func: &str, var: &str, new_type: &str) -> Result<(), String> {
+        // stdout carries the `--summary` JSON (with `first_error`) even when a
+        // bad type makes bn exit non-zero, so read it regardless of exit status.
+        let out = self.run_stdout(&[
+            "local",
+            "retype",
+            func,
+            var,
+            new_type,
+            "--preview",
+            "--summary",
+        ]);
+        for line in out.lines() {
+            if let Ok(summary) = serde_json::from_str::<MutationSummaryJson>(line.trim()) {
+                return if summary.success {
+                    Ok(())
+                } else {
+                    Err(clean_err(
+                        &summary
+                            .first_error
+                            .unwrap_or_else(|| "type rejected".into()),
+                    ))
+                };
+            }
+        }
+        Err("no response from bn".into())
+    }
+
     /// Rename a function symbol (`ident` = name or address). Live in-memory,
     /// like [`local_rename`]; not persisted until a deliberate `bn save`.
     pub fn symbol_rename(&self, ident: &str, new: &str) -> bool {
@@ -1435,6 +1646,64 @@ impl Bn {
     pub fn comment_set_addr(&self, addr: &str, text: &str) -> bool {
         let out = self.run(&["comment", "set", addr, text, "--summary"]);
         mutation_ok(&out)
+    }
+
+    /// The comment currently at `addr` (`comment get`), for edit-in-place.
+    /// `None` when there is none (or on failure).
+    pub fn comment_get_addr(&self, addr: &str) -> Option<String> {
+        let out = self.run_stdout(&["comment", "get", addr, "--format", "json"]);
+        let value: serde_json::Value = serde_json::from_str(out.trim()).ok()?;
+        if value
+            .get("has_comment")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            value
+                .get("comment")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        } else {
+            None
+        }
+    }
+
+    /// A function's existing annotation: BN's separate `function_doc`, plus any
+    /// comment sitting at the entry address (which BN *also* renders atop the
+    /// function — e.g. one added with `bn comment set <entry>`). Lets `;` edit
+    /// whichever note is actually shown, in place.
+    pub fn comment_get_func(&self, func: &str) -> FuncComment {
+        let out = self.run_stdout(&["comment", "get", "--function", func, "--format", "json"]);
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(out.trim()) else {
+            return FuncComment::default();
+        };
+        let doc = value
+            .get("function_doc")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let entry_addr = value
+            .get("address")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let entry_comment = value
+            .get("comments")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| {
+                items.iter().find_map(|item| {
+                    let addr = item.get("address").and_then(serde_json::Value::as_str)?;
+                    (addr == entry_addr)
+                        .then(|| item.get("comment").and_then(serde_json::Value::as_str))
+                        .flatten()
+                        .map(str::to_string)
+                })
+            });
+        FuncComment {
+            doc,
+            entry_addr,
+            entry_comment,
+        }
     }
 
     /// Set a function's documentation comment (shown atop the function).
@@ -1482,6 +1751,19 @@ impl Bn {
             "(no data)".into()
         } else {
             s
+        }
+    }
+
+    /// Like [`Self::read`] but via `--out`, so a large window (the linear data
+    /// view can request several KB) doesn't trip bn's stdout spill envelope.
+    /// Empty on failure.
+    pub fn read_dump(&self, addr: &str, length: usize) -> String {
+        let len = length.to_string();
+        let out = self.run_out(&["read", addr, "--length", &len]);
+        if out.trim_start().starts_with('✗') {
+            String::new()
+        } else {
+            out
         }
     }
 }
