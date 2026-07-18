@@ -58,6 +58,9 @@ pub fn sink_category(name: &str) -> Option<&'static str> {
         ("execvpe", "command"),
         ("execve", "command"),
         ("execveat", "command"),
+        ("fexecve", "command"),
+        ("posix_spawn", "command"),
+        ("posix_spawnp", "command"),
         ("wordexp", "command"),
         ("printf", "format"),
         ("fprintf", "format"),
@@ -755,6 +758,9 @@ mod tests {
         assert_eq!(sink_category("strcpy"), Some("buffer"));
         assert_eq!(sink_category("system"), Some("command"));
         assert_eq!(sink_category("execve"), Some("command"));
+        assert_eq!(sink_category("posix_spawn"), Some("command"));
+        assert_eq!(sink_category("posix_spawnp"), Some("command"));
+        assert_eq!(sink_category("fexecve"), Some("command"));
         assert_eq!(sink_category("snprintf"), Some("format"));
         assert_eq!(sink_category("recv"), Some("source"));
     }
