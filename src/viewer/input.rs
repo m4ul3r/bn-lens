@@ -16,7 +16,7 @@ impl Viewer {
                 return Exit::Stay;
             }
             Popup::Peek { .. } => {
-                self.peek_key(key);
+                self.peek_key(key, ctx);
                 return Exit::Stay;
             }
             Popup::Rename { .. } => return self.rename_key(key, ctx),
@@ -276,6 +276,8 @@ impl Viewer {
                 self.popup = Popup::Peek {
                     title: "sections  ·  r-x=exec  rw-=data  w+x flagged".into(),
                     lines: ctx.bn.sections(),
+                    tokens: None,
+                    goto: None,
                     off: 0,
                     hoff: 0,
                     focus: None,
@@ -608,9 +610,13 @@ impl Viewer {
         }
     }
 
-    fn peek_key(&mut self, key: KeyEvent) {
+    fn peek_key(&mut self, key: KeyEvent, ctx: &Ctx) {
         let Popup::Peek {
-            lines, off, hoff, ..
+            lines,
+            off,
+            hoff,
+            goto,
+            ..
         } = &mut self.popup
         else {
             return;
@@ -622,14 +628,27 @@ impl Viewer {
             .max()
             .unwrap_or(0)
             .saturating_sub(1);
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let last = lines.len().saturating_sub(1);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => self.popup = Popup::None,
+            // `g` on a function/code peek jumps to that function (Enter still
+            // just closes, matching the byte-dump/section peeks).
+            KeyCode::Char('g') if !control => {
+                if let Some(target) = goto.take() {
+                    self.popup = Popup::None;
+                    self.goto_to(ctx, target);
+                }
+            }
+            // ^D/^U page (matching the main viewer's half-page step).
+            KeyCode::Char('d') if control => *off = (*off + 10).min(last),
+            KeyCode::Char('u') if control => *off = off.saturating_sub(10),
             KeyCode::Char('j') | KeyCode::Down => {
-                *off = (*off + 1).min(lines.len().saturating_sub(1));
+                *off = (*off + 1).min(last);
             }
             KeyCode::Char('k') | KeyCode::Up => *off = off.saturating_sub(1),
             KeyCode::PageDown => {
-                *off = (*off + 10).min(lines.len().saturating_sub(1));
+                *off = (*off + 10).min(last);
             }
             KeyCode::PageUp => *off = off.saturating_sub(10),
             KeyCode::Char('l') | KeyCode::Right => *hoff = (*hoff + 8).min(max_h),

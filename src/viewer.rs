@@ -158,6 +158,14 @@ enum Popup {
     Peek {
         title: String,
         lines: Vec<String>,
+        /// Per-line pseudo-C tokenization aligned 1:1 with `lines`, used to
+        /// syntax-colour a decompile peek. `None` for plain scrollable peeks
+        /// (byte dumps, sections) which render in a flat colour.
+        tokens: Option<Vec<crate::syntax::Line>>,
+        /// The function to jump to with `g` — set only when the peek *is* a
+        /// function's decompile (a `Func`/code-address peek). `None` for data
+        /// dumps and section lists, where there's nothing to open.
+        goto: Option<String>,
         off: usize,
         /// Horizontal scroll (chars) so a long line — e.g. a call whose trailing
         /// `length` argument would otherwise clip off the right edge — can be

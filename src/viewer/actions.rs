@@ -221,7 +221,7 @@ impl Viewer {
 
     /// Navigate to `target` (a function name or code address), pushing the nav
     /// stack. From an xrefs view, land on the *use* of the current symbol.
-    fn goto_to(&mut self, ctx: &Ctx, target: String) {
+    pub(super) fn goto_to(&mut self, ctx: &Ctx, target: String) {
         let landing = if self.view.is_code() {
             None
         } else {
@@ -349,6 +349,8 @@ impl Viewer {
         self.popup = Popup::Peek {
             title: format!("peek {symbol} @ {address}"),
             lines: symbolize_dump(&dump, &ctx.name_by_addr),
+            tokens: None,
+            goto: None,
             off: 0,
             hoff: 0,
             focus: None,
@@ -383,6 +385,10 @@ impl Viewer {
             let marker = if hit { "▸ " } else { "  " };
             lines.push(format!("{marker}{}", line.text));
         }
+        // Tokenize the (marker-prefixed) body once so the peek gets the same
+        // pseudo-C colours as the main viewer; the 2-char marker tokenizes as
+        // plain, keeping alignment with `lines`.
+        let tokens = crate::syntax::tokenize_c(&lines.join("\n"));
         // Center the focused statement with a few lines of lead-in context.
         let off = first_hit.map_or(0, |index| index.saturating_sub(4));
         let display_name = ctx
@@ -398,6 +404,10 @@ impl Viewer {
         self.popup = Popup::Peek {
             title,
             lines,
+            tokens: Some(tokens),
+            // `g` jumps to the peeked function by its entry address (already a
+            // `0x…` selector from bn's JSON).
+            goto: Some(entry.clone()),
             off,
             hoff: 0,
             focus: first_hit,

@@ -11,6 +11,30 @@ use std::collections::HashMap;
 
 const GUTTER_WIDTH: u16 = 7; // "NNNN │ "
 
+/// Turn a tokenized pseudo-C line into coloured spans, dropping the first
+/// `hoff` characters (horizontal pan). Splits inside a segment when the pan
+/// lands mid-token so colours stay aligned to the panned text.
+fn pan_syntax_spans(segs: &[crate::syntax::Seg], hoff: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    for seg in segs {
+        let len = seg.text.chars().count();
+        if skipped + len <= hoff {
+            skipped += len;
+            continue;
+        }
+        let text: String = if skipped < hoff {
+            let drop = hoff - skipped;
+            skipped = hoff;
+            seg.text.chars().skip(drop).collect()
+        } else {
+            seg.text.clone()
+        };
+        out.push(Span::styled(text, theme::tok_style(seg.kind)));
+    }
+    out
+}
+
 /// Hard-wrap a composer value and retain the visible tail. The ask field is a
 /// single logical line, but hiding everything after the popup width made long
 /// prompts impossible to review before sending.
@@ -577,6 +601,8 @@ impl Viewer {
             Popup::Peek {
                 title,
                 lines,
+                tokens,
+                goto,
                 off,
                 hoff,
                 focus,
@@ -592,32 +618,45 @@ impl Viewer {
                 // horizontal offset means content is clipped — show the h/l hint.
                 let mut clipped = false;
                 for (row, line) in lines.iter().skip(*off).take(view_height).enumerate() {
-                    let focused = *focus == Some(*off + row);
-                    let style = if focused {
-                        // A highlight bar across the full inner width for the
-                        // focused statement (a decomp peek's use site).
-                        Style::default()
-                            .fg(Color::White)
-                            .bg(crate::ui::HILITE_BG)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Yellow)
-                    };
+                    let abs = *off + row;
+                    let focused = *focus == Some(abs);
                     let y = box_y + 1 + row as u16;
-                    if focused {
-                        crate::ui::put_str(buffer, box_x + 2, y, " ".repeat(inner), inner, style);
-                    }
                     // Pan horizontally: drop the first `hoff` chars before clipping.
                     let visible: String = line.chars().skip(*hoff).collect();
                     if visible.chars().count() > inner {
                         clipped = true;
                     }
-                    crate::ui::put_str(buffer, box_x + 2, y, &visible, inner, style);
+                    if focused {
+                        // A highlight bar across the full inner width for the
+                        // focused statement (a decomp peek's use site); its own
+                        // white-on-accent styling wins over syntax colours.
+                        let style = Style::default()
+                            .fg(Color::White)
+                            .bg(crate::ui::HILITE_BG)
+                            .add_modifier(Modifier::BOLD);
+                        crate::ui::put_str(buffer, box_x + 2, y, " ".repeat(inner), inner, style);
+                        crate::ui::put_str(buffer, box_x + 2, y, &visible, inner, style);
+                    } else if let Some(segs) = tokens.as_ref().and_then(|t| t.get(abs)) {
+                        // Syntax-highlight a decompile peek the same way the main
+                        // viewer colours pseudo-C.
+                        let spans = pan_syntax_spans(segs, *hoff);
+                        crate::ui::put_spans(buffer, box_x + 2, y, inner, &spans);
+                    } else {
+                        crate::ui::put_str(
+                            buffer,
+                            box_x + 2,
+                            y,
+                            &visible,
+                            inner,
+                            Style::default().fg(Color::Yellow),
+                        );
+                    }
                 }
-                let hint = if clipped || *hoff > 0 {
-                    " j/k scroll · h/l pan · 0 reset · ? help · q close "
-                } else {
-                    " j/k scroll · ? help · q close "
+                let hint = match (goto.is_some(), clipped || *hoff > 0) {
+                    (true, true) => " j/k scroll · h/l pan · 0 reset · g goto · q close ",
+                    (true, false) => " j/k scroll · g goto · ? help · q close ",
+                    (false, true) => " j/k scroll · h/l pan · 0 reset · ? help · q close ",
+                    (false, false) => " j/k scroll · ? help · q close ",
                 };
                 crate::ui::put_str(
                     buffer,
@@ -854,7 +893,8 @@ fn cfg_cell_style(col: u8, selected: bool) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::tail_wrapped_lines;
+    use super::{pan_syntax_spans, tail_wrapped_lines};
+    use crate::syntax::{Seg, Tok};
 
     #[test]
     fn ask_composer_keeps_the_wrapped_tail() {
@@ -863,5 +903,30 @@ mod tests {
             vec!["uvwxy", "z"]
         );
         assert_eq!(tail_wrapped_lines("short", 20, 2), vec!["short"]);
+    }
+
+    fn seg(text: &str, kind: Tok) -> Seg {
+        Seg {
+            text: text.into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn pan_drops_leading_chars_and_splits_mid_token() {
+        let line = vec![seg("int ", Tok::Type), seg("x", Tok::Name)];
+        // No pan: both segments survive whole.
+        let spans = pan_syntax_spans(&line, 0);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, "int ");
+        assert_eq!(spans[1].content, "x");
+        // Pan past the whole first segment (4 chars): only `x` remains.
+        let spans = pan_syntax_spans(&line, 4);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "x");
+        // Pan into the middle of the first segment: it's clipped, colour kept.
+        let spans = pan_syntax_spans(&line, 2);
+        assert_eq!(spans[0].content, "t ");
+        assert_eq!(spans[1].content, "x");
     }
 }
