@@ -202,11 +202,19 @@ impl Viewer {
         };
         let dim = Style::default().add_modifier(Modifier::DIM);
         if let Some(query) = &self.goto_input {
+            // Live completion: show the unique name Enter would jump to, or a
+            // match count, replacing the static help once the user starts typing.
+            let hint = self.goto_hint(ctx, query);
+            let tail = if hint.is_empty() {
+                "(goto 0x… / name · Enter · Esc)".to_string()
+            } else {
+                hint
+            };
             crate::ui::put_str(
                 buffer,
                 area.x,
                 area.y + 1,
-                format!(" :{query}▏   (goto 0x… / name · Enter · Esc)"),
+                format!(" :{query}▏   {tail}"),
                 code_width,
                 Style::default()
                     .fg(Color::Yellow)

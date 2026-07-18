@@ -479,6 +479,31 @@ impl Viewer {
         }
     }
 
+    /// A short live hint for the `:` goto prompt: the unique name completion
+    /// (`→ vg_revert`) or a match count for the in-progress query. Empty when the
+    /// query is blank or an address (nothing to complete). Mirrors the same
+    /// prefix resolution `goto_address` commits, so the hint never disagrees with
+    /// what Enter does.
+    pub(super) fn goto_hint(&self, ctx: &Ctx, query: &str) -> String {
+        let q = query.trim();
+        if q.is_empty() {
+            return String::new();
+        }
+        // Address inputs (`0x…` or bare hex) resolve directly — no completion.
+        let is_hex = q.starts_with("0x")
+            || q.starts_with("0X")
+            || (q.len() >= 3 && q.bytes().all(|b| b.is_ascii_hexdigit()));
+        if is_hex {
+            return String::new();
+        }
+        match match_name_prefix(ctx.addr_by_name.keys().map(String::as_str), q) {
+            NameMatch::Unique(name) if name.eq_ignore_ascii_case(q) => String::new(),
+            NameMatch::Unique(name) => format!("→ {name}"),
+            NameMatch::Ambiguous(count) => format!("· {count} matches"),
+            NameMatch::None => "· no match".to_string(),
+        }
+    }
+
     /// Turn a `:`-entered token into a canonical `0x…` address: a known symbol
     /// wins over a hex reading (so `add` stays a symbol), then `0x…`/bare-hex
     /// parse as hex, else fall back to the general symbol resolver. `None` when
