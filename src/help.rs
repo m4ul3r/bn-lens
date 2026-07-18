@@ -204,6 +204,11 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "STRINGS",
+        key: "f",
+        action: "toggle format-strings-only (printf-sink surface); ⚠%n marks write primitives",
+    },
+    HelpLine::Entry {
+        scope: "STRINGS",
         key: "p",
         action: "peek uses (exact asm + approximate mapped C at each site)",
     },
@@ -220,7 +225,7 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "STRINGS",
         key: "Esc / q",
-        action: "clear filter, then back to symbols / quit",
+        action: "clear filter, then format filter, then back to symbols / quit",
     },
     HelpLine::Section("IMPORTS"),
     HelpLine::Entry {
@@ -497,7 +502,7 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "VIEWER",
         key: ":",
-        action: "goto address or symbol (0x… / name) — lands in the containing function, keeps the IL level",
+        action: "goto address or symbol (0x… / name; unique name prefix completes) — lands in the containing function, keeps the IL level",
     },
     HelpLine::Entry {
         scope: "VIEWER",
