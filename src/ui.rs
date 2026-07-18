@@ -5,13 +5,14 @@ use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-/// Background of the header bar (a dark slate that reads on light + dark themes).
-pub const BAR_BG: Color = Color::Rgb(38, 44, 66);
+/// Background of the header bar. Solid black for maximum text contrast
+/// (matches the CFG expand panel).
+pub const BAR_BG: Color = Color::Black;
 
-/// Popup panel colours — a slightly raised slate over the header, with a light
-/// default foreground so content that sets no colour of its own stays legible
-/// (and doesn't fall back to a terminal default fg that could vanish on the bg).
-pub const POPUP_BG: Color = Color::Rgb(48, 55, 82);
+/// Popup panel colours — a solid black fill, with a light default foreground
+/// so content that sets no colour of its own stays legible (and doesn't fall
+/// back to a terminal default fg that could vanish on the bg).
+pub const POPUP_BG: Color = Color::Black;
 pub const POPUP_FG: Color = Color::Rgb(216, 221, 233);
 
 /// Selection/focus bar background inside a popup (an accent blue that reads on
