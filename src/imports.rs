@@ -94,10 +94,13 @@ pub fn sink_category(name: &str) -> Option<&'static str> {
         return Some(cat);
     }
 
-    // Wrapper detection at segment boundaries. These tokens never occur as a
-    // substring of an unrelated identifier, so any underscore-segment match is a
-    // real wrapper (`my_strcpy`, `bsp_MemCpy`). `system` is excluded here — it
-    // *does* prefix benign names (`system_property_get`) — and handled below.
+    // Wrapper detection at segment boundaries. `SEG` tokens are specific enough
+    // that a match on *any* whole underscore-segment is a real wrapper
+    // (`my_strcpy`, `bsp_MemCpy`, `svc_fgets`). Substring hits never count — only
+    // whole segments. `read` is deliberately absent: it's a common benign segment
+    // (`reg_read`, `spi_read`, `read_config`) — only the exact `read` import above
+    // flags. `sscanf` is likewise absent: it parses an existing buffer, so it's a
+    // taint *propagator*, not an input origin.
     const SEG: &[(&str, &str)] = &[
         ("strcpy", "buffer"),
         ("strncpy", "buffer"),
@@ -115,6 +118,25 @@ pub fn sink_category(name: &str) -> Option<&'static str> {
         ("execvp", "command"),
         ("execvpe", "command"),
         ("execve", "command"),
+        // Input sources whose token is unambiguous as *any* segment.
+        ("recvfrom", "source"),
+        ("recvmsg", "source"),
+        ("readlink", "source"),
+        ("readlinkat", "source"),
+        ("fgets", "source"),
+        ("getenv", "source"),
+    ];
+    // `SEG_LAST` tokens *do* collide with benign non-final segments — `recv` in
+    // `rtw_init_recv_priv`, `scanf` in the newlib `scanf_float` internals, `fread`
+    // in flash-register names like `spi_mem_fread_qio`, `system` in
+    // `system_property_get`. Trust them only as the *trailing* segment, which
+    // still catches real wrappers (`net_recv`, `safe_fread`, `tsk_sys_System`).
+    const SEG_LAST: &[(&str, &str)] = &[
+        ("recv", "source"),
+        ("scanf", "source"),
+        ("fscanf", "source"),
+        ("fread", "source"),
+        ("system", "command"),
     ];
     let segs: Vec<&str> = lower.split('_').collect();
     for seg in &segs {
@@ -122,10 +144,10 @@ pub fn sink_category(name: &str) -> Option<&'static str> {
             return Some(cat);
         }
     }
-    // `system` only as the *trailing* segment (`tsk_sys_System`) — so a name
-    // that merely starts with or contains "system" as a prefix does not flag.
-    if segs.last() == Some(&"system") {
-        return Some("command");
+    if let Some(last) = segs.last() {
+        if let Some((_, cat)) = SEG_LAST.iter().find(|(tok, _)| tok == last) {
+            return Some(cat);
+        }
     }
     None
 }
@@ -784,9 +806,13 @@ mod tests {
     fn new_sinks_do_not_overflag_lookalikes() {
         // bounded/benign neighbours of the new entries must stay clean
         assert_eq!(sink_category("getcwd"), None); // takes a size arg
-        assert_eq!(sink_category("readlinkat_helper"), None); // not a segment token
         assert_eq!(sink_category("realpathname"), None); // substring, not exact
+        // `wprintf`/`realpath`/`getwd` are exact-only (not segment tokens), so a
+        // wrapper suffix does not flag them
         assert_eq!(sink_category("wprintf_wrapper"), None);
+        assert_eq!(sink_category("realpath_cached"), None);
+        // but `readlinkat` *is* a segment source token, so a wrapper does flag
+        assert_eq!(sink_category("readlinkat_helper"), Some("source"));
     }
 
     #[test]
@@ -794,6 +820,34 @@ mod tests {
         assert_eq!(sink_category("tsk_sys_System"), Some("command"));
         assert_eq!(sink_category("my_strcpy_safe"), Some("buffer"));
         assert_eq!(sink_category("bsp_MemCpy"), Some("buffer"));
+    }
+
+    #[test]
+    fn catches_source_wrappers_but_not_benign_read_segments() {
+        // specific tokens flag as sources on any whole segment
+        assert_eq!(sink_category("sock_recvfrom"), Some("source"));
+        assert_eq!(sink_category("svc_fgets"), Some("source"));
+        assert_eq!(sink_category("app_readlink"), Some("source"));
+        assert_eq!(sink_category("cfg_getenv"), Some("source"));
+        // colliding tokens flag only as the *trailing* segment
+        assert_eq!(sink_category("net_recv"), Some("source"));
+        assert_eq!(sink_category("safe_fread"), Some("source"));
+        assert_eq!(sink_category("uart_scanf"), Some("source"));
+        // …and are rejected mid-name, where they're benign firmware identifiers
+        // (real collisions surfaced by an adversarial review)
+        assert_eq!(sink_category("rtw_init_recv_priv"), None); // recv init state
+        assert_eq!(sink_category("scanf_float"), None); // newlib internal
+        assert_eq!(sink_category("spi_mem_fread_qio"), None); // flash register
+        // `read` is intentionally NOT a segment token — these stay clean
+        assert_eq!(sink_category("reg_read"), None);
+        assert_eq!(sink_category("spi_read"), None);
+        assert_eq!(sink_category("read_config"), None);
+        assert_eq!(sink_category("thread_create"), None);
+        // `sscanf` is a propagator, not an origin — not inferred from a wrapper
+        assert_eq!(sink_category("proto_sscanf"), None);
+        // partial/substring tokens don't flag — must be a whole segment
+        assert_eq!(sink_category("get_environment"), None);
+        assert_eq!(sink_category("recovery"), None);
     }
 
     #[test]

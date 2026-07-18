@@ -139,6 +139,14 @@ mistaken for a catalog fact. Full heuristic-fallback mode (no catalog) is unchan
 discloses it globally; rows aren't individually dimmed). Pure `resolve_roles` is unit-tested for
 catalog-hit-authoritative vs catalog-miss-hint vs no-catalog behavior.
 
+The segment-boundary wrapper matcher now also covers **source** tokens, in two tiers (hardened by an
+adversarial review against real firmware collisions): specific tokens (`recvfrom`/`recvmsg`,
+`readlink`/`readlinkat`, `fgets`, `getenv`) match on *any* whole segment, while colliding tokens
+(`recv`, `scanf`, `fscanf`, `fread`, and `system`) match only as the *trailing* segment — so `net_recv`
+/ `safe_fread` / `tsk_sys_System` flag but `rtw_init_recv_priv` / `scanf_float` / `spi_mem_fread_qio`
+don't. Bare `read` is excluded (benign: `reg_read`, `spi_read`), and `sscanf` is excluded as a taint
+propagator (parses an existing buffer), not an origin.
+
 **Possible follow-ups:** `realpath(path, NULL)` self-allocates (safe mode) so the `hint:buffer` label
 slightly overflags that case — acceptable while framed as a hint, but a fortified/arg-aware refinement
 could sharpen it. A catalog-side suppression/coverage marker (tombstone) would let the producer mark an
