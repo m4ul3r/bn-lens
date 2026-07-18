@@ -351,12 +351,21 @@ impl ImportsList {
         self.usage.is_some()
     }
 
+    /// Catalog-modeled sinks only — heuristic gap-fills are counted as `hint`s,
+    /// not folded into the authoritative total (they'd otherwise inflate it and
+    /// read as catalog facts). Same for `source_count`.
     fn sink_count(&self) -> usize {
-        self.items.iter().filter(|it| it.is_sink()).count()
+        self.items
+            .iter()
+            .filter(|it| it.is_sink() && !it.heuristic)
+            .count()
     }
 
     fn source_count(&self) -> usize {
-        self.items.iter().filter(|it| it.is_source()).count()
+        self.items
+            .iter()
+            .filter(|it| it.is_source() && !it.heuristic)
+            .count()
     }
 
     /// Sinks/sources whose roles came from the heuristic filling a catalog gap.

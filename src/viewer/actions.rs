@@ -496,6 +496,13 @@ impl Viewer {
         if is_hex {
             return String::new();
         }
+        // Mirror `resolve_goto_target`: a case-sensitive exact name resolves as-is
+        // (Enter jumps straight there), so don't show a prefix hint for it — else
+        // a case-only collision (`foo` vs `FOO`) would read "2 matches" while
+        // Enter succeeds on the exact `foo`.
+        if ctx.addr_by_name.contains_key(q) {
+            return String::new();
+        }
         match match_name_prefix(ctx.addr_by_name.keys().map(String::as_str), q) {
             NameMatch::Unique(name) if name.eq_ignore_ascii_case(q) => String::new(),
             NameMatch::Unique(name) => format!("→ {name}"),

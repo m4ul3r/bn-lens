@@ -13,6 +13,8 @@ use ratatui::text::Span;
 struct StrItem {
     addr: String,
     content: String,
+    /// Classified once at build time — render/filter run every frame.
+    fmt: FmtKind,
 }
 
 enum Mode {
@@ -168,7 +170,10 @@ impl StringsList {
             .strings()
             .into_iter()
             .filter(|(_, addr)| addr.starts_with("0x") && seen.insert(addr.clone()))
-            .map(|(content, addr)| StrItem { addr, content })
+            .map(|(content, addr)| {
+                let fmt = format_kind(&content);
+                StrItem { addr, content, fmt }
+            })
             .collect();
         items.sort_by_key(|it| {
             let addr = parse_hex(&it.addr).unwrap_or(0);
@@ -185,7 +190,7 @@ impl StringsList {
                 let text_ok = f.is_empty()
                     || it.content.to_lowercase().contains(&f)
                     || it.addr.contains(&f);
-                let fmt_ok = !self.fmt_only || format_kind(&it.content) != FmtKind::None;
+                let fmt_ok = !self.fmt_only || it.fmt != FmtKind::None;
                 text_ok && fmt_ok
             })
             .collect()
@@ -194,7 +199,7 @@ impl StringsList {
     fn fmt_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|it| format_kind(&it.content) != FmtKind::None)
+            .filter(|it| it.fmt != FmtKind::None)
             .count()
     }
 
@@ -440,7 +445,7 @@ impl StringsList {
             let it = &self.items[i];
             let is_sel = row == self.sel;
             // `%n` is a format-string write primitive — a genuine red flag.
-            let write_n = format_kind(&it.content) == FmtKind::WriteN;
+            let write_n = it.fmt == FmtKind::WriteN;
             let tag = if write_n { "  ⚠%n" } else { "" };
             if is_sel {
                 let text =
