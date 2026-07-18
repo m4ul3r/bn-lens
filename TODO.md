@@ -192,6 +192,32 @@ comments (`;` on a Tab/`w`/click-selected address) are unaffected — those list
 3. Ask the `bn` side to add function-doc enumeration to `comment list` (e.g. `--include-docs`); then
    `marks()` merges them with no lens-side state. Cleanest but needs a `bn` change (out of this repo).
 
+## Autonomous loop session (2026-07-18, branch `auto/loop-2026-07-18`)
+
+~13 commits, 116 tests, each dogfooded through herdr on a throwaway `loop-dogfood` bn instance
+(vgscan→lvm, plus firmware service binaries) and adversarially reviewed with `codex e`:
+
+- **Imports classifier** now *supplements* the `bn taint models --present` catalog on per-import misses
+  with explicit `hint:` provenance — surfaces catalog holes (`__vfprintf_chk`, `__vsyslog_chk`,
+  `dm_strncpy`). Catalog sink/source totals are kept *pure* (hints counted separately as `· N hint`,
+  not folded in). Two-tier segment-wrapper matching for sources (specific tokens any-segment; colliding
+  `recv`/`scanf`/`fread`/`system` trailing-only) — codex-hardened vs real firmware collisions
+  (`rtw_init_recv_priv`, `scanf_float`). Broad coverage: `realpath`/`getwd`, `readlink*`/`fgets`, `v*`/
+  wide printf, BSD/glibc `err`/`warn`/`error`, `asprintf`/`vasprintf`/`vsyslog`, `posix_spawn*`/`fexecve`,
+  `memccpy`.
+- **`Ctx::build`** fans out its 4 bulk `bn` reads via `std::thread::scope` after the sequential
+  liveness-gating prerequisites (`target_info`, `functions`) — ~0.9 s → ~0.6 s, fail-fast preserved for
+  the realistic dead-session case. (Residual: a bulk read hanging *after* another errors isn't fail-fast
+  — needs subprocess timeouts; see the startup-latency section.)
+- **Viewer `:` goto** completes a unique symbol-name prefix (`vg_rev` → `vg_revert`), reports an
+  ambiguous count, and shows a live hint in the prompt that mirrors Enter's resolution precedence.
+- **Strings view** `f` filters to printf format strings (the printf-sink surface) and tags `%n` write
+  primitives red `⚠%n`; `FmtKind` classified once per item at build (no per-render rescan).
+- **Docs**: help overlay updated; Marks module doc corrected re the function-doc gap above.
+
+**Still open / deliberately not done here:** threaded `p` popup (below), CFG edge-following, the
+function-doc→Marks gap (above — a design call), `bn save` persistence (below).
+
 ## Done this pass (for context)
 
 - Write paths: local + **function rename** (`n`), **comments** (`;`), **bookmarks/tags** (`t`).
