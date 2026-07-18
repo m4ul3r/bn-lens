@@ -74,6 +74,19 @@ pub fn sink_category(name: &str) -> Option<&'static str> {
         ("vfwprintf", "format"),
         ("swprintf", "format"),
         ("vswprintf", "format"),
+        // BSD/glibc error-printing format sinks (all take a printf format arg).
+        // Exact-only — `err`/`warn` collide with benign words as substrings/
+        // segments, so they never join the wrapper matchers below.
+        ("err", "format"),
+        ("verr", "format"),
+        ("errx", "format"),
+        ("verrx", "format"),
+        ("warn", "format"),
+        ("vwarn", "format"),
+        ("warnx", "format"),
+        ("vwarnx", "format"),
+        ("error", "format"),
+        ("error_at_line", "format"),
         ("scanf", "source"),
         ("sscanf", "source"),
         ("fscanf", "source"),
@@ -800,6 +813,22 @@ mod tests {
         let (roles, heuristic) = resolve_roles("strcpy", "strcpy", &empty, false);
         assert!(!heuristic);
         assert_eq!(roles.sink_classes, vec!["buffer".to_string()]);
+    }
+
+    #[test]
+    fn bsd_glibc_error_format_sinks_are_exact_only() {
+        // BSD/glibc error-printing format sinks
+        assert_eq!(sink_category("err"), Some("format"));
+        assert_eq!(sink_category("warnx"), Some("format"));
+        assert_eq!(sink_category("verr"), Some("format"));
+        assert_eq!(sink_category("error"), Some("format"));
+        assert_eq!(sink_category("error_at_line"), Some("format"));
+        // exact-only: benign lookalikes must NOT flag (err/warn are common words)
+        assert_eq!(sink_category("error_code"), None);
+        assert_eq!(sink_category("my_err"), None);
+        assert_eq!(sink_category("warning_count"), None);
+        assert_eq!(sink_category("errno"), None);
+        assert_eq!(sink_category("__errno_location"), None);
     }
 
     #[test]
