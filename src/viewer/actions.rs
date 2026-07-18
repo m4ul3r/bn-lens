@@ -430,9 +430,28 @@ impl Viewer {
         if raw.is_empty() {
             return;
         }
-        let Some(addr_str) = self.resolve_goto_target(ctx, raw) else {
-            self.status = format!(" ✗ can't resolve '{raw}'");
-            return;
+        let addr_str = match self.resolve_goto_target(ctx, raw) {
+            Some(addr) => addr,
+            // Exact/hex resolution missed — try a unique symbol-name prefix so a
+            // partial name still navigates (`vg_rev` → `vg_revert`).
+            None => match match_name_prefix(ctx.addr_by_name.keys().map(String::as_str), raw) {
+                NameMatch::Unique(name) => match ctx.addr_by_name.get(&name) {
+                    Some(addr) => addr.clone(),
+                    None => {
+                        self.status = format!(" ✗ can't resolve '{raw}'");
+                        return;
+                    }
+                },
+                NameMatch::Ambiguous(count) => {
+                    self.status =
+                        format!(" ✗ '{raw}' matches {count} names — be more specific");
+                    return;
+                }
+                NameMatch::None => {
+                    self.status = format!(" ✗ can't resolve '{raw}'");
+                    return;
+                }
+            },
         };
         let Some(addr) = crate::ctx::parse_hex(&addr_str) else {
             self.status = format!(" ✗ can't resolve '{raw}'");
@@ -796,9 +815,62 @@ fn parse_xref_callsite(line: &str) -> Option<String> {
     (hex.len() >= 4).then_some(hex)
 }
 
+/// The result of resolving a `:` goto query against the known symbol names.
+enum NameMatch {
+    /// A single symbol — a case-insensitive exact hit, or a unique prefix.
+    Unique(String),
+    /// Several names share the prefix; too ambiguous to jump (report the count).
+    Ambiguous(usize),
+    None,
+}
+
+/// Resolve a goto query to a symbol name by case-insensitive exact match, else a
+/// unique case-insensitive prefix — so `:` can reach `vg_revert` from `vg_rev`
+/// without the full name. An exact (case-insensitive) hit always wins over a
+/// longer prefix neighbour; an ambiguous prefix reports its count rather than
+/// guessing a target.
+fn match_name_prefix<'a>(names: impl Iterator<Item = &'a str>, query: &str) -> NameMatch {
+    let query = query.trim();
+    if query.is_empty() {
+        return NameMatch::None;
+    }
+    let qb = query.as_bytes();
+    let mut exact: Option<&str> = None;
+    let mut exact_count = 0usize;
+    let mut first_prefix: Option<&str> = None;
+    let mut prefix_count = 0usize;
+    for name in names {
+        // ASCII-case-insensitive, allocation-free (this runs per keystroke for
+        // the live goto hint). Byte-slicing is safe — `[u8]` has no boundary rule
+        // and the length is guarded.
+        if name.eq_ignore_ascii_case(query) {
+            exact = Some(name);
+            exact_count += 1;
+        }
+        let nb = name.as_bytes();
+        if nb.len() >= qb.len() && nb[..qb.len()].eq_ignore_ascii_case(qb) {
+            prefix_count += 1;
+            first_prefix.get_or_insert(name);
+        }
+    }
+    // Two names differing only by case are genuinely ambiguous — don't let map
+    // iteration order pick one arbitrarily.
+    if exact_count > 1 {
+        return NameMatch::Ambiguous(exact_count);
+    }
+    if let Some(name) = exact {
+        return NameMatch::Unique(name.to_string());
+    }
+    match prefix_count {
+        0 => NameMatch::None,
+        1 => NameMatch::Unique(first_prefix.unwrap().to_string()),
+        n => NameMatch::Ambiguous(n),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_xref_callsite;
+    use super::{match_name_prefix, parse_xref_callsite, NameMatch};
 
     #[test]
     fn parses_the_first_site_not_the_entry() {
@@ -825,5 +897,50 @@ mod tests {
             None
         );
         assert_eq!(parse_xref_callsite(""), None);
+    }
+
+    fn matched(names: &[&str], query: &str) -> NameMatch {
+        match_name_prefix(names.iter().copied(), query)
+    }
+
+    #[test]
+    fn goto_prefix_resolves_a_unique_completion() {
+        let names = ["vg_revert", "vg_reduce", "lvm_run", "main"];
+        // unique prefix
+        assert!(matches!(matched(&names, "vg_rev"), NameMatch::Unique(n) if n == "vg_revert"));
+        assert!(matches!(matched(&names, "lvm_"), NameMatch::Unique(n) if n == "lvm_run"));
+        // case-insensitive
+        assert!(matches!(matched(&names, "MAIN"), NameMatch::Unique(n) if n == "main"));
+    }
+
+    #[test]
+    fn goto_prefix_reports_ambiguity_and_misses() {
+        let names = ["vg_revert", "vg_reduce", "lvm_run"];
+        // shared prefix -> ambiguous with the count
+        assert!(matches!(matched(&names, "vg_re"), NameMatch::Ambiguous(2)));
+        assert!(matches!(matched(&names, "vg"), NameMatch::Ambiguous(2)));
+        // no match / empty
+        assert!(matches!(matched(&names, "zzz"), NameMatch::None));
+        assert!(matches!(matched(&names, ""), NameMatch::None));
+    }
+
+    #[test]
+    fn goto_prefix_prefers_exact_over_longer_neighbour() {
+        // an exact (case-insensitive) name wins even when a longer name shares
+        // the prefix, so `:foo` never becomes ambiguous against `foobar`.
+        let names = ["foo", "foobar", "foobaz"];
+        assert!(matches!(matched(&names, "foo"), NameMatch::Unique(n) if n == "foo"));
+        assert!(matches!(matched(&names, "FOO"), NameMatch::Unique(n) if n == "foo"));
+    }
+
+    #[test]
+    fn goto_prefix_case_only_collision_is_ambiguous() {
+        // two symbols differing only by ASCII case are genuinely ambiguous —
+        // never silently pick one by map order.
+        let names = ["foo", "FOO"];
+        assert!(matches!(matched(&names, "FoO"), NameMatch::Ambiguous(2)));
+        assert!(matches!(matched(&names, "foo"), NameMatch::Ambiguous(2)));
+        // trailing/leading whitespace in the query is ignored
+        assert!(matches!(matched(&["main"], "  main  "), NameMatch::Unique(n) if n == "main"));
     }
 }
