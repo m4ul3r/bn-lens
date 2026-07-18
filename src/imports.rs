@@ -29,6 +29,7 @@ pub fn sink_category(name: &str) -> Option<&'static str> {
     const EXACT: &[(&str, &str)] = &[
         ("memcpy", "buffer"),
         ("mempcpy", "buffer"),
+        ("memccpy", "buffer"),
         ("memmove", "buffer"),
         ("strcpy", "buffer"),
         ("strcat", "buffer"),
@@ -67,10 +68,13 @@ pub fn sink_category(name: &str) -> Option<&'static str> {
         ("snprintf", "format"),
         ("vsnprintf", "format"),
         ("dprintf", "format"),
+        ("asprintf", "format"),
+        ("vasprintf", "format"),
         ("vprintf", "format"),
         ("vfprintf", "format"),
         ("vdprintf", "format"),
         ("syslog", "format"),
+        ("vsyslog", "format"),
         ("wprintf", "format"),
         ("fwprintf", "format"),
         ("vwprintf", "format"),
@@ -782,6 +786,10 @@ mod tests {
         assert_eq!(sink_category("__realpath_chk"), Some("buffer"));
         // wide / variadic format sinks
         assert_eq!(sink_category("vfprintf"), Some("format"));
+        assert_eq!(sink_category("asprintf"), Some("format"));
+        assert_eq!(sink_category("vasprintf"), Some("format"));
+        assert_eq!(sink_category("vsyslog"), Some("format"));
+        assert_eq!(sink_category("memccpy"), Some("buffer"));
         assert_eq!(sink_category("__vfprintf_chk"), Some("format")); // the motivating hole
         assert_eq!(sink_category("wprintf"), Some("format"));
         assert_eq!(sink_category("fwprintf"), Some("format"));
