@@ -2,6 +2,7 @@
 //! Also polls the launching agent's status so the pairing partner's state
 //! ("working"/"done") is always visible on the header bar.
 
+use crate::classes::ClassesList;
 use crate::ctx::Ctx;
 use crate::exports::ExportsList;
 use crate::help::{Help, HelpContext};
@@ -42,6 +43,7 @@ enum AppView {
     Strings,
     Imports,
     Exports,
+    Classes,
     Types,
     Marks,
 }
@@ -53,6 +55,7 @@ struct App {
     strings: Option<StringsList>, // built lazily on first switch to Strings
     imports: Option<ImportsList>, // built lazily on first switch to Imports
     exports: Option<ExportsList>, // built lazily on first switch to Exports
+    classes: Option<ClassesList>, // built lazily on first switch to Classes
     types: Option<TypesList>,     // built lazily on first switch to Types
     marks: Option<MarksList>,     // built lazily on first switch to Marks
     menu: Menu,
@@ -66,6 +69,10 @@ struct App {
     partner: Option<crate::herdr::PaneAgent>,
     last_poll: Option<Instant>,
     refreshing: Option<Refreshing>,
+    /// Context-rebuild failures belong to the old ctx, so retain them here;
+    /// cached-list/state failures are shared through `ctx.bn.last_error()`.
+    /// Per-item viewer reads render their errors locally instead.
+    refresh_error: Option<String>,
 }
 
 impl App {
@@ -81,6 +88,7 @@ impl App {
             strings: None,
             imports: None,
             exports: None,
+            classes: None,
             types: None,
             marks: None,
             menu: Menu::default(),
@@ -94,6 +102,7 @@ impl App {
             partner: None,
             last_poll: None,
             refreshing: None,
+            refresh_error: None,
         }
     }
 
@@ -108,22 +117,27 @@ impl App {
         } else {
             Some(target)
         };
-        if let Ok(ctx) = Ctx::build(
+        match Ctx::build(
             &self.bn_bin,
             &self.herdr,
             &self.agent_pane,
             Some(instance),
             tgt,
         ) {
-            self.ctx = ctx;
-            self.picker = Picker::new(&self.ctx);
-            self.strings = None;
-            self.imports = None;
-            self.exports = None;
-            self.types = None;
-            self.marks = None;
-            self.view = AppView::Symbols;
-            self.viewer = None;
+            Ok(ctx) => {
+                self.ctx = ctx;
+                self.picker = Picker::new(&self.ctx);
+                self.strings = None;
+                self.imports = None;
+                self.exports = None;
+                self.classes = None;
+                self.types = None;
+                self.marks = None;
+                self.view = AppView::Symbols;
+                self.viewer = None;
+                self.refresh_error = None;
+            }
+            Err(error) => self.refresh_error = Some(error),
         }
     }
 
@@ -134,14 +148,15 @@ impl App {
             AppView::Strings => Choice::Strings,
             AppView::Imports => Choice::Imports,
             AppView::Exports => Choice::Exports,
+            AppView::Classes => Choice::Classes,
             AppView::Types => Choice::Types,
             AppView::Marks => Choice::Marks,
         }
     }
 
     /// Switch to a top-level list view, building its (lazy) list on first use.
-    /// Marks rebuild every time — unlike the static Symbols/Strings/Imports/
-    /// Exports lists, annotations change as you add them with `;`/`t`.
+    /// Marks rebuild every time — unlike the other lazy inventories,
+    /// annotations change as you add them with `;`/`t`.
     fn set_view(&mut self, view: AppView) {
         match view {
             AppView::Symbols => {}
@@ -158,6 +173,11 @@ impl App {
             AppView::Exports => {
                 if self.exports.is_none() {
                     self.exports = Some(ExportsList::new(&self.ctx));
+                }
+            }
+            AppView::Classes => {
+                if self.classes.is_none() {
+                    self.classes = Some(ClassesList::new(&self.ctx));
                 }
             }
             AppView::Types => {
@@ -179,6 +199,7 @@ impl App {
             AppView::Strings,
             AppView::Imports,
             AppView::Exports,
+            AppView::Classes,
             AppView::Types,
             AppView::Marks,
         ];
@@ -194,6 +215,7 @@ impl App {
             Choice::Strings => self.set_view(AppView::Strings),
             Choice::Imports => self.set_view(AppView::Imports),
             Choice::Exports => self.set_view(AppView::Exports),
+            Choice::Classes => self.set_view(AppView::Classes),
             Choice::Types => self.set_view(AppView::Types),
             Choice::Marks => self.set_view(AppView::Marks),
             Choice::Refresh => self.start_refresh(),
@@ -278,6 +300,9 @@ impl App {
                 if let Some(exports) = &mut self.exports {
                     exports.refresh(&self.ctx);
                 }
+                if let Some(classes) = &mut self.classes {
+                    classes.refresh(&self.ctx);
+                }
                 if let Some(types) = &mut self.types {
                     types.refresh(&self.ctx);
                 }
@@ -287,9 +312,17 @@ impl App {
                 if let Some(viewer) = &mut self.viewer {
                     viewer.reload(&self.ctx);
                 }
+                self.refresh_error = None;
                 self.refreshing = None;
             }
-            Ok(Err(_)) | Err(TryRecvError::Disconnected) => self.refreshing = None,
+            Ok(Err(error)) => {
+                self.refresh_error = Some(error);
+                self.refreshing = None;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.refresh_error = Some("bn refresh worker disconnected".into());
+                self.refreshing = None;
+            }
             Err(TryRecvError::Empty) => {}
         }
     }
@@ -338,11 +371,7 @@ impl App {
             // get matched against the one in view (fail-closed provenance).
             if !self.agent_pane.is_empty() {
                 let text = crate::herdr::pane_read(&self.herdr, &self.agent_pane, 400);
-                let tokens = if self.ctx.transcript_concerns_target(&text) {
-                    crate::ctx::scan_recent(&text)
-                } else {
-                    Vec::new()
-                };
+                let tokens = self.ctx.recent_agent_tokens(&text);
                 self.picker.update_agent(tokens);
             }
             self.last_poll = Some(now);
@@ -358,6 +387,10 @@ impl App {
         } else {
             match &self.partner {
                 None => (Color::Red, format!(" ⚠ no agent on {} ", self.agent_pane)),
+                Some(a) if !crate::herdr::same_agent_session(&self.ctx.agent_session, a) => (
+                    Color::Red,
+                    " ⚠ launching agent changed · ask blocked ".to_string(),
+                ),
                 Some(a) => {
                     let (g, c) = match a.status.as_str() {
                         "working" => ("◐", Color::Yellow),
@@ -392,6 +425,40 @@ impl App {
         );
     }
 
+    /// A command/context failure must dominate cached content. Without this,
+    /// dead sessions degrade into plausible `(no layout)`/`no references` rows.
+    fn draw_backend_error(&self, buf: &mut Buffer, area: Rect) {
+        if area.height < 2 {
+            return;
+        }
+        let Some(error) = self
+            .refresh_error
+            .as_ref()
+            .cloned()
+            .or_else(|| self.ctx.bn.last_error())
+        else {
+            return;
+        };
+        let width = area.width as usize;
+        let recovery = if self.viewer.is_some() {
+            "^R retry · q then i switch"
+        } else {
+            "^R retry · i switch"
+        };
+        let label = format!(" ⚠ BN COMMAND FAILED · {error} · {recovery} ");
+        crate::ui::put_str(
+            buf,
+            area.x,
+            area.y + 1,
+            format!("{label:<width$}"),
+            width,
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+
     /// True while the focused list/viewer is capturing raw text input (a search
     /// filter, or an ask/comment/tag/rename field) — so the global `?`/`^R`/`m`
     /// shortcuts must not steal those characters.
@@ -407,6 +474,7 @@ impl App {
             AppView::Strings => self.strings.as_ref().is_some_and(StringsList::is_searching),
             AppView::Imports => self.imports.as_ref().is_some_and(ImportsList::is_searching),
             AppView::Exports => self.exports.as_ref().is_some_and(ExportsList::is_searching),
+            AppView::Classes => self.classes.as_ref().is_some_and(ClassesList::is_searching),
             AppView::Types => self.types.as_ref().is_some_and(TypesList::is_searching),
             AppView::Marks => self.marks.as_ref().is_some_and(MarksList::is_searching),
         }
@@ -423,6 +491,7 @@ impl App {
             AppView::Strings => self.strings.as_ref().is_some_and(StringsList::popup_open),
             AppView::Imports => self.imports.as_ref().is_some_and(ImportsList::popup_open),
             AppView::Exports => self.exports.as_ref().is_some_and(ExportsList::popup_open),
+            AppView::Classes => self.classes.as_ref().is_some_and(ClassesList::popup_open),
             AppView::Types => self.types.as_ref().is_some_and(TypesList::popup_open),
             AppView::Marks => self.marks.as_ref().is_some_and(MarksList::popup_open),
         }
@@ -523,6 +592,10 @@ impl App {
                         .exports
                         .as_mut()
                         .map_or(Action::None, |s| s.on_key(k, &self.ctx)),
+                    AppView::Classes => self
+                        .classes
+                        .as_mut()
+                        .map_or(Action::None, |s| s.on_key(k, &self.ctx)),
                     AppView::Types => self
                         .types
                         .as_mut()
@@ -581,6 +654,11 @@ impl App {
                         s.on_mouse(m, self.area);
                     }
                 }
+                AppView::Classes => {
+                    if let Some(s) = &mut self.classes {
+                        s.on_mouse(m, self.area);
+                    }
+                }
                 AppView::Types => {
                     if let Some(s) = &mut self.types {
                         s.on_mouse(m, self.area);
@@ -611,6 +689,7 @@ impl App {
                 AppView::Strings => HelpContext::Strings,
                 AppView::Imports => HelpContext::Imports,
                 AppView::Exports => HelpContext::Exports,
+                AppView::Classes => HelpContext::Classes,
                 AppView::Types => HelpContext::Types,
                 AppView::Marks => HelpContext::Marks,
             }
@@ -667,6 +746,11 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
                             s.render(app.area, f.buffer_mut(), &app.ctx);
                         }
                     }
+                    AppView::Classes => {
+                        if let Some(s) = &mut app.classes {
+                            s.render(app.area, f.buffer_mut(), &app.ctx);
+                        }
+                    }
                     AppView::Types => {
                         if let Some(s) = &mut app.types {
                             s.render(app.area, f.buffer_mut(), &app.ctx);
@@ -680,6 +764,7 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
                 },
             }
             app.draw_partner(f.buffer_mut(), app.area);
+            app.draw_backend_error(f.buffer_mut(), app.area);
             if let Some(sw) = &app.switcher {
                 sw.render(app.area, f.buffer_mut());
             }

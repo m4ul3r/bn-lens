@@ -25,12 +25,15 @@ the code is split into small typed modules with unit tests.
 | `syntax.rs` | pure pseudo-C tokenizer → `(text, kind)` runs (**unit-tested**; replaces pygments) |
 | `theme.rs` | token-kind → colour |
 | `help.rs` | global, scrollable `where / key / action` shortcut reference |
-| `menu.rs` | the `bn lens` title dropdown: switch view (Symbols/Strings/Imports) + global actions |
+| `menu.rs` | the `bn lens` title dropdown: switch among all list views + global actions |
 | `picker.rs` | the **Symbols** list (functions + data): filter, vim nav, colours, mouse |
 | `strings.rs` | the **Strings** list: recovered text, filter, `Enter`/`x` to xref its uses |
-| `imports.rs` | the **Imports** list (attack surface): dangerous-sink flagging, `f` sinks-only, `p` callers |
+| `imports.rs` | the **Imports** list: modeled source/sink presence, `f` sinks-only, `p` callers |
+| `exports.rs` | the **Exports** list: demangled public function/data inventory and usage peeks |
+| `classes.rs` | the **Classes** list: folded C++ inventory with RTTI/vtable/base/method evidence |
+| `types.rs` | the **Types** list/editor: layouts plus previewed/explicit declarations |
 | `marks.rs` | the **Marks** list: comments + tags/bookmarks merged, `Enter` jumps to the annotated function |
-| `usage.rs` | shared "where is this used?" report (xref + per-callsite pseudo-C) for Strings/Imports `p` |
+| `usage.rs` | shared usage report: exact callsite disassembly + approximate mapped pseudo-C |
 | `viewer.rs` | code-viewer state model and load lifecycle |
 | `viewer/actions.rs` | navigation and data-backed actions: goto/peek/xrefs/rename/comment/tag |
 | `viewer/input.rs` | keyboard/mouse modes, search, view cycling, and agent asks |
@@ -40,7 +43,7 @@ the code is split into small typed modules with unit tests.
 | `switch.rs` | ranger-style instance/target switcher (miller columns + live target-info preview) |
 
 Data flows one way: `Ctx` is built once and shared by ref; the picker returns an `Action`
-(`OpenDecompile`/`OpenXrefs`/`Quit`); the viewer returns `Exit::{Stay,Back}`. No global mutable state.
+(`OpenDecompile`/`OpenXrefs`/`Quit`); the viewer returns `Exit::{Stay,Back,Reload}`. No global mutable state.
 
 ## Features
 
@@ -54,12 +57,10 @@ opens immediately; the agent scan on the ~1s poll). Non-function addresses are a
 `/` search filters the full list live and ranks best-match first (`↑`/`↓` pick, `Enter` opens the top
 hit, `Tab` commits the filter to the list); the recent subsection shows only when unfiltered.
 
-**Imports (attack surface)** — `imports.rs`, reached from the menu, lists the binary's imported symbols
-with known-dangerous **sinks flagged** (`sink_category` classifies libc buffer/command/format/source
-calls, normalizing `__*_chk` and catching wrappers like `tsk_sys_System` by substring); sinks sort to
-the top, `f` toggles a sinks-only filter, and `p` peeks **callers** (the `usage.rs` report — pseudo-C
-at each callsite), `Enter`/`x` opens the full xrefs. This is the vuln-researcher's entry point: filter
-to `memcpy`, `p`, read every call in context.
+**Imports (modeled attack surface)** — `imports.rs` joins the binary's JSON-backed import inventory to
+`bn taint models --present`. Modeled sinks and sources sort and render separately; the view states that
+catalog presence is **not a finding**, and `f` includes only true modeled sinks. A legacy name heuristic
+is retained only as a labeled compatibility fallback. `p` opens the shared usage report.
 
 **Marks (annotations)** — `marks.rs`, reached from the menu, is the read half of the "shared map":
 every comment (`;`) and tag/bookmark (`t`) — plus BN's own analysis tags — merged from `bn comment
@@ -68,18 +69,19 @@ the top. `Enter` jumps to the annotated function; `x` its xrefs. Rebuilt on each
 static lists) since annotations change as you add them. Completes the annotate→navigate loop with the
 `;`/`t` write paths.
 
-**Views + the title menu** — the list pane has four top-level views: **Symbols** (functions + data, the
-default `picker.rs`), **Strings** (`strings.rs`, recovered text), **Imports** (`imports.rs`), and
-**Marks** (`marks.rs`), all above.
-In Strings and Imports, `p` peeks a **usage popup** (`usage.rs`) — it parses `bn xrefs` on the selected
-address, decompiles each referencing function once (`--addresses`), and shows the **pseudo-C statement**
-at each callsite (grouped by function; falling back to the disassembled instruction when a site maps to
-no decompiled line), plus any data refs; `Enter`/`x` opens the full navigable xrefs listing instead.
+**Views + the title menu** — the list pane has seven top-level views: **Symbols**, **Strings**,
+**Imports**, **Exports**, **Classes**, **Types**, and **Marks**. C++-facing inventories render demangled
+names while retaining raw identifiers for backend actions. The Classes view folds STL/vendor entries
+and non-class RTTI artifacts, then drills into `bn class show` evidence.
+In Strings, Imports, and Exports, `p` peeks a **usage popup** (`usage.rs`) — it parses `bn xrefs`, shows
+the exact machine instruction at each callsite, then labels address-mapped pseudo-C as approximate
+(`C≈`). A content/name hint prevents a neighboring decompiler declaration from masquerading as the
+callsite statement. `Enter`/`x` opens the full navigable xrefs listing instead.
 Clicking the ` bn lens ` title (or `m`) opens a small **dropdown** (`menu.rs`) that switches view and reaches the
 global actions (Refresh, Switch bn, Help, Quit); a click on the title toggles it, a click on an entry
 or click-away dismisses it. `app.rs` owns an `AppView` enum and routes keys/mouse/render to the active
-list; the Strings list is built lazily on first switch and re-pulled by the same refresh path as the
-picker. Views share the `Viewer` for anything they open.
+list; expensive lists are built lazily and re-pulled by the same refresh path as the picker. Views
+share the `Viewer` for anything they open.
 
 **Sections** — `s` (in the picker or viewer) opens a scrollable popup of the `bn sections` table
 (address range, size, perms, semantics, name) with a `w+x` summary line up top — quick orientation and
@@ -121,8 +123,9 @@ notably a callsite line on the xrefs page) opens a scrollable pseudo-C popup of 
 function, centered on and highlighting the statement at that address. It decompiles via
 `bn decompile <addr> --addresses --format json` (bn resolves an interior address to its function and
 returns the name); `decomp.rs` maps the use address to its statement (exact, else nearest at/below) and
-normalizes the address-column indentation. Data hotspots still peek as a symbolized byte dump. This is
-the same address→pseudo-C mapping the Strings usage popup uses.
+normalizes the address-column indentation. Data hotspots still peek as a symbolized byte dump. The
+usage popup uses the same address mapping only as secondary `C≈` context; its exact machine
+instruction remains the authoritative callsite evidence.
 
 **Views** — `i`/`I` cycle the current function through **decompile → MLIL → disassembly** (forward /
 back; `bn decompile` / `bn il --view mlil` / `bn disasm`). The three code views + the xrefs view are a
@@ -174,10 +177,10 @@ needs the binary pre-built (as above), since local linking skips build steps.
 block comments, hex/number handling, plain-text address/name tokenizing). The TUI itself is dogfooded
 in a herdr pane.
 
-## Mutation (a narrow, annotation-only surface)
+## Mutation (a narrow, explicit surface)
 
-The lens was read-only by construction until **local rename**; the write surface is now four
-annotation actions, all live in the bn instance, none auto-saved:
+The lens was read-only by construction until **local rename**; the write surface is four deliberate
+actions, all live in the bn instance, none auto-saved:
 
 - **`n` rename** — context-aware, safety-first. A selected **Local** hotspot renames the local; a
   selected **Func** hotspot naming *another* function renames that symbol; otherwise (no selection, or
@@ -187,8 +190,10 @@ annotation actions, all live in the bn instance, none auto-saved:
   identifier (spaces/invalid rejected inline).
 - **`;` comment** — targets a concrete address when one is resolvable (a selected Addr hotspot, or the
   address leading a disasm/MLIL line), else the current function's doc comment (`bn comment set
-  --function`). After a set, the current view reloads so an inline note renders.
+  --function`). After a set, the context and cached lists refresh so Marks cannot stay stale.
 - **`t` bookmark** — a `Bookmarks` tag (with an optional note) on the address or function.
+- **type declaration** — the Types editor previews C declarations first (`^P`), then commits only on
+  explicit `^S`; collisions are surfaced before the live type system changes.
 
 Each shells out to a `bn … --summary` mutation and checks `"success": true`. All mutate the **live bn
 instance in-memory** — immediately visible to every `bn` command against that instance — and **none
@@ -211,5 +216,5 @@ no-ops the degenerate self-goto.
 ## Non-goals (kept deliberately)
 
 Not a Binary Ninja clone — the justification is *headless* + *agent pairing*, not decompiler-feature
-parity. The write surface stays limited to **naming and annotation** (rename / comment / bookmark);
-resist creep toward types/structs/graph editing.
+parity. The write surface stays limited to **naming, annotation, and explicit type declarations**;
+resist creep toward arbitrary graph or binary editing.

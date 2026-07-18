@@ -151,16 +151,15 @@ impl StringsList {
     }
 
     /// `p`: peek *where the string is used in code or data*. Parse `bn xrefs`,
-    /// decompile each referencing function once (`--addresses`), and show the
-    /// pseudo-C statement at each callsite (grouped by function), plus any data
-    /// refs. Falls back to the disassembled instruction if a site maps to no
-    /// decompiled line. (`x`/Enter opens the full navigable xrefs listing.)
+    /// decompile each referencing function once (`--addresses`), and show exact
+    /// disassembly plus approximate pseudo-C at each callsite, grouped by
+    /// function, plus any data refs. (`x`/Enter opens the full xrefs listing.)
     fn open_usage(&mut self, ctx: &Ctx) {
         let Some(item) = self.current() else { return };
         let (addr, content) = (item.addr.clone(), item.content.clone());
         self.usage = Some(Usage {
             title: format!("used in code · \"{}\"", ellipsize(&content, 34)),
-            lines: crate::usage::report(ctx, &addr),
+            lines: crate::usage::report(ctx, &addr, &content),
             addr,
             off: 0,
         });

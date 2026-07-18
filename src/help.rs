@@ -13,6 +13,7 @@ pub enum HelpContext {
     Strings,
     Imports,
     Exports,
+    Classes,
     Types,
     Marks,
     Viewer,
@@ -27,6 +28,7 @@ impl HelpContext {
             Self::Strings => "strings",
             Self::Imports => "imports",
             Self::Exports => "exports",
+            Self::Classes => "classes",
             Self::Types => "types",
             Self::Marks => "marks",
             Self::Viewer => "viewer",
@@ -41,6 +43,7 @@ impl HelpContext {
             Self::Strings => "STRINGS",
             Self::Imports => "IMPORTS",
             Self::Exports => "EXPORTS",
+            Self::Classes => "CLASSES",
             Self::Types => "TYPES",
             Self::Marks => "MARKS",
             Self::Viewer => "VIEWER",
@@ -55,6 +58,7 @@ impl HelpContext {
             Self::Strings => scope == "STRINGS" || scope == "LIST",
             Self::Imports => scope == "IMPORTS" || scope == "LIST",
             Self::Exports => scope == "EXPORTS" || scope == "LIST",
+            Self::Classes => scope == "CLASSES" || scope == "LIST",
             Self::Types => scope.starts_with("TYPES") || scope == "LIST",
             Self::Marks => scope == "MARKS" || scope == "LIST",
             Self::Viewer => {
@@ -73,6 +77,14 @@ enum HelpLine {
         key: &'static str,
         action: &'static str,
     },
+}
+
+/// Fixed-width help fields must be truncated before padding. Letting a long
+/// key binding spill into the next span made the key and action read as one
+/// concatenated string on narrow terminals.
+fn help_field(value: &str, width: usize) -> String {
+    let value: String = value.chars().take(width).collect();
+    format!("{value:<width$}")
 }
 
 const LINES: &[HelpLine] = &[
@@ -95,7 +107,7 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "LIST",
         key: "v",
-        action: "next list view (symbols→strings→imports→exports→types→marks) — not the IL cycle",
+        action: "next list view (symbols→strings→imports→exports→classes→types→marks) — not the IL cycle",
     },
     HelpLine::Entry {
         scope: "MENU",
@@ -193,7 +205,7 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "STRINGS",
         key: "p",
-        action: "peek where it's used (pseudo-C statement at each site)",
+        action: "peek uses (exact asm + approximate mapped C at each site)",
     },
     HelpLine::Entry {
         scope: "STRINGS",
@@ -219,17 +231,17 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "IMPORTS",
         key: "f",
-        action: "toggle sinks-only (⚠ buffer/command, • format/source)",
+        action: "toggle modeled sinks-only (sources remain visible when off)",
     },
     HelpLine::Entry {
         scope: "IMPORTS",
         key: "/",
-        action: "filter by name / address / category",
+        action: "filter by name / address / model role",
     },
     HelpLine::Entry {
         scope: "IMPORTS",
         key: "p",
-        action: "peek callers (pseudo-C at each callsite)",
+        action: "peek callers (exact asm + approximate mapped C)",
     },
     HelpLine::Entry {
         scope: "IMPORTS",
@@ -260,7 +272,7 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "EXPORTS",
         key: "p",
-        action: "peek uses (pseudo-C at each callsite)",
+        action: "peek uses (exact asm + approximate mapped C)",
     },
     HelpLine::Entry {
         scope: "EXPORTS",
@@ -274,6 +286,32 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "EXPORTS",
+        key: "Esc / q",
+        action: "clear filter, then back to symbols / quit",
+    },
+    HelpLine::Section("CLASSES"),
+    HelpLine::Entry {
+        scope: "CLASSES",
+        key: "j/k  ^D/^U  gg/G",
+        action: "move / page / ends",
+    },
+    HelpLine::Entry {
+        scope: "CLASSES",
+        key: "/",
+        action: "filter by class / base / confidence",
+    },
+    HelpLine::Entry {
+        scope: "CLASSES",
+        key: "Enter / p",
+        action: "show RTTI, bases, vtables, methods, and construction evidence",
+    },
+    HelpLine::Entry {
+        scope: "CLASSES",
+        key: "m / v / i",
+        action: "view menu / cycle view / switch bn",
+    },
+    HelpLine::Entry {
+        scope: "CLASSES",
         key: "Esc / q",
         action: "clear filter, then back to symbols / quit",
     },
@@ -661,7 +699,11 @@ impl Help {
         let box_height = area.height.saturating_sub(vertical_margin * 2);
         let box_x = area.x + horizontal_margin;
         let box_y = area.y + vertical_margin;
-        let title = format!("shortcuts · {} · where / key / action", context.label());
+        let title = if box_width >= 58 {
+            format!("shortcuts · {} · where / key / action", context.label())
+        } else {
+            format!("shortcuts · {}", context.label())
+        };
         ui::draw_box(buffer, box_x, box_y, box_width, box_height, &title);
 
         let inner_width = box_width.saturating_sub(4) as usize;
@@ -692,24 +734,42 @@ impl Help {
                     );
                 }
                 HelpLine::Entry { scope, key, action } => {
-                    ui::put_spans(
-                        buffer,
-                        box_x + 2,
-                        y,
-                        inner_width,
-                        &[
-                            Span::styled(format!("{scope:<15}"), dim),
-                            Span::styled(
-                                format!("{key:<18}"),
-                                if context.matches(scope) {
-                                    active_style
-                                } else {
-                                    Style::default().fg(Color::Green)
-                                },
-                            ),
-                            Span::raw(*action),
-                        ],
-                    );
+                    let key_style = if context.matches(scope) {
+                        active_style
+                    } else {
+                        Style::default().fg(Color::Green)
+                    };
+                    if inner_width >= 72 {
+                        ui::put_spans(
+                            buffer,
+                            box_x + 2,
+                            y,
+                            inner_width,
+                            &[
+                                Span::styled(format!("{}  ", help_field(scope, 13)), dim),
+                                Span::styled(format!("{}  ", help_field(key, 20)), key_style),
+                                Span::raw(*action),
+                            ],
+                        );
+                    } else {
+                        // Section headers already provide scope at this width;
+                        // spend the scarce columns on an unambiguous key/action
+                        // split instead of three colliding columns.
+                        let key_width = (inner_width / 3).clamp(1, 20);
+                        ui::put_spans(
+                            buffer,
+                            box_x + 2,
+                            y,
+                            inner_width,
+                            &[
+                                Span::styled(
+                                    format!("{}  ", help_field(key, key_width)),
+                                    key_style,
+                                ),
+                                Span::raw(*action),
+                            ],
+                        );
+                    }
                 }
             }
         }
@@ -734,6 +794,7 @@ impl Help {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+    use ratatui::buffer::Buffer;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -767,5 +828,25 @@ mod tests {
             LINES.get(help.offset),
             Some(HelpLine::Section("STACK VIEW"))
         ));
+    }
+
+    #[test]
+    fn help_fields_truncate_before_the_column_separator() {
+        assert_eq!(help_field("j/k · Enter · Esc", 8), "j/k · En");
+        assert_eq!(format!("{}  action", help_field("?", 4)), "?     action");
+    }
+
+    #[test]
+    fn narrow_help_keeps_a_visible_key_action_boundary() {
+        let mut help = Help::default();
+        help.open(HelpContext::Picker);
+        let area = Rect::new(0, 0, 54, 16);
+        let mut buffer = Buffer::empty(area);
+        help.render(area, &mut buffer, HelpContext::Picker);
+        let line = (0..area.width)
+            .map(|x| buffer[(x, 3)].symbol())
+            .collect::<String>();
+        let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("j/k arrows move selection"));
     }
 }

@@ -64,6 +64,15 @@ pub fn crumbs(ctx: &Ctx) -> Vec<Span<'static>> {
             Style::default().fg(Color::Cyan),
         ));
     }
+    if !ctx.analysis_complete() {
+        v.push(Span::styled(
+            format!(
+                "  · ⚠ {} ANALYSIS",
+                ctx.analysis_state.label().to_uppercase()
+            ),
+            bold.fg(Color::Yellow),
+        ));
+    }
     v
 }
 

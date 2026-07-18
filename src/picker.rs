@@ -63,8 +63,10 @@ pub struct Picker {
     pending_g: bool,
     // classification + annotation tables (static per target)
     fn_names: HashSet<String>,
-    fn_name_addr: HashMap<String, String>, // fn name -> addr
-    fn_addr_name: HashMap<String, String>, // addr -> fn name
+    fn_name_addr: HashMap<String, String>, // raw/display alias -> addr
+    fn_alias_target: HashMap<String, String>, // raw/display alias -> stable raw name
+    fn_addr_name: HashMap<String, String>, // addr -> stable raw name
+    fn_display: HashMap<String, String>,   // stable raw name -> display name
     imports: HashSet<String>,
     ranges: Vec<(u64, u64, String)>, // section ranges
     syms: Vec<(u64, String)>,        // symbol addr -> name, sorted ascending
@@ -91,9 +93,10 @@ impl Picker {
             .iter()
             .map(|f| Item {
                 addr: f.addr.clone(),
-                name: f.name.clone(),
+                name: f.display_name.clone(),
                 target: f.name.clone(),
-                import: ctx.import_names.contains(&f.name),
+                import: ctx.import_names.contains(&f.name)
+                    || ctx.import_names.contains(&f.display_name),
                 annot: String::new(),
                 src: 0,
             })
@@ -101,11 +104,16 @@ impl Picker {
         all.sort_by_key(|it| parse_hex(&it.addr).unwrap_or(0));
 
         let fn_names = ctx.func_names.clone();
-        let fn_name_addr: HashMap<String, String> = ctx
-            .funcs
-            .iter()
-            .map(|f| (f.name.clone(), f.addr.clone()))
-            .collect();
+        let mut fn_name_addr = HashMap::new();
+        let mut fn_alias_target = HashMap::new();
+        let mut fn_display = HashMap::new();
+        for f in &ctx.funcs {
+            fn_name_addr.insert(f.name.clone(), f.addr.clone());
+            fn_name_addr.insert(f.display_name.clone(), f.addr.clone());
+            fn_alias_target.insert(f.name.clone(), f.name.clone());
+            fn_alias_target.insert(f.display_name.clone(), f.name.clone());
+            fn_display.insert(f.name.clone(), f.display_name.clone());
+        }
         let fn_addr_name: HashMap<String, String> = ctx
             .funcs
             .iter()
@@ -140,7 +148,9 @@ impl Picker {
             pending_g: false,
             fn_names,
             fn_name_addr,
+            fn_alias_target,
             fn_addr_name,
+            fn_display,
             imports: ctx.import_names.clone(),
             ranges,
             syms,
@@ -158,7 +168,9 @@ impl Picker {
         self.awidth = fresh.awidth;
         self.fn_names = fresh.fn_names;
         self.fn_name_addr = fresh.fn_name_addr;
+        self.fn_alias_target = fresh.fn_alias_target;
         self.fn_addr_name = fresh.fn_addr_name;
+        self.fn_display = fresh.fn_display;
         self.imports = fresh.imports;
         self.ranges = fresh.ranges;
         self.syms = fresh.syms;
@@ -240,7 +252,11 @@ impl Picker {
             }
             out.push(Item {
                 addr,
-                name: name.clone(),
+                name: self
+                    .fn_display
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| name.clone()),
                 target: name.clone(),
                 import: self.imports.contains(name),
                 annot: String::new(),
@@ -253,15 +269,19 @@ impl Picker {
             if out.len() >= RECENT_CAP {
                 break;
             }
-            if self.fn_names.contains(tok) {
-                if !seen.insert(format!("f:{tok}")) {
+            if let Some(target) = self.fn_alias_target.get(tok) {
+                if !seen.insert(format!("f:{target}")) {
                     continue;
                 }
                 out.push(Item {
                     addr: self.fn_name_addr.get(tok).cloned().unwrap_or_default(),
-                    name: tok.clone(),
-                    target: tok.clone(),
-                    import: self.imports.contains(tok),
+                    name: self
+                        .fn_display
+                        .get(target)
+                        .cloned()
+                        .unwrap_or_else(|| tok.clone()),
+                    target: target.clone(),
+                    import: self.imports.contains(tok) || self.imports.contains(target),
                     annot: String::new(),
                     src: AGENT,
                 });
@@ -272,7 +292,11 @@ impl Picker {
                     }
                     out.push(Item {
                         addr: tok.clone(),
-                        name: fname.clone(),
+                        name: self
+                            .fn_display
+                            .get(fname)
+                            .cloned()
+                            .unwrap_or_else(|| fname.clone()),
                         target: fname.clone(),
                         import: self.imports.contains(fname),
                         annot: String::new(),
@@ -308,6 +332,7 @@ impl Picker {
             .filter(|&i| {
                 f.is_empty()
                     || self.all[i].name.to_lowercase().contains(&f)
+                    || self.all[i].target.to_lowercase().contains(&f)
                     || self.all[i].addr.contains(&f)
             })
             .collect();

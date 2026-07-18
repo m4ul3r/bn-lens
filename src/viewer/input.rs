@@ -20,14 +20,8 @@ impl Viewer {
                 return Exit::Stay;
             }
             Popup::Rename { .. } => return self.rename_key(key, ctx),
-            Popup::Comment { .. } => {
-                self.comment_key(key, ctx);
-                return Exit::Stay;
-            }
-            Popup::Tag { .. } => {
-                self.tag_key(key, ctx);
-                return Exit::Stay;
-            }
+            Popup::Comment { .. } => return self.comment_key(key, ctx),
+            Popup::Tag { .. } => return self.tag_key(key, ctx),
             Popup::None => {}
         }
         // The 2D CFG graph is navigated by block, not by line.
@@ -124,16 +118,16 @@ impl Viewer {
         }
     }
 
-    fn comment_key(&mut self, key: KeyEvent, ctx: &Ctx) {
+    fn comment_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
         let Popup::Comment { target, buf } = &mut self.popup else {
-            return;
+            return Exit::Stay;
         };
         match key.code {
             KeyCode::Enter => {
                 let (target, text) = (target.clone(), buf.clone());
                 self.popup = Popup::None;
                 if text.is_empty() {
-                    return;
+                    return Exit::Stay;
                 }
                 let ok = match &target {
                     super::AnnTarget::Addr(addr) => ctx.bn.comment_set_addr(addr, &text),
@@ -142,8 +136,9 @@ impl Viewer {
                 if ok {
                     self.status =
                         format!(" ✓ comment set {}   (`bn save` to persist)", target.label());
-                    // Re-render so the note shows inline (no ctx change).
-                    self.load(ctx);
+                    // Refresh the viewer and every cached list (especially
+                    // Marks) so a lens mutation is never stale on return.
+                    return Exit::Reload;
                 } else {
                     self.status = format!(" ✗ comment {} failed", target.label());
                 }
@@ -155,11 +150,12 @@ impl Viewer {
             KeyCode::Char(ch) => buf.push(ch),
             _ => {}
         }
+        Exit::Stay
     }
 
-    fn tag_key(&mut self, key: KeyEvent, ctx: &Ctx) {
+    fn tag_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
         let Popup::Tag { target, buf } = &mut self.popup else {
-            return;
+            return Exit::Stay;
         };
         match key.code {
             KeyCode::Enter => {
@@ -172,6 +168,7 @@ impl Viewer {
                 if ok {
                     self.status =
                         format!(" ✓ bookmarked {}   (`bn save` to persist)", target.label());
+                    return Exit::Reload;
                 } else {
                     self.status = format!(" ✗ tag {} failed", target.label());
                 }
@@ -183,6 +180,7 @@ impl Viewer {
             KeyCode::Char(ch) => buf.push(ch),
             _ => {}
         }
+        Exit::Stay
     }
 
     fn search_key(&mut self, key: KeyEvent) {
@@ -264,8 +262,8 @@ impl Viewer {
             }
             // Hotspot step (vim-ish word motion): functions, data, strings,
             // and every local (including v0_2-style temps — those get renamed).
-            KeyCode::Char('w') | KeyCode::Tab => self.next_symbol(1),
-            KeyCode::Char('b') | KeyCode::BackTab => self.next_symbol(-1),
+            KeyCode::Char('w') | KeyCode::Tab => self.next_symbol(ctx, 1),
+            KeyCode::Char('b') | KeyCode::BackTab => self.next_symbol(ctx, -1),
             // Nav history (browser jumplist) — not in-view motion.
             KeyCode::Char('o') if control => return self.back(ctx),
             KeyCode::Char('f') if control => {
@@ -405,8 +403,10 @@ impl Viewer {
     /// sets its own status for the CFG view.)
     fn reload_view(&mut self, ctx: &Ctx) {
         self.load(ctx);
-        self.top = 0;
-        self.cline = 0;
+        if self.focus_addr.is_none() {
+            self.top = 0;
+            self.cline = 0;
+        }
         self.active = None;
         if !matches!(self.view, View::Cfg) {
             self.status = format!(" view: {}", self.view.label());
@@ -418,8 +418,10 @@ impl Viewer {
     fn toggle_cfg_graph(&mut self, ctx: &Ctx) {
         self.cfg_graph = !self.cfg_graph;
         self.load(ctx);
-        self.top = 0;
-        self.cline = 0;
+        if self.focus_addr.is_none() {
+            self.top = 0;
+            self.cline = 0;
+        }
         self.active = None;
     }
 
@@ -483,13 +485,13 @@ impl Viewer {
     /// `w`/`b`/Tab/Shift-Tab: step interactive spans, wrapping. Non-code
     /// addresses and the viewed function's own name are skipped; **all locals**
     /// (including `v0_2` temps) stay in the ring so they can be renamed.
-    fn next_symbol(&mut self, direction: i32) {
+    fn next_symbol(&mut self, ctx: &Ctx, direction: i32) {
         if self.spans.is_empty() {
             return;
         }
         // `tab_stops` is non-empty whenever `spans` is (it falls back to every
         // span), so indexing `stops` below is safe.
-        let stops = super::hotspots::tab_stops(&self.spans, &self.name);
+        let stops = super::hotspots::tab_stops(&self.spans, ctx.display_name(&self.name));
         // Only ring-step from a *deliberate* selection (Tab or click) that is
         // itself a stop on the cursor line. A span merely derived from the
         // cursor line (arrived via search or j/k) must not be stepped past —
@@ -515,9 +517,10 @@ impl Viewer {
         if !ctx.target.is_empty() {
             locator.push_str(&format!(" -t {}", ctx.target));
         }
-        match ctx.addr_by_name.get(&self.name) {
-            Some(address) => locator.push_str(&format!(" · {} @ {}", self.name, address)),
-            None => locator.push_str(&format!(" · {}", self.name)),
+        let display_name = ctx.display_name(&self.name);
+        match ctx.addr_by_name.get(&self.name).or(self.entry.as_ref()) {
+            Some(address) => locator.push_str(&format!(" · {display_name} @ {address}")),
+            None => locator.push_str(&format!(" · {display_name}")),
         }
         locator
     }
@@ -528,7 +531,7 @@ impl Viewer {
             snippet = snippet.chars().take(139).collect::<String>() + "…";
         }
         self.popup = Popup::Ask {
-            label: format!("{}:{}", self.name, self.cline + 1),
+            label: format!("{}:{}", ctx.display_name(&self.name), self.cline + 1),
             preview: snippet.clone(),
             prefix: format!(
                 "{} · line {} · code: {} · [user] ",
@@ -554,7 +557,7 @@ impl Viewer {
         self.popup = Popup::Ask {
             label: format!(
                 "{}:{}-{}  ({} lines)",
-                self.name,
+                ctx.display_name(&self.name),
                 low + 1,
                 high + 1,
                 high - low + 1
@@ -585,11 +588,7 @@ impl Viewer {
                 } else {
                     match herdr::pane_agent(&ctx.herdr, &ctx.agent_pane) {
                         None => " ✗ launching pane has no agent".into(),
-                        Some(agent)
-                            if !ctx.agent_session.is_empty()
-                                && !agent.session.is_empty()
-                                && agent.session != ctx.agent_session =>
-                        {
+                        Some(agent) if !herdr::same_agent_session(&ctx.agent_session, &agent) => {
                             " ✗ launching agent changed — not sending".into()
                         }
                         Some(_) if herdr::pane_run(&ctx.herdr, &ctx.agent_pane, &message) => {

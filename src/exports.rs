@@ -13,7 +13,10 @@ use ratatui::text::Span;
 
 struct ExpItem {
     addr: String,
+    /// Stable identifier for backend actions.
     name: String,
+    /// Human-facing demangled/short name.
+    display_name: String,
     /// True for a data global; false for a function (drives the action + colour).
     is_data: bool,
 }
@@ -92,10 +95,13 @@ impl ExportsList {
             .map(|e| {
                 // Cross-check bn's `(data)` tag against the known function set:
                 // an export that isn't a recovered function is data.
-                let is_data = e.is_data || !ctx.func_names.contains(&e.name);
+                let is_data = e.is_data
+                    || (!ctx.func_names.contains(&e.name)
+                        && !ctx.func_names.contains(&e.display_name));
                 ExpItem {
                     addr: e.addr,
                     name: e.name,
+                    display_name: e.display_name,
                     is_data,
                 }
             })
@@ -127,7 +133,10 @@ impl ExportsList {
         (0..self.items.len())
             .filter(|&i| {
                 let it = &self.items[i];
-                f.is_empty() || it.name.to_lowercase().contains(&f) || it.addr.contains(&f)
+                f.is_empty()
+                    || it.name.to_lowercase().contains(&f)
+                    || it.display_name.to_lowercase().contains(&f)
+                    || it.addr.contains(&f)
             })
             .collect()
     }
@@ -164,13 +173,13 @@ impl ExportsList {
         }
     }
 
-    /// `p`: peek where the export is used — pseudo-C at each callsite/ref.
+    /// `p`: peek where the export is used — exact asm plus approximate C.
     fn open_usage(&mut self, ctx: &Ctx) {
         let Some(item) = self.current() else { return };
-        let (addr, name) = (item.addr.clone(), item.name.clone());
+        let (addr, name) = (item.addr.clone(), item.display_name.clone());
         self.usage = Some(Usage {
             title: format!("uses of {name}"),
-            lines: crate::usage::report(ctx, &addr),
+            lines: crate::usage::report(ctx, &addr, &name),
             addr,
             off: 0,
         });
@@ -372,7 +381,12 @@ impl ExportsList {
             let is_sel = row == self.sel;
             let tag = if it.is_data { "  [data]" } else { "" };
             if is_sel {
-                let text = format!("  {:<aw$}  {}{tag}", it.addr, it.name, aw = self.awidth);
+                let text = format!(
+                    "  {:<aw$}  {}{tag}",
+                    it.addr,
+                    it.display_name,
+                    aw = self.awidth
+                );
                 crate::ui::put_str(
                     buf,
                     x0,
@@ -396,7 +410,7 @@ impl ExportsList {
                         .fg(crate::theme::ADDR)
                         .add_modifier(Modifier::DIM),
                 ),
-                Span::styled(format!("  {}", it.name), name_style),
+                Span::styled(format!("  {}", it.display_name), name_style),
                 Span::styled(tag, Style::default().fg(Color::DarkGray)),
             ];
             crate::ui::put_spans(buf, x0, y, w, &spans);

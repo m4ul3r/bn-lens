@@ -63,12 +63,19 @@ pane and open **bn lens beside it** (`alt+d`).
 The picker's **`recent`** section keeps a live list of what you opened (`▸`) and what the agent
 referenced in its pane (`◆`) — a shared map of where you both are.
 
-The list pane has four views, switched from the **`bn lens` menu** (`m`, or click the title):
-**Symbols** (functions + data — the default), **Strings** (every recovered string), **Imports** (the
-attack surface — imported symbols with dangerous **sinks flagged** in red, `f` for sinks-only), and
-**Marks** (your comments + tags/bookmarks; `Enter` jumps to the annotated function — the read half of
-the shared map). In Strings and Imports, **`p`** peeks where the selected entry is used — the
-**pseudo-C statement** at each callsite, grouped by function; `Enter`/`x` opens the full xrefs listing.
+The list pane has seven views, switched from the **`bn lens` menu** (`m`, or click the title):
+**Symbols**, **Strings**, **Imports**, **Exports**, **Classes**, **Types**, and **Marks**. Imports uses
+the active `bn taint models --present` catalog to label modeled sources and sinks; these are presence
+facts, explicitly **not vulnerability findings**, and `f` filters actual modeled sinks. Classes folds
+STL/vendor noise and opens RTTI, base, vtable, method, and construction evidence. In Strings, Imports,
+and Exports, **`p`** shows exact callsite disassembly first and a clearly approximate (`C≈`) mapped
+pseudo-C statement second; `Enter`/`x` opens the full xrefs listing.
+
+Targets loaded with `bn --quick` carry a persistent **QUICK ANALYSIS** warning, and absence wording is
+qualified as incomplete. Failed context or cached-list builds stay visible as an error banner instead
+of silently turning stale data into plausible empty results. Per-item reads (decompile, IL, disassembly,
+xrefs, class evidence, and memory) report errors inside their invoking view without poisoning the global
+banner.
 
 ## Keyboard shortcuts
 
@@ -80,7 +87,7 @@ most useful keys for the current mode.
 | key | action |
 |-----|--------|
 | `?` | open the global shortcut guide |
-| `m` / click **`bn lens`** | open the view menu — switch **Symbols ↔ Strings**, refresh, switch bn, help, quit |
+| `m` / click **`bn lens`** | open the view menu — switch among all seven lists, refresh, switch bn, help, quit |
 | `^R` | refresh the function list from the live bn instance |
 | `j`/`k` `g`/`G` `^D`/`^U` | move (skips the section delimiters) |
 | `/` | search — type to filter, `↑`/`↓` pick, `Enter` opens the top hit, `Tab` keeps the filter, `Esc` cancels |
@@ -125,8 +132,9 @@ most useful keys for the current mode.
 ## Design & internals
 
 See [`DESIGN.md`](DESIGN.md). Rust + `ratatui`/`crossterm`, focused modules, unit-tested token/hotspot
-helpers, one-way data flow. Writes are a narrow, annotation-only surface (rename / comment / bookmark),
-all live in the bn instance and never auto-saved to disk. `cargo test` runs the suite.
+helpers, one-way data flow. Writes are a narrow, explicit surface (rename / comment / bookmark /
+previewed type declaration), all live in the bn instance and never auto-saved to disk. `cargo test`
+runs the suite.
 
 ## License
 

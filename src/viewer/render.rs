@@ -11,6 +11,28 @@ use std::collections::HashMap;
 
 const GUTTER_WIDTH: u16 = 7; // "NNNN │ "
 
+/// Hard-wrap a composer value and retain the visible tail. The ask field is a
+/// single logical line, but hiding everything after the popup width made long
+/// prompts impossible to review before sending.
+fn tail_wrapped_lines(input: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let chars: Vec<char> = input.chars().collect();
+    let mut lines = if chars.is_empty() {
+        vec![String::new()]
+    } else {
+        chars
+            .chunks(width)
+            .map(|chunk| chunk.iter().collect())
+            .collect::<Vec<String>>()
+    };
+    if lines.len() > max_lines {
+        lines.drain(0..lines.len() - max_lines);
+    }
+    lines
+}
+
 impl Viewer {
     pub fn render(&mut self, area: Rect, buffer: &mut Buffer, ctx: &Ctx) {
         let height = area.height as usize;
@@ -120,7 +142,7 @@ impl Viewer {
                 Style::default().fg(Color::Blue),
             ));
             location.push(Span::styled(
-                self.name.clone(),
+                ctx.display_name(&self.name).to_string(),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
             location.push(Span::styled(
@@ -300,7 +322,8 @@ impl Viewer {
 
         self.render_popup(area, buffer, ctx);
         if matches!(self.popup, Popup::None) && self.stack_view.is_open() {
-            self.stack_view.render(area, buffer, &self.name);
+            self.stack_view
+                .render(area, buffer, ctx.display_name(&self.name));
         }
     }
 
@@ -328,7 +351,7 @@ impl Viewer {
                 Style::default().fg(Color::Blue),
             ),
             Span::styled(
-                self.name.clone(),
+                ctx.display_name(&self.name).to_string(),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -485,7 +508,7 @@ impl Viewer {
                 ..
             } => {
                 let box_width = (area.width.saturating_sub(6)).clamp(46, 110);
-                let box_height = 8u16;
+                let box_height = 9u16;
                 let box_x = area.x + (area.width.saturating_sub(box_width)) / 2;
                 let box_y = area.y + (area.height.saturating_sub(box_height)) / 2;
                 crate::ui::draw_box(buffer, box_x, box_y, box_width, box_height, "Ask the agent");
@@ -521,11 +544,27 @@ impl Viewer {
                 crate::ui::put_str(
                     buffer,
                     box_x + 2,
-                    box_y + 5,
-                    format!("> {input}"),
+                    box_y + 4,
+                    format!(
+                        "message · {} chars · showing the tail",
+                        input.chars().count()
+                    ),
                     (box_width - 4) as usize,
-                    Style::default(),
+                    Style::default().add_modifier(Modifier::DIM),
                 );
+                let content_width = (box_width - 6) as usize;
+                let input_lines = tail_wrapped_lines(input, content_width, 2);
+                for (row, line) in input_lines.iter().enumerate() {
+                    let prefix = if row == 0 { "> " } else { "  " };
+                    crate::ui::put_str(
+                        buffer,
+                        box_x + 2,
+                        box_y + 5 + row as u16,
+                        format!("{prefix}{line}"),
+                        (box_width - 4) as usize,
+                        Style::default(),
+                    );
+                }
                 crate::ui::put_str(
                     buffer,
                     box_x + 2,
@@ -810,5 +849,19 @@ fn cfg_cell_style(col: u8, selected: bool) -> Style {
         base.add_modifier(Modifier::DIM)
     } else {
         base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail_wrapped_lines;
+
+    #[test]
+    fn ask_composer_keeps_the_wrapped_tail() {
+        assert_eq!(
+            tail_wrapped_lines("abcdefghijklmnopqrstuvwxyz", 5, 2),
+            vec!["uvwxy", "z"]
+        );
+        assert_eq!(tail_wrapped_lines("short", 20, 2), vec!["short"]);
     }
 }

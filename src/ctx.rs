@@ -1,7 +1,7 @@
 //! Shared, loaded-once context: the resolved bn instance + target, its
 //! functions and data symbols, the address maps, and the launching pane.
 
-use crate::bn::{self, Bn, Func};
+use crate::bn::{self, AnalysisState, Bn, Func};
 use crate::herdr;
 use std::collections::{HashMap, HashSet};
 
@@ -15,12 +15,17 @@ pub struct Ctx {
     pub instance_label: String,
     pub target: String, // the `-t` selector
     pub arch: String,
+    /// Completeness is security provenance: only `Full` permits authoritative
+    /// absence wording in usage/list views.
+    pub analysis_state: AnalysisState,
     pub funcs: Vec<Func>,
     pub func_names: HashSet<String>,
     pub import_names: HashSet<String>,
     pub data_names: HashSet<String>,
     pub addr_by_name: HashMap<String, String>,
     pub name_by_addr: HashMap<String, String>,
+    /// Stable/display aliases -> the human-facing demangled name.
+    pub display_by_name: HashMap<String, String>,
     /// Raw `bn sections` lines (for the section popup).
     pub sections_text: Vec<String>,
     /// Parsed section ranges: (start, end, name, executable).
@@ -71,6 +76,26 @@ fn parse_section_ranges(lines: &[String]) -> Vec<(u64, u64, String, bool)> {
 }
 
 impl Ctx {
+    pub fn analysis_complete(&self) -> bool {
+        self.analysis_state.is_complete()
+    }
+
+    pub fn analysis_warning(&self) -> Option<String> {
+        (!self.analysis_complete()).then(|| {
+            format!(
+                "⚠ {} analysis — results and absences are incomplete",
+                self.analysis_state.label()
+            )
+        })
+    }
+
+    pub fn display_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.display_by_name
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name)
+    }
+
     /// The section containing `addr`, if any.
     pub fn section_of(&self, addr: u64) -> Option<&(u64, u64, String, bool)> {
         self.section_ranges
@@ -117,9 +142,11 @@ impl Ctx {
         let agent_pane = std::env::var("BN_LENS_PANE").unwrap_or_default();
 
         let instance = bn::resolve_instance(&bn_bin, &cwd);
+        let mut failures = Vec::new();
         if let Some(inst) = &instance {
-            if let Ok(c) = Self::build(&bn_bin, &herdr_bin, &agent_pane, Some(inst.clone()), None) {
-                return Ok(c);
+            match Self::build(&bn_bin, &herdr_bin, &agent_pane, Some(inst.clone()), None) {
+                Ok(ctx) => return Ok(ctx),
+                Err(error) => failures.push(format!("{inst}: {error}")),
             }
         }
         let mut live = Bn::session_list(&bn_bin);
@@ -128,19 +155,31 @@ impl Ctx {
             if Some(&alt.instance_id) == instance.as_ref() {
                 continue;
             }
-            if let Ok(c) = Self::build(
+            match Self::build(
                 &bn_bin,
                 &herdr_bin,
                 &agent_pane,
-                Some(alt.instance_id),
+                Some(alt.instance_id.clone()),
                 None,
             ) {
-                return Ok(c);
+                Ok(ctx) => return Ok(ctx),
+                Err(error) => failures.push(format!("{}: {error}", alt.instance_id)),
             }
         }
-        Err("no functions in any live bn instance.\n  \
+        let detail = failures
+            .into_iter()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        let detail = if detail.is_empty() {
+            String::new()
+        } else {
+            format!("\n  {detail}")
+        };
+        Err(format!(
+            "no usable target in any live bn instance.{detail}\n  \
              Open a bn session for this pane's binary, or set BN_LENS_INSTANCE."
-            .into())
+        ))
     }
 
     /// Build the context for a specific instance + target (target = None picks
@@ -160,7 +199,7 @@ impl Ctx {
                 t
             }
             None => {
-                let tl = bn.target_list();
+                let tl = bn.target_list_checked()?;
                 let sel = tl
                     .iter()
                     .find(|t| t.active)
@@ -171,29 +210,44 @@ impl Ctx {
             }
         };
 
-        let funcs = bn.functions();
+        let target_info = bn.target_info()?;
+        let funcs = bn.functions_checked()?;
         if funcs.is_empty() {
             return Err(format!("{instance:?} / {target_sel} has no functions"));
         }
 
-        let (mut addr_by_name, data_names) = bn.symbols();
+        let (mut addr_by_name, data_names) = bn.symbols_checked()?;
+        let mut func_names = HashSet::new();
+        let mut name_by_addr = HashMap::new();
+        let mut display_by_name = HashMap::new();
         for f in &funcs {
             addr_by_name.entry(f.name.clone()).or_insert(f.addr.clone());
+            addr_by_name
+                .entry(f.display_name.clone())
+                .or_insert(f.addr.clone());
+            func_names.insert(f.name.clone());
+            func_names.insert(f.display_name.clone());
+            display_by_name.insert(f.name.clone(), f.display_name.clone());
+            display_by_name.insert(f.display_name.clone(), f.display_name.clone());
+            // Canonical/raw identity wins for mutations and backend commands.
+            name_by_addr
+                .entry(f.addr.clone())
+                .or_insert_with(|| f.name.clone());
         }
-        let func_names: HashSet<String> = funcs.iter().map(|f| f.name.clone()).collect();
-        let name_by_addr: HashMap<String, String> = addr_by_name
-            .iter()
-            .map(|(n, a)| (a.clone(), n.clone()))
-            .collect();
-        let import_names = bn.imports();
-        let arch = bn.arch();
-        let sections_text = bn.sections();
+        for (name, addr) in &addr_by_name {
+            name_by_addr
+                .entry(addr.clone())
+                .or_insert_with(|| name.clone());
+        }
+        let import_names = bn.imports_checked()?;
+        let sections_text = bn.sections_checked()?;
         let section_ranges = parse_section_ranges(&sections_text);
 
         Ok(Ctx {
             instance_label: instance.unwrap_or_else(|| "(default)".into()),
             target: target_sel,
-            arch,
+            arch: target_info.arch,
+            analysis_state: target_info.analysis_state,
             bn,
             herdr: herdr_bin.to_string(),
             agent_pane: agent_pane.to_string(),
@@ -204,6 +258,7 @@ impl Ctx {
             data_names,
             addr_by_name,
             name_by_addr,
+            display_by_name,
             sections_text,
             section_ranges,
             strings_map: std::cell::OnceCell::new(),
@@ -232,18 +287,53 @@ fn target_key(target: &str) -> Option<String> {
 }
 
 impl Ctx {
-    /// Whether `transcript` plausibly concerns *this* target — the fail-closed
-    /// gate on the agent "recent" scan. Another target's addresses and symbol
-    /// names, mentioned in a transcript about a different binary, must not be
-    /// matched against this one (a mosquitto address resolving to a plausible
-    /// neard function). When the selector is empty there is only one target in
-    /// reach — no sibling to confuse it with — so any transcript is accepted.
-    pub fn transcript_concerns_target(&self, transcript: &str) -> bool {
-        match target_key(&self.target) {
-            Some(key) => transcript.to_lowercase().contains(&key),
-            None => true,
+    /// Agent-referenced tokens scoped to transcript regions whose most recent
+    /// explicit `-t/--target` selector names this target. This is intentionally
+    /// fail-closed: a target name appearing once somewhere in mixed scrollback
+    /// no longer blesses unrelated addresses from every other target.
+    pub fn recent_agent_tokens(&self, transcript: &str) -> Vec<String> {
+        scan_recent_for_target(transcript, &self.target)
+    }
+}
+
+fn explicit_target(line: &str) -> Option<&str> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if let Some(target) = tokens.iter().rev().find_map(|token| {
+        token
+            .strip_prefix("--target=")
+            .or_else(|| token.strip_prefix("-t="))
+    }) {
+        return Some(target.trim_matches(|ch: char| {
+            matches!(ch, '`' | '\'' | '"' | ',' | ';' | ')' | ']' | '}')
+        }));
+    }
+    tokens.windows(2).rev().find_map(|pair| {
+        matches!(pair[0], "-t" | "--target").then(|| {
+            pair[1].trim_matches(|ch: char| {
+                matches!(ch, '`' | '\'' | '"' | ',' | ';' | ')' | ']' | '}')
+            })
+        })
+    })
+}
+
+/// Keep only lines within explicit target-scoped transcript regions, then run
+/// the normal recency scanner over that subset.
+pub fn scan_recent_for_target(transcript: &str, target: &str) -> Vec<String> {
+    let Some(want) = target_key(target) else {
+        return scan_recent(transcript);
+    };
+    let mut active = false;
+    let mut scoped = String::new();
+    for line in transcript.lines() {
+        if let Some(selector) = explicit_target(line) {
+            active = target_key(selector).as_deref() == Some(want.as_str());
+        }
+        if active {
+            scoped.push_str(line);
+            scoped.push('\n');
         }
     }
+    scan_recent(&scoped)
 }
 
 /// Identifier / address tokens in `text`, ordered most-recently-mentioned first
@@ -284,7 +374,7 @@ pub fn scan_recent(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{sec_rank, target_key};
+    use super::{scan_recent_for_target, sec_rank, target_key};
 
     #[test]
     fn target_key_strips_path_hash_and_extension() {
@@ -292,8 +382,14 @@ mod tests {
             target_key("/home/u/.cache/bn/bndb/mosquitto.65d26f3541c254ca.bndb").as_deref(),
             Some("mosquitto")
         );
-        assert_eq!(target_key("automounter").as_deref(), Some("automounter"));
-        assert_eq!(target_key("neard.bndb").as_deref(), Some("neard"));
+        assert_eq!(
+            target_key("sample_daemon").as_deref(),
+            Some("sample_daemon")
+        );
+        assert_eq!(
+            target_key("radio_service.bndb").as_deref(),
+            Some("radio_service")
+        );
         assert_eq!(target_key(""), None);
     }
 
@@ -313,5 +409,63 @@ mod tests {
         assert_eq!(sec_rank(".rodata.str1.1"), sec_rank(".rodata"));
         assert_eq!(sec_rank(".rdata"), 0);
         assert!(sec_rank(".rodata.str1.8") < sec_rank(".dynstr"));
+    }
+
+    #[test]
+    fn recent_scan_is_scoped_by_explicit_target_regions() {
+        let transcript = "\
+bn -i demo -t radio_service decompile parse_tlv
+0x401111 memcpy parse_tlv
+bn -i demo -t media_plugin.so decompile copy_body
+0x402222 __memcpy_chk copy_body
+[bn lens] --target=media_plugin.so · sub_4013a0 @ 0x402223
+[bn lens] -i demo -t radio_service · tlv_next @ 0x403333
+0x403334 near_tlv_parse
+";
+        let radio = scan_recent_for_target(transcript, "radio_service");
+        assert!(radio.contains(&"0x401111".to_string()));
+        assert!(radio.contains(&"0x403334".to_string()));
+        assert!(!radio.contains(&"0x402222".to_string()));
+
+        let plugin = scan_recent_for_target(transcript, "media_plugin.so");
+        assert!(plugin.contains(&"0x402222".to_string()));
+        assert!(plugin.contains(&"0x402223".to_string()));
+        assert!(!plugin.contains(&"0x403334".to_string()));
+    }
+
+    #[test]
+    fn recent_scan_keeps_long_followup_discussion_in_matching_regions() {
+        // Match the 400-line recent-unwrapped capture shape: unscoped history,
+        // a long discussion after one selector, another target, then a return
+        // to the original target. Region persistence is deliberate—it keeps
+        // the agent's prose/results after a command instead of reducing recent
+        // references to the selector line itself.
+        let transcript = format!(
+            "{}[bn lens] -i demo -t radio_service · parse_frame @ 0x401000\n{}\
+             inspected caller 0x401abc parse_frame_tail\n\
+             [bn lens] -i demo -t media_plugin.so · decode_item @ 0x502000\n{}\
+             unrelated caller 0x502def decode_item_tail\n\
+             [bn lens] -i demo -t radio_service · dispatch_frame @ 0x403000\n{}\
+             final caller 0x403fed dispatch_frame_tail\n",
+            "old unscoped output\n".repeat(80),
+            "continued radio analysis\n".repeat(100),
+            "continued media analysis\n".repeat(100),
+            "continued radio followup\n".repeat(100),
+        );
+
+        let radio = scan_recent_for_target(&transcript, "radio_service");
+        assert!(radio.contains(&"0x401abc".to_string()));
+        assert!(radio.contains(&"0x403fed".to_string()));
+        assert!(!radio.contains(&"0x502def".to_string()));
+
+        let plugin = scan_recent_for_target(&transcript, "media_plugin.so");
+        assert!(plugin.contains(&"0x502def".to_string()));
+        assert!(!plugin.contains(&"0x403fed".to_string()));
+    }
+
+    #[test]
+    fn recent_scan_fails_closed_without_a_target_marker() {
+        let tokens = scan_recent_for_target("radio_service maybe 0x401111", "radio_service");
+        assert!(tokens.is_empty());
     }
 }

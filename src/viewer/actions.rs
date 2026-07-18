@@ -6,6 +6,17 @@ use crate::ctx::Ctx;
 use crate::syntax::Tok;
 
 impl Viewer {
+    fn is_current_function(&self, ctx: &Ctx, target: &str) -> bool {
+        if target == self.name || target == ctx.display_name(&self.name) {
+            return true;
+        }
+        let current = self
+            .entry
+            .as_ref()
+            .or_else(|| ctx.addr_by_name.get(&self.name));
+        current.is_some() && ctx.addr_by_name.get(target) == current
+    }
+
     /// `g`/`Enter`: act on the selected span by kind — goto a function/code
     /// address, peek a data symbol/address.
     pub(super) fn act_primary(&mut self, ctx: &Ctx) {
@@ -30,8 +41,11 @@ impl Viewer {
                 let target = span.target.clone();
                 // The signature name is a hotspot for x/r, but g on it is a
                 // self-goto — nothing to navigate to.
-                if self.view.is_code() && target == self.name {
-                    self.status = format!(" {}   (x xrefs · n rename · ; comment)", self.name);
+                if self.view.is_code() && self.is_current_function(ctx, &target) {
+                    self.status = format!(
+                        " {}   (x xrefs · n rename · ; comment)",
+                        ctx.display_name(&self.name)
+                    );
                 } else {
                     self.goto_to(ctx, target);
                 }
@@ -87,7 +101,7 @@ impl Viewer {
             }
             Some(index)
                 if self.spans[index].kind == HotKind::Func
-                    && self.spans[index].target != self.name =>
+                    && !self.is_current_function(ctx, &self.spans[index].target) =>
             {
                 (self.spans[index].target.clone(), RenameScope::Symbol)
             }
@@ -214,18 +228,24 @@ impl Viewer {
             Some(self.name.clone())
         };
         self.push_nav();
+        self.focus_addr = target
+            .starts_with("0x")
+            .then(|| crate::ctx::parse_hex(&target))
+            .flatten();
         self.name = target;
         self.view = View::Decomp;
         self.code_view = View::Decomp;
         self.load(ctx);
-        self.top = 0;
-        self.cline = 0;
-        if let Some(symbol) = landing {
-            for (index, segments) in self.lines.iter().enumerate() {
-                if segments.iter().any(|segment| segment.text == symbol) {
-                    self.cline = index;
-                    self.top = index.saturating_sub(3);
-                    break;
+        if self.focus_addr.is_none() {
+            self.top = 0;
+            self.cline = 0;
+            if let Some(symbol) = landing {
+                for (index, segments) in self.lines.iter().enumerate() {
+                    if segments.iter().any(|segment| segment.text == symbol) {
+                        self.cline = index;
+                        self.top = index.saturating_sub(3);
+                        break;
+                    }
                 }
             }
         }
@@ -342,7 +362,7 @@ impl Viewer {
     /// address (e.g. a callsite on the xrefs page), so a code ref reads as
     /// pseudo-C rather than raw bytes.
     fn peek_code(&mut self, ctx: &Ctx, identifier: &str, focus: Option<u64>, fallback: &str) {
-        let Some((name, text)) = ctx.bn.decompile_json(identifier) else {
+        let Some((name, entry, text)) = ctx.bn.decompile_json(identifier) else {
             self.status = format!(" ✗ no decompile for {identifier}");
             return;
         };
@@ -365,10 +385,15 @@ impl Viewer {
         }
         // Center the focused statement with a few lines of lead-in context.
         let off = first_hit.map_or(0, |index| index.saturating_sub(4));
-        let title = if name.is_empty() {
+        let display_name = ctx
+            .name_by_addr
+            .get(&entry)
+            .map(|name| ctx.display_name(name))
+            .unwrap_or(name.as_str());
+        let title = if display_name.is_empty() {
             fallback.to_string()
         } else {
-            format!("decomp · {name}")
+            format!("decomp · {display_name}")
         };
         self.popup = Popup::Peek {
             title,
@@ -401,6 +426,7 @@ impl Viewer {
             None => self.name.clone(),
         };
         self.push_nav();
+        self.focus_addr = None;
         self.name = target;
         self.view = View::Xrefs;
         self.load(ctx);
@@ -413,8 +439,10 @@ impl Viewer {
         Frame {
             name: self.name.clone(),
             view: self.view,
+            code_view: self.code_view,
             top: self.top,
             cline: self.cline,
+            focus_addr: self.focus_addr,
         }
     }
 
@@ -429,9 +457,8 @@ impl Viewer {
     fn restore(&mut self, ctx: &Ctx, frame: Frame) {
         self.name = frame.name;
         self.view = frame.view;
-        if frame.view.is_code() {
-            self.code_view = frame.view;
-        }
+        self.code_view = frame.code_view;
+        self.focus_addr = frame.focus_addr;
         self.load(ctx);
         self.top = frame.top;
         self.cline = frame.cline;

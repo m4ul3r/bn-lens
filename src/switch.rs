@@ -390,10 +390,16 @@ impl Switcher {
                     .iter()
                     .map(|&idx| {
                         let t = &self.targets[idx];
+                        let analysis = match t.analysis_state.as_str() {
+                            "full" => "",
+                            "quick" => "[Q] ",
+                            _ => "[?] ",
+                        };
                         (
                             format!(
-                                "{}{}",
+                                "{}{}{}",
                                 if t.active { "● " } else { "  " },
+                                analysis,
                                 ui::clean_target_label(&t.selector)
                             ),
                             Style::default(),

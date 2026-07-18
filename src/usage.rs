@@ -1,7 +1,7 @@
 //! "Where is this used?" report — shared by the Strings and Imports views' `p`
 //! peek. Given an address, parse `bn xrefs`, decompile each referencing function
-//! once (`--addresses`), and render the pseudo-C statement at each callsite
-//! (grouped by function; disassembly fallback), plus any data-ref lines.
+//! once (`--addresses`), and render exact disassembly plus an explicitly
+//! approximate pseudo-C mapping at each callsite, plus any data-ref lines.
 
 use crate::ctx::Ctx;
 use crate::decomp::{addr_lines, lines_at};
@@ -10,14 +10,31 @@ use crate::decomp::{addr_lines, lines_at};
 /// (~hundreds of ms each) and a total site count. The full set is one `x` away.
 const MAX_SITES: usize = 12;
 const MAX_FUNCS: usize = 6;
+/// Address-prefix mappings can land on a declaration immediately beside the
+/// actual call. Hint rescue is useful there, but searching the whole function
+/// lets short/common string content select an unrelated statement.
+const MAX_HINT_RESCUE_DISTANCE: u64 = 0x40;
+const MIN_HINT_RESCUE_CHARS: usize = 4;
 
 /// Build the usage-report lines for `addr` (the popup body). Empty references
-/// yield a single explanatory line.
-pub fn report(ctx: &Ctx, addr: &str) -> Vec<String> {
-    let (code, data) = parse_xrefs(&ctx.bn.xrefs(addr));
+/// yield a single analysis-qualified explanatory line.
+pub fn report(ctx: &Ctx, addr: &str, hint: &str) -> Vec<String> {
+    let raw_xrefs = match ctx.bn.xrefs_checked(addr) {
+        Ok(xrefs) => xrefs,
+        Err(error) => return vec![format!("✗ {error}")],
+    };
+    let (code, data) = parse_xrefs(&raw_xrefs);
     let mut lines: Vec<String> = Vec::new();
+    if let Some(warning) = ctx.analysis_warning() {
+        lines.push(warning);
+        lines.push(String::new());
+    }
     if code.is_empty() && data.is_empty() {
-        lines.push("no code or data references".into());
+        lines.push(if ctx.analysis_complete() {
+            "no code or data references".into()
+        } else {
+            "no references observed in incomplete analysis".into()
+        });
     }
     if !code.is_empty() {
         lines.push("code:".into());
@@ -29,7 +46,7 @@ pub fn report(ctx: &Ctx, addr: &str) -> Vec<String> {
                 break;
             }
             funcs_left -= 1;
-            lines.push(format!("  {func}"));
+            lines.push(format!("  {}", ctx.display_name(func)));
             let dec = addr_lines(&ctx.bn.decompile_addr(func));
             for site in sites {
                 if sites_left == 0 {
@@ -37,18 +54,19 @@ pub fn report(ctx: &Ctx, addr: &str) -> Vec<String> {
                     break 'outer;
                 }
                 sites_left -= 1;
+                // The exact machine instruction is the authority. BN's
+                // address-prefixed decompile can assign a call address to a
+                // declaration/neighboring statement, so pseudo-C is explicitly
+                // approximate and never replaces the instruction evidence.
+                lines.push(format!("    {site}  asm: {}", disasm_line(ctx, site)));
                 let matched = crate::ctx::parse_hex(site)
-                    .map(|cs| lines_at(&dec, cs))
+                    .map(|cs| best_decompile_lines(&dec, cs, hint))
                     .unwrap_or_default();
-                if matched.is_empty() {
-                    lines.push(format!("    {site}  {}", disasm_line(ctx, site)));
-                } else {
-                    for (i, text) in matched.iter().take(2).enumerate() {
-                        if i == 0 {
-                            lines.push(format!("    {site}  {text}"));
-                        } else {
-                            lines.push(format!("               {text}"));
-                        }
+                for (i, text) in matched.iter().take(2).enumerate() {
+                    if i == 0 {
+                        lines.push(format!("               C≈ {text}"));
+                    } else {
+                        lines.push(format!("                  {text}"));
                     }
                 }
             }
@@ -62,6 +80,47 @@ pub fn report(ctx: &Ctx, addr: &str) -> Vec<String> {
         lines.extend(data.into_iter().map(|d| format!("  {d}")));
     }
     lines
+}
+
+/// Prefer a *nearby* pseudo-C line that actually names the referenced import /
+/// export / string. If none does, retain the ordinary address mapping, but the
+/// caller labels it `C≈` and has already rendered exact disassembly first.
+fn best_decompile_lines(dec: &[(u64, String)], site: u64, hint: &str) -> Vec<String> {
+    let mapped: Vec<String> = lines_at(dec, site)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let hint = hint.trim_matches('"').trim().to_ascii_lowercase();
+    if hint.is_empty()
+        || mapped
+            .iter()
+            .any(|line| line.to_ascii_lowercase().contains(&hint))
+    {
+        return mapped;
+    }
+
+    // Tiny literals/identifiers are too collision-prone to override even an
+    // approximate address mapping. Exact disassembly above remains available.
+    if hint.chars().count() < MIN_HINT_RESCUE_CHARS {
+        return mapped;
+    }
+
+    let closest = dec
+        .iter()
+        .filter(|(addr, text)| {
+            addr.abs_diff(site) <= MAX_HINT_RESCUE_DISTANCE
+                && text.to_ascii_lowercase().contains(&hint)
+        })
+        .min_by_key(|(addr, _)| addr.abs_diff(site))
+        .map(|(addr, _)| *addr);
+    match closest {
+        Some(addr) => dec
+            .iter()
+            .filter(|(candidate, _)| *candidate == addr)
+            .map(|(_, text)| text.clone())
+            .collect(),
+        None => mapped,
+    }
 }
 
 /// Parse `bn xrefs` text into ([(function, [callsite addrs])], [data-ref lines]).
@@ -120,7 +179,7 @@ fn disasm_line(ctx: &Ctx, addr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_xrefs;
+    use super::{best_decompile_lines, parse_xrefs};
 
     #[test]
     fn parses_code_callsites_and_data_refs() {
@@ -150,5 +209,39 @@ data refs:
         let (code, data) = parse_xrefs(text);
         assert!(code.is_empty());
         assert!(data.is_empty());
+    }
+
+    #[test]
+    fn hint_beats_a_misattributed_exact_decompile_line() {
+        let dec = vec![
+            (0x401000, "int128_t v0;".to_string()),
+            (0x401004, "memcpy(dst, src, len);".to_string()),
+            (0x402000, "memcpy(unrelated, far, away);".to_string()),
+        ];
+        assert_eq!(
+            best_decompile_lines(&dec, 0x401000, "memcpy"),
+            vec!["memcpy(dst, src, len);"]
+        );
+        assert_eq!(
+            best_decompile_lines(&dec, 0x401000, "unseen"),
+            vec!["int128_t v0;"]
+        );
+    }
+
+    #[test]
+    fn hint_rescue_rejects_distant_or_short_common_matches() {
+        let dec = vec![
+            (0x401000, "int128_t v0;".to_string()),
+            (0x401004, "log_error(\"ok\");".to_string()),
+            (0x402000, "memcpy(unrelated, far, away);".to_string()),
+        ];
+        assert_eq!(
+            best_decompile_lines(&dec, 0x401000, "memcpy"),
+            vec!["int128_t v0;"]
+        );
+        assert_eq!(
+            best_decompile_lines(&dec, 0x401000, "ok"),
+            vec!["int128_t v0;"]
+        );
     }
 }

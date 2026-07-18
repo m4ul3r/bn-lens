@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 /// Resolve a binary: env override, then PATH, then known fallbacks. Plugin
 /// panes launch with a minimal PATH that omits ~/.local/bin, so we can't rely
@@ -49,6 +50,25 @@ pub struct Bn {
     pub bin: String,
     pub instance: Option<String>,
     pub target: Option<String>,
+    /// The most recent state-building command failure for this handle. Clones
+    /// share it, so a failed context/list refresh is visible to the top-level
+    /// status bar instead of being flattened into a plausible empty result.
+    /// Per-item viewer reads report errors locally and never poison this state.
+    health: Arc<Mutex<Option<CommandFailure>>>,
+}
+
+#[derive(Clone)]
+struct CommandFailure {
+    key: String,
+    message: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HealthScope {
+    /// The caller renders this command's failure in its own view/popup.
+    Local,
+    /// Failure means a cached list/context may be stale or incomplete.
+    Shared,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +82,53 @@ pub struct TargetItem {
     pub selector: String,
     #[serde(default)]
     pub active: bool,
+    #[serde(default)]
+    pub analysis_state: String,
+}
+
+/// Analysis completeness reported by `bn target info`. Unknown is deliberately
+/// not treated as full: absence claims are authoritative only in `Full` state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnalysisState {
+    Full,
+    Quick,
+    Unknown(String),
+}
+
+impl AnalysisState {
+    pub fn from_raw(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "full" => Self::Full,
+            "quick" => Self::Quick,
+            _ => Self::Unknown(raw.trim().to_string()),
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Full => "full",
+            Self::Quick => "quick",
+            Self::Unknown(raw) if !raw.is_empty() => raw,
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TargetInfoJson {
+    #[serde(default)]
+    arch: String,
+    #[serde(default)]
+    analysis_state: String,
+}
+
+pub struct TargetInfo {
+    pub arch: String,
+    pub analysis_state: AnalysisState,
 }
 
 #[derive(Deserialize)]
@@ -83,7 +150,30 @@ pub struct Instance {
 #[derive(Clone)]
 pub struct Func {
     pub addr: String,
+    /// Stable identifier passed back to bn (normally `raw_name`).
     pub name: String,
+    /// Human-facing demangled/short name.
+    pub display_name: String,
+}
+
+#[derive(Deserialize)]
+struct FunctionListJson {
+    #[serde(default)]
+    items: Vec<FunctionItemJson>,
+    #[serde(default)]
+    has_more: bool,
+}
+
+#[derive(Deserialize)]
+struct FunctionItemJson {
+    #[serde(default)]
+    address: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    raw_name: String,
+    #[serde(default)]
+    display_name: String,
 }
 
 /// One Binary Ninja local/parameter. Stack variables use a signed frame offset
@@ -126,6 +216,8 @@ struct LocalListJson {
 struct FnRef {
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    address: String,
 }
 
 /// The subset of `bn decompile --format json` we consume.
@@ -191,8 +283,166 @@ struct CommentItemJson {
 #[derive(Clone)]
 pub struct Export {
     pub addr: String,
+    /// Stable identifier passed to bn.
     pub name: String,
+    pub display_name: String,
     pub is_data: bool,
+}
+
+#[derive(Deserialize)]
+struct ExportsJson {
+    #[serde(default)]
+    items: Vec<ExportJson>,
+    #[serde(default)]
+    has_more: bool,
+}
+
+#[derive(Deserialize)]
+struct ExportJson {
+    #[serde(default)]
+    address: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    raw_name: String,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    kind: String,
+}
+
+#[derive(Clone)]
+pub struct Import {
+    pub addr: String,
+    pub name: String,
+    pub raw_name: String,
+}
+
+#[derive(Deserialize)]
+struct ImportsJson {
+    #[serde(default)]
+    items: Vec<ImportJson>,
+    #[serde(default)]
+    has_more: bool,
+}
+
+#[derive(Deserialize)]
+struct ImportJson {
+    #[serde(default)]
+    address: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    raw_name: String,
+}
+
+/// One C++ class recovered by bn's class lens.
+#[derive(Clone)]
+pub struct ClassItem {
+    pub name: String,
+    pub method_count: usize,
+    pub has_vtable: bool,
+    pub confidence: String,
+    pub bases: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ClassesJson {
+    #[serde(default)]
+    items: Vec<ClassItemJson>,
+    #[serde(default)]
+    has_more: bool,
+}
+
+#[derive(Deserialize)]
+struct ClassItemJson {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    method_count: usize,
+    #[serde(default)]
+    has_vtable: bool,
+    #[serde(default)]
+    confidence: String,
+    #[serde(default)]
+    bases: Vec<String>,
+    #[serde(default)]
+    artifact: bool,
+}
+
+/// Roles assigned by bn's active taint-model catalog to one raw binary symbol.
+/// This is a presence catalog, never a vulnerability verdict.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelRoles {
+    pub source: bool,
+    pub sink_classes: Vec<String>,
+    pub propagator: bool,
+}
+
+#[derive(Deserialize)]
+struct ModelsJson {
+    #[serde(default)]
+    items: Vec<ModelItemJson>,
+}
+
+#[derive(Deserialize)]
+struct ModelItemJson {
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    class: String,
+    #[serde(default)]
+    raw_symbol: String,
+    #[serde(default)]
+    resolved_symbol: String,
+    #[serde(default)]
+    accepted_aliases: Vec<String>,
+}
+
+fn recovered_class(item: ClassItemJson) -> Option<ClassItem> {
+    if item.name.is_empty() || item.artifact {
+        None
+    } else {
+        Some(ClassItem {
+            name: item.name,
+            method_count: item.method_count,
+            has_vtable: item.has_vtable,
+            confidence: item.confidence,
+            bases: item.bases,
+        })
+    }
+}
+
+fn roles_from_catalog(catalog: ModelsJson) -> HashMap<String, ModelRoles> {
+    let mut roles: HashMap<String, ModelRoles> = HashMap::new();
+    for item in catalog.items {
+        let mut aliases = item.accepted_aliases;
+        aliases.push(item.raw_symbol);
+        aliases.push(item.resolved_symbol);
+        aliases.retain(|alias| !alias.is_empty());
+        aliases.sort();
+        aliases.dedup();
+        for alias in aliases {
+            let role = roles.entry(alias).or_default();
+            match item.role.as_str() {
+                "source" => role.source = true,
+                "sink" => {
+                    let class = if item.class.is_empty() {
+                        "sink".to_string()
+                    } else {
+                        item.class.clone()
+                    };
+                    if !role.sink_classes.contains(&class) {
+                        role.sink_classes.push(class);
+                        role.sink_classes.sort();
+                    }
+                }
+                "propagator" => role.propagator = true,
+                _ => {}
+            }
+        }
+    }
+    roles
 }
 
 /// One basic block of a function's CFG (from `Bn::cfg`): its start address, the
@@ -450,6 +700,7 @@ impl Bn {
             bin,
             instance,
             target,
+            health: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -464,37 +715,177 @@ impl Bn {
         c
     }
 
+    fn command_key(args: &[&str]) -> String {
+        args.first()
+            .map(|first| {
+                if let Some(second) = args.get(1).filter(|arg| !arg.starts_with('-')) {
+                    format!("{first} {second}")
+                } else {
+                    (*first).to_string()
+                }
+            })
+            .unwrap_or_else(|| "bn".into())
+    }
+
+    fn record_failure(&self, args: &[&str], message: String) {
+        if let Ok(mut health) = self.health.lock() {
+            *health = Some(CommandFailure {
+                key: Self::command_key(args),
+                message,
+            });
+        }
+    }
+
+    /// A successful retry heals the same failed command. An unrelated success
+    /// must not erase evidence that another view is stale or incomplete.
+    fn record_success(&self, args: &[&str]) {
+        let key = Self::command_key(args);
+        if let Ok(mut health) = self.health.lock() {
+            if health.as_ref().is_some_and(|failure| failure.key == key) {
+                *health = None;
+            }
+        }
+    }
+
+    /// Most recent state-building command failure for this shared handle. A
+    /// successful retry of that state family clears it; item reads neither set
+    /// nor clear shared health.
+    pub fn last_error(&self) -> Option<String> {
+        self.health
+            .lock()
+            .ok()
+            .and_then(|health| health.as_ref().map(|failure| failure.message.clone()))
+    }
+
+    fn command_error(&self, args: &[&str], stderr: &[u8], stdout: &[u8]) -> String {
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        let detail = clean_err(&String::from_utf8_lossy(detail));
+        let command = Self::command_key(args);
+        if detail.is_empty() {
+            format!("bn {command} failed")
+        } else {
+            format!("bn {command}: {detail}")
+        }
+    }
+
+    fn run_checked_with_scope(&self, args: &[&str], scope: HealthScope) -> Result<String, String> {
+        let output = self.cmd().args(args).output().map_err(|error| {
+            let message = format!("could not start bn: {error}");
+            if scope == HealthScope::Shared {
+                self.record_failure(args, message.clone());
+            }
+            message
+        })?;
+        if !output.status.success() {
+            let message = self.command_error(args, &output.stderr, &output.stdout);
+            if scope == HealthScope::Shared {
+                self.record_failure(args, message.clone());
+            }
+            return Err(message);
+        }
+        if scope == HealthScope::Shared {
+            self.record_success(args);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn run_checked(&self, args: &[&str]) -> Result<String, String> {
+        self.run_checked_with_scope(args, HealthScope::Local)
+    }
+
+    fn run_state_checked(&self, args: &[&str]) -> Result<String, String> {
+        self.run_checked_with_scope(args, HealthScope::Shared)
+    }
+
+    fn run_out_checked_with_scope(
+        &self,
+        args: &[&str],
+        scope: HealthScope,
+    ) -> Result<String, String> {
+        let tmp = unique_tmp();
+        let output = self
+            .cmd()
+            .args(args)
+            .args(["--out", &tmp])
+            .output()
+            .map_err(|error| {
+                let message = format!("could not start bn: {error}");
+                if scope == HealthScope::Shared {
+                    self.record_failure(args, message.clone());
+                }
+                message
+            })?;
+        let captured = std::fs::read_to_string(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        if !output.status.success() {
+            let message = self.command_error(args, &output.stderr, &output.stdout);
+            if scope == HealthScope::Shared {
+                self.record_failure(args, message.clone());
+            }
+            return Err(message);
+        }
+        let captured = captured.map_err(|error| {
+            let command = Self::command_key(args);
+            let message = format!("could not read bn {command} output: {error}");
+            if scope == HealthScope::Shared {
+                self.record_failure(args, message.clone());
+            }
+            message
+        })?;
+        if scope == HealthScope::Shared {
+            self.record_success(args);
+        }
+        Ok(captured)
+    }
+
+    fn run_out_checked(&self, args: &[&str]) -> Result<String, String> {
+        self.run_out_checked_with_scope(args, HealthScope::Local)
+    }
+
+    fn run_out_state_checked(&self, args: &[&str]) -> Result<String, String> {
+        self.run_out_checked_with_scope(args, HealthScope::Shared)
+    }
+
     /// Targets open in this instance (`-t` selectors).
     pub fn target_list(&self) -> Vec<TargetItem> {
+        self.target_list_checked().unwrap_or_default()
+    }
+
+    pub fn target_list_checked(&self) -> Result<Vec<TargetItem>, String> {
         // listing doesn't need -t; use a bare instance-scoped call
         let mut c = Command::new(&self.bin);
         if let Some(i) = &self.instance {
             c.arg("-i").arg(i);
         }
-        let out = c
-            .args(["target", "list", "--format", "json"])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
+        let out = match c.args(["target", "list", "--format", "json"]).output() {
+            Ok(output) if output.status.success() => {
+                self.record_success(&["target", "list"]);
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            }
+            Ok(output) => {
+                let message =
+                    self.command_error(&["target", "list"], &output.stderr, &output.stdout);
+                self.record_failure(&["target", "list"], message.clone());
+                return Err(message);
+            }
+            Err(error) => {
+                let message = format!("could not start bn: {error}");
+                self.record_failure(&["target", "list"], message.clone());
+                return Err(message);
+            }
+        };
         serde_json::from_str::<TargetListJson>(&out)
-            .map(|t| t.items)
-            .unwrap_or_default()
+            .map(|targets| targets.items)
+            .map_err(|error| {
+                let message = format!("bn target list returned invalid JSON: {error}");
+                self.record_failure(&["target", "list"], message.clone());
+                message
+            })
     }
 
     fn run(&self, args: &[&str]) -> String {
-        self.cmd()
-            .args(args)
-            .output()
-            .ok()
-            .map(|o| {
-                if o.stdout.is_empty() {
-                    String::from_utf8_lossy(&o.stderr).into_owned()
-                } else {
-                    String::from_utf8_lossy(&o.stdout).into_owned()
-                }
-            })
-            .unwrap_or_default()
+        self.run_checked(args)
+            .unwrap_or_else(|error| format!("✗ {error}"))
     }
 
     /// Run a subcommand capturing the FULL output via `--out` to a temp file —
@@ -507,11 +898,16 @@ impl Bn {
     /// reading a *previous* call's bytes — and the refresh worker thread can't
     /// collide with a foreground read.
     fn run_out(&self, args: &[&str]) -> String {
-        let tmp = unique_tmp();
-        let _ = self.cmd().args(args).args(["--out", &tmp]).output();
-        let out = std::fs::read_to_string(&tmp).unwrap_or_default();
-        let _ = std::fs::remove_file(&tmp);
-        out
+        self.run_out_checked(args)
+            .unwrap_or_else(|error| format!("✗ {error}"))
+    }
+
+    /// State-building counterpart to [`Self::run_out`]. Only list/context
+    /// reads use it: their failures invalidate cached absence/count claims and
+    /// therefore belong in the shared backend-health banner.
+    fn run_out_state(&self, args: &[&str]) -> String {
+        self.run_out_state_checked(args)
+            .unwrap_or_else(|error| format!("✗ {error}"))
     }
 
     /// All instances (parsed from `bn session list --format json`), regardless
@@ -528,32 +924,67 @@ impl Bn {
             .unwrap_or_default()
     }
 
-    /// `bn function list` -> [(addr, name)].
-    pub fn functions(&self) -> Vec<Func> {
-        let out = self.run_out(&["function", "list", "--limit", "5000"]);
-        out.lines()
-            .filter_map(|line| {
-                let mut it = line.split_whitespace();
-                let addr = it.next()?;
-                let name = it.next()?;
-                if addr.starts_with("0x") {
-                    Some(Func {
-                        addr: addr.to_string(),
-                        name: name.to_string(),
-                    })
-                } else {
-                    None
+    /// Full JSON-backed function inventory. `display_name` preserves BN's
+    /// demangling while `name` remains a stable command identifier.
+    pub fn functions_checked(&self) -> Result<Vec<Func>, String> {
+        let mut all = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let offset_arg = offset.to_string();
+            let out = self.run_out_state_checked(&[
+                "function",
+                "list",
+                "--offset",
+                &offset_arg,
+                "--limit",
+                "5000",
+                "--format",
+                "json",
+            ])?;
+            let page: FunctionListJson = serde_json::from_str(out.trim()).map_err(|error| {
+                let message = format!("bn function list returned invalid JSON: {error}");
+                self.record_failure(&["function", "list"], message.clone());
+                message
+            })?;
+            let returned = page.items.len();
+            offset += returned;
+            all.extend(page.items.into_iter().filter_map(|item| {
+                if !item.address.starts_with("0x") {
+                    return None;
                 }
-            })
-            .collect()
+                let name = if item.raw_name.is_empty() {
+                    item.name.clone()
+                } else {
+                    item.raw_name
+                };
+                let display_name = if item.display_name.is_empty() {
+                    item.name
+                } else {
+                    item.display_name
+                };
+                Some(Func {
+                    addr: item.address,
+                    name,
+                    display_name,
+                })
+            }));
+            if !page.has_more || returned == 0 {
+                break;
+            }
+        }
+        Ok(all)
     }
 
-    /// Import symbol names (`bn imports`) — the noise to dim in the picker.
-    pub fn imports(&self) -> HashSet<String> {
-        self.run_out(&["imports"])
-            .lines()
-            .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
-            .collect()
+    /// Import symbol aliases (`name` + `raw_name`) — used to dim PLT entries and
+    /// to refuse accidental import renames regardless of display spelling.
+    pub fn imports_checked(&self) -> Result<HashSet<String>, String> {
+        let mut names = HashSet::new();
+        for import in self.imports_list_checked()? {
+            names.insert(import.name);
+            names.insert(import.raw_name);
+        }
+        names.remove("");
+        Ok(names)
     }
 
     /// Every annotation — comments + tags — merged for the Marks view. Both come
@@ -561,7 +992,7 @@ impl Bn {
     /// without scraping text.
     pub fn marks(&self) -> Vec<Mark> {
         let mut marks = Vec::new();
-        let comments = self.run_out(&["comment", "list", "--format", "json"]);
+        let comments = self.run_out_state(&["comment", "list", "--format", "json"]);
         if let Ok(list) = serde_json::from_str::<CommentListJson>(&comments) {
             for c in list.items {
                 push_mark(
@@ -573,7 +1004,7 @@ impl Bn {
                 );
             }
         }
-        let tags = self.run_out(&["tag", "list", "--format", "json"]);
+        let tags = self.run_out_state(&["tag", "list", "--format", "json"]);
         if let Ok(list) = serde_json::from_str::<TagListJson>(&tags) {
             for t in list.items {
                 let kind = t
@@ -586,18 +1017,61 @@ impl Bn {
         marks
     }
 
-    /// `bn imports` -> [(addr, name)] for the Imports/attack-surface view.
-    pub fn imports_list(&self) -> Vec<(String, String)> {
-        self.run_out(&["imports"])
-            .lines()
-            .filter_map(|line| {
-                let mut it = line.split_whitespace();
-                let addr = it.next()?;
-                let name = it.next()?;
-                addr.starts_with("0x")
-                    .then(|| (addr.to_string(), name.to_string()))
-            })
-            .collect()
+    /// JSON-backed imports for the attack-surface view.
+    pub fn imports_list_checked(&self) -> Result<Vec<Import>, String> {
+        let mut all = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let offset_arg = offset.to_string();
+            let out = self.run_out_state_checked(&[
+                "imports",
+                "--offset",
+                &offset_arg,
+                "--limit",
+                "5000",
+                "--format",
+                "json",
+            ])?;
+            let page: ImportsJson = serde_json::from_str(out.trim()).map_err(|error| {
+                let message = format!("bn imports returned invalid JSON: {error}");
+                self.record_failure(&["imports"], message.clone());
+                message
+            })?;
+            let returned = page.items.len();
+            offset += returned;
+            all.extend(page.items.into_iter().filter_map(|item| {
+                item.address.starts_with("0x").then(|| Import {
+                    addr: item.address,
+                    raw_name: if item.raw_name.is_empty() {
+                        item.name.clone()
+                    } else {
+                        item.raw_name
+                    },
+                    name: item.name,
+                })
+            }));
+            if !page.has_more || returned == 0 {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    pub fn imports_list(&self) -> Vec<Import> {
+        self.imports_list_checked().unwrap_or_default()
+    }
+
+    /// Active taint-model roles keyed by every accepted raw symbol spelling.
+    /// These are catalog/presence facts, not taint findings.
+    pub fn model_roles_present(&self) -> Result<HashMap<String, ModelRoles>, String> {
+        let out =
+            self.run_out_state_checked(&["taint", "models", "--present", "--format", "json"])?;
+        let catalog: ModelsJson = serde_json::from_str(out.trim()).map_err(|error| {
+            let message = format!("bn taint models returned invalid JSON: {error}");
+            self.record_failure(&["taint", "models"], message.clone());
+            message
+        })?;
+        Ok(roles_from_catalog(catalog))
     }
 
     /// `bn types` -> the full type list (name + kind) for the Types view,
@@ -607,7 +1081,7 @@ impl Bn {
         let mut all: Vec<TypeItem> = Vec::new();
         loop {
             let offset = all.len().to_string();
-            let out = self.run_out(&[
+            let out = self.run_out_state(&[
                 "types", "--offset", &offset, "--limit", "5000", "--format", "json",
             ]);
             let (mut items, has_more) = parse_types_page(&out);
@@ -676,22 +1150,101 @@ impl Bn {
         }
     }
 
-    /// `bn exports` -> the exported symbols (public API) for the Exports view.
-    /// `--limit` matches [`functions`]: without it bn caps the listing at 100.
-    pub fn exports_list(&self) -> Vec<Export> {
-        self.run_out(&["exports", "--limit", "5000"])
-            .lines()
-            .filter_map(|line| {
-                let mut it = line.split_whitespace();
-                let addr = it.next()?;
-                let name = it.next()?;
-                addr.starts_with("0x").then(|| Export {
-                    addr: addr.to_string(),
-                    name: name.to_string(),
-                    is_data: line.contains("(data)"),
+    /// Domain C++ classes recovered from symbols/RTTI, with STL and vendored
+    /// library clusters folded out so firmware classes lead the view.
+    pub fn classes_list(&self) -> Result<Vec<ClassItem>, String> {
+        let mut all = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let offset_arg = offset.to_string();
+            let out = self.run_out_state_checked(&[
+                "class",
+                "list",
+                "--no-stl",
+                "--no-vendor",
+                "--offset",
+                &offset_arg,
+                "--limit",
+                "5000",
+                "--format",
+                "json",
+            ])?;
+            let page: ClassesJson = serde_json::from_str(out.trim()).map_err(|error| {
+                let message = format!("bn class list returned invalid JSON: {error}");
+                self.record_failure(&["class", "list"], message.clone());
+                message
+            })?;
+            let returned = page.items.len();
+            offset += returned;
+            all.extend(page.items.into_iter().filter_map(recovered_class));
+            if !page.has_more || returned == 0 {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    pub fn class_show(&self, name: &str) -> Vec<String> {
+        match self.run_out_checked(&["class", "show", name]) {
+            Ok(out) if !out.trim().is_empty() => out.lines().map(str::to_string).collect(),
+            Ok(_) => vec![format!("(no class evidence for {name})")],
+            Err(error) => vec![format!("✗ {error}")],
+        }
+    }
+
+    /// JSON-backed exported symbols (public API), including demangled display
+    /// names and an explicit function/data kind.
+    pub fn exports_list_checked(&self) -> Result<Vec<Export>, String> {
+        let mut all = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let offset_arg = offset.to_string();
+            let out = self.run_out_state_checked(&[
+                "exports",
+                "--offset",
+                &offset_arg,
+                "--limit",
+                "5000",
+                "--format",
+                "json",
+            ])?;
+            let page: ExportsJson = serde_json::from_str(out.trim()).map_err(|error| {
+                let message = format!("bn exports returned invalid JSON: {error}");
+                self.record_failure(&["exports"], message.clone());
+                message
+            })?;
+            let returned = page.items.len();
+            offset += returned;
+            all.extend(page.items.into_iter().filter_map(|item| {
+                if !item.address.starts_with("0x") {
+                    return None;
+                }
+                let name = if item.raw_name.is_empty() {
+                    item.name.clone()
+                } else {
+                    item.raw_name
+                };
+                let display_name = if item.display_name.is_empty() {
+                    item.name
+                } else {
+                    item.display_name
+                };
+                Some(Export {
+                    addr: item.address,
+                    name,
+                    display_name,
+                    is_data: item.kind == "data",
                 })
-            })
-            .collect()
+            }));
+            if !page.has_more || returned == 0 {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    pub fn exports_list(&self) -> Vec<Export> {
+        self.exports_list_checked().unwrap_or_default()
     }
 
     /// Basic blocks + typed edges of `ident`'s control-flow graph at rendering
@@ -709,25 +1262,20 @@ impl Bn {
             .unwrap_or_default()
     }
 
-    /// `bn exports` -> (name->addr map, set of data-symbol names).
-    pub fn symbols(&self) -> (HashMap<String, String>, HashSet<String>) {
-        let out = self.run_out(&["exports"]);
+    /// Export aliases -> address, plus every data-symbol alias.
+    pub fn symbols_checked(&self) -> Result<(HashMap<String, String>, HashSet<String>), String> {
         let mut addr = HashMap::new();
         let mut data = HashSet::new();
-        for line in out.lines() {
-            let mut it = line.split_whitespace();
-            let (Some(a), Some(n)) = (it.next(), it.next()) else {
-                continue;
-            };
-            if !a.starts_with("0x") {
-                continue;
-            }
-            addr.insert(n.to_string(), a.to_string());
-            if line.contains("(data)") {
-                data.insert(n.to_string());
+        for export in self.exports_list_checked()? {
+            let aliases = [export.name.clone(), export.display_name.clone()];
+            for alias in aliases.into_iter().filter(|alias| !alias.is_empty()) {
+                addr.insert(alias.clone(), export.addr.clone());
+                if export.is_data {
+                    data.insert(alias);
+                }
             }
         }
-        (addr, data)
+        Ok((addr, data))
     }
 
     /// Decompile via `--out` (avoids the stdout spill envelope for big funcs).
@@ -749,15 +1297,15 @@ impl Bn {
 
     /// Decompile `id` — a function name or any *interior* address (bn resolves
     /// it to the containing function) — as JSON, returning
-    /// `(function name, address-prefixed text)`. The JSON gives us the resolved
-    /// name directly instead of scraping the text header.
-    pub fn decompile_json(&self, id: &str) -> Option<(String, String)> {
+    /// `(function name, entry address, address-prefixed text)`. The JSON gives
+    /// us the resolved identity directly instead of scraping the text header.
+    pub fn decompile_json(&self, id: &str) -> Option<(String, String, String)> {
         let out = self.run_out(&["decompile", id, "--addresses", "--format", "json"]);
         let parsed: DecompiledFn = serde_json::from_str(&out).ok()?;
         if parsed.text.is_empty() {
             None
         } else {
-            Some((parsed.function.name, parsed.text))
+            Some((parsed.function.name, parsed.function.address, parsed.text))
         }
     }
 
@@ -791,11 +1339,16 @@ impl Bn {
 
     /// Xrefs (small; stdout is fine).
     pub fn xrefs(&self, name: &str) -> String {
-        let s = self.run_out(&["xrefs", name]);
+        self.xrefs_checked(name)
+            .unwrap_or_else(|error| format!("✗ {error}"))
+    }
+
+    pub fn xrefs_checked(&self, name: &str) -> Result<String, String> {
+        let s = self.run_out_checked(&["xrefs", name])?;
         if s.trim().is_empty() {
-            "(no xrefs)".into()
+            Ok("(no xrefs)".into())
         } else {
-            s
+            Ok(s)
         }
     }
 
@@ -804,30 +1357,41 @@ impl Bn {
         self.run(&["target", "info"])
     }
 
-    /// Section table as plain lines: a `w+x:` summary then
-    /// `start-end  size  perms  semantics  name` per section.
-    pub fn sections(&self) -> Vec<String> {
-        let out = self.run(&["sections"]);
-        let v: Vec<String> = out.lines().map(str::to_string).collect();
-        if v.is_empty() {
-            vec!["(no sections)".into()]
-        } else {
-            v
-        }
+    /// Structured target provenance used by every normal-view header. Failure
+    /// is fatal to a context build: silently guessing "full" would make empty
+    /// lists unsafe evidence.
+    pub fn target_info(&self) -> Result<TargetInfo, String> {
+        let out = self.run_state_checked(&["target", "info", "--format", "json"])?;
+        let info: TargetInfoJson = serde_json::from_str(out.trim()).map_err(|error| {
+            let message = format!("bn target info returned invalid JSON: {error}");
+            self.record_failure(&["target", "info"], message.clone());
+            message
+        })?;
+        Ok(TargetInfo {
+            arch: info.arch,
+            analysis_state: AnalysisState::from_raw(&info.analysis_state),
+        })
     }
 
-    /// Target architecture, parsed from `bn target info`.
-    pub fn arch(&self) -> String {
-        self.run(&["target", "info"])
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("arch:").map(|a| a.trim().to_string()))
-            .unwrap_or_default()
+    /// Section table as plain lines: a `w+x:` summary then
+    /// `start-end  size  perms  semantics  name` per section.
+    pub fn sections_checked(&self) -> Result<Vec<String>, String> {
+        let out = self.run_state_checked(&["sections"])?;
+        Ok(out.lines().map(str::to_string).collect())
+    }
+
+    pub fn sections(&self) -> Vec<String> {
+        match self.sections_checked() {
+            Ok(lines) if !lines.is_empty() => lines,
+            Ok(_) => vec!["(no sections)".into()],
+            Err(error) => vec![format!("✗ {error}")],
+        }
     }
 
     /// All strings: (content, address). Content is bn's rendering (same escape
     /// form as the decompile, so it matches a quote-stripped literal directly).
     pub fn strings(&self) -> Vec<(String, String)> {
-        let text = self.run_out(&["strings"]);
+        let text = self.run_out_state(&["strings"]);
         let mut out = Vec::new();
         for line in text.lines() {
             let Some(addr) = line.split_whitespace().next() else {
@@ -969,7 +1533,83 @@ pub fn newest_live(bin: &str, exclude: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_local_list_json, parse_types_page, push_mark, CommentListJson, TagListJson};
+    use super::{
+        parse_local_list_json, parse_types_page, push_mark, recovered_class, roles_from_catalog,
+        AnalysisState, Bn, ClassItemJson, CommentListJson, ModelsJson, TagListJson,
+    };
+
+    #[test]
+    fn analysis_state_fails_closed_for_unknown_values() {
+        assert!(AnalysisState::from_raw("full").is_complete());
+        assert!(!AnalysisState::from_raw("quick").is_complete());
+        assert_eq!(AnalysisState::from_raw("").label(), "unknown");
+        assert_eq!(AnalysisState::from_raw("partial").label(), "partial");
+    }
+
+    #[test]
+    fn unrelated_success_does_not_hide_a_command_failure() {
+        let bn = Bn::new("bn".into(), None, None);
+        bn.record_failure(&["strings"], "strings failed".into());
+        bn.record_success(&["class", "list"]);
+        assert_eq!(bn.last_error().as_deref(), Some("strings failed"));
+        bn.record_success(&["strings"]);
+        assert_eq!(bn.last_error(), None);
+        assert_eq!(Bn::command_key(&["imports", "--offset", "0"]), "imports");
+    }
+
+    #[test]
+    fn per_item_reads_never_poison_or_heal_shared_health() {
+        let mut bn = Bn::new("/definitely/missing/bn-lens-test-binary".into(), None, None);
+
+        // A failed viewer read is rendered in that viewer, not the global bar.
+        assert!(bn.run_out_checked(&["decompile", "missing_fn"]).is_err());
+        assert_eq!(bn.last_error(), None);
+
+        // A failed state build is sticky because cached absence/count claims
+        // can no longer be trusted.
+        assert!(bn.run_out_state_checked(&["function", "list"]).is_err());
+        assert!(bn.last_error().is_some());
+
+        // Neither a successful read of the same item nor another item heals a
+        // state failure. Only a successful retry of that state family does.
+        bn.bin = "/bin/true".into();
+        assert!(bn.run_checked(&["decompile", "missing_fn"]).is_ok());
+        assert!(bn.last_error().is_some());
+        assert!(bn.run_state_checked(&["function", "list"]).is_ok());
+        assert_eq!(bn.last_error(), None);
+    }
+
+    #[test]
+    fn model_roles_merge_aliases_without_calling_presence_findings() {
+        let json = r#"{"items":[
+          {"role":"source","raw_symbol":"read","resolved_symbol":"read","accepted_aliases":["read"]},
+          {"role":"sink","class":"overflow_len","raw_symbol":"read","resolved_symbol":"read","accepted_aliases":["read"]},
+          {"role":"propagator","raw_symbol":"memcpy","accepted_aliases":["__memcpy_chk"]}
+        ]}"#;
+        let catalog = serde_json::from_str::<ModelsJson>(json).expect("model catalog");
+        let roles = roles_from_catalog(catalog);
+        assert!(roles["read"].source);
+        assert_eq!(roles["read"].sink_classes, ["overflow_len"]);
+        assert!(roles["memcpy"].propagator);
+        assert!(roles["__memcpy_chk"].propagator);
+    }
+
+    #[test]
+    fn non_class_rtti_artifacts_are_folded_from_the_class_view() {
+        let artifact = serde_json::from_str::<ClassItemJson>(
+            r#"{"name":"int32_t ()","confidence":"rtti","artifact":true}"#,
+        )
+        .expect("artifact row");
+        assert!(recovered_class(artifact).is_none());
+
+        let domain = serde_json::from_str::<ClassItemJson>(
+            r#"{"name":"media::Parser","method_count":4,"has_vtable":true,"confidence":"rtti","bases":["media::Base"],"artifact":false}"#,
+        )
+        .expect("domain row");
+        let domain = recovered_class(domain).expect("real class retained");
+        assert_eq!(domain.name, "media::Parser");
+        assert_eq!(domain.bases, ["media::Base"]);
+    }
 
     #[test]
     fn types_page_recovers_union_kind_from_decl() {

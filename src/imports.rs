@@ -1,9 +1,9 @@
-//! The imports view: the binary's imported symbols — its attack surface. Known
-//! dangerous sinks/sources are flagged so a vuln researcher can jump straight to
-//! them. `Enter`/`x` cross-references an import (its callers land in the viewer);
-//! `p` peeks *where it's called* with the pseudo-C at each callsite; `f` toggles
-//! a sinks-only filter.
+//! The imports view: the binary's imported symbols — its attack surface. Roles
+//! come from bn's active taint-model presence catalog (not findings), with the
+//! legacy name heuristic only as a compatibility fallback. `f` is a *real*
+//! sinks-only filter; sources remain separately labeled/countable.
 
+use crate::bn::ModelRoles;
 use crate::ctx::Ctx;
 use crate::picker::Action;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -117,15 +117,41 @@ pub fn sink_category(name: &str) -> Option<&'static str> {
     None
 }
 
-/// A "high severity" category renders red; the rest yellow.
 fn is_high(cat: &str) -> bool {
-    matches!(cat, "buffer" | "command")
+    cat.contains("overflow") || cat.contains("command") || cat == "buffer"
 }
 
 struct ImpItem {
     addr: String,
     name: String,
-    sink: Option<&'static str>,
+    raw_name: String,
+    roles: ModelRoles,
+}
+
+impl ImpItem {
+    fn is_sink(&self) -> bool {
+        !self.roles.sink_classes.is_empty()
+    }
+
+    fn is_source(&self) -> bool {
+        self.roles.source
+    }
+
+    fn high_sink(&self) -> bool {
+        self.roles.sink_classes.iter().any(|class| is_high(class))
+    }
+
+    fn role_label(&self) -> String {
+        let sink = (!self.roles.sink_classes.is_empty())
+            .then(|| format!("sink:{}", self.roles.sink_classes.join(",")));
+        match (self.roles.source, sink) {
+            (true, Some(sink)) => format!("source+{sink}"),
+            (true, None) => "source".into(),
+            (false, Some(sink)) => sink,
+            (false, None) if self.roles.propagator => "propagator".into(),
+            (false, None) => String::new(),
+        }
+    }
 }
 
 enum Mode {
@@ -147,6 +173,7 @@ pub struct ImportsList {
     prev_filter: String,
     mode: Mode,
     sinks_only: bool,
+    model_backed: bool,
     sel: usize,
     top: usize,
     pending_g: bool,
@@ -159,7 +186,7 @@ fn parse_hex(s: &str) -> Option<u64> {
 
 impl ImportsList {
     pub fn new(ctx: &Ctx) -> Self {
-        let items = Self::build(ctx);
+        let (items, model_backed) = Self::build(ctx);
         let awidth = items
             .iter()
             .map(|it| it.addr.len())
@@ -173,6 +200,7 @@ impl ImportsList {
             prev_filter: String::new(),
             mode: Mode::Normal,
             sinks_only: false,
+            model_backed,
             sel: 0,
             top: 0,
             pending_g: false,
@@ -181,7 +209,9 @@ impl ImportsList {
     }
 
     pub fn refresh(&mut self, ctx: &Ctx) {
-        self.items = Self::build(ctx);
+        let (items, model_backed) = Self::build(ctx);
+        self.items = items;
+        self.model_backed = model_backed;
         self.awidth = self
             .items
             .iter()
@@ -195,23 +225,46 @@ impl ImportsList {
         self.top = self.top.min(self.sel);
     }
 
-    /// Sinks first (by category severity), then the rest — both by address —
-    /// so the attack surface sits at the top.
-    fn build(ctx: &Ctx) -> Vec<ImpItem> {
-        let mut items: Vec<ImpItem> = ctx
-            .bn
-            .imports_list()
+    /// Sinks first, then sources, then the rest — all by address.
+    fn build(ctx: &Ctx) -> (Vec<ImpItem>, bool) {
+        let imports = ctx.bn.imports_list();
+        let (models, model_backed) = match ctx.bn.model_roles_present() {
+            Ok(models) => (models, true),
+            Err(_) => (std::collections::HashMap::new(), false),
+        };
+        let mut items: Vec<ImpItem> = imports
             .into_iter()
-            .map(|(addr, name)| {
-                let sink = sink_category(&name);
-                ImpItem { addr, name, sink }
+            .map(|import| {
+                let roles = models
+                    .get(&import.raw_name)
+                    .or_else(|| models.get(&import.name))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if model_backed {
+                            return ModelRoles::default();
+                        }
+                        let mut fallback = ModelRoles::default();
+                        match sink_category(&import.name) {
+                            Some("source") => fallback.source = true,
+                            Some(category) => fallback.sink_classes.push(category.to_string()),
+                            None => {}
+                        }
+                        fallback
+                    });
+                ImpItem {
+                    addr: import.addr,
+                    name: import.name,
+                    raw_name: import.raw_name,
+                    roles,
+                }
             })
             .collect();
         items.sort_by(|a, b| {
-            let rank = |it: &ImpItem| match it.sink {
-                Some(c) if is_high(c) => 0,
-                Some(_) => 1,
-                None => 2,
+            let rank = |it: &ImpItem| match (it.is_sink(), it.is_source()) {
+                (true, _) if it.high_sink() => 0,
+                (true, _) => 1,
+                (false, true) => 2,
+                _ => 3,
             };
             rank(a).cmp(&rank(b)).then(
                 parse_hex(&a.addr)
@@ -219,7 +272,7 @@ impl ImportsList {
                     .cmp(&parse_hex(&b.addr).unwrap_or(0)),
             )
         });
-        items
+        (items, model_backed)
     }
 
     pub fn is_searching(&self) -> bool {
@@ -231,7 +284,11 @@ impl ImportsList {
     }
 
     fn sink_count(&self) -> usize {
-        self.items.iter().filter(|it| it.sink.is_some()).count()
+        self.items.iter().filter(|it| it.is_sink()).count()
+    }
+
+    fn source_count(&self) -> usize {
+        self.items.iter().filter(|it| it.is_source()).count()
     }
 
     fn filtered(&self) -> Vec<usize> {
@@ -239,13 +296,15 @@ impl ImportsList {
         (0..self.items.len())
             .filter(|&i| {
                 let it = &self.items[i];
-                if self.sinks_only && it.sink.is_none() {
+                if self.sinks_only && !it.is_sink() {
                     return false;
                 }
+                let roles = it.role_label().to_lowercase();
                 f.is_empty()
                     || it.name.to_lowercase().contains(&f)
+                    || it.raw_name.to_lowercase().contains(&f)
                     || it.addr.contains(&f)
-                    || it.sink.is_some_and(|c| c.contains(&f))
+                    || roles.contains(&f)
             })
             .collect()
     }
@@ -267,13 +326,13 @@ impl ImportsList {
         self.current().map(|it| it.addr.clone())
     }
 
-    /// `p`: peek where the import is called — pseudo-C at each callsite.
+    /// `p`: peek where the import is called — exact asm plus approximate C.
     fn open_usage(&mut self, ctx: &Ctx) {
         let Some(item) = self.current() else { return };
         let (addr, name) = (item.addr.clone(), item.name.clone());
         self.usage = Some(Usage {
             title: format!("callers of {name}"),
-            lines: crate::usage::report(ctx, &addr),
+            lines: crate::usage::report(ctx, &addr, &name),
             addr,
             off: 0,
         });
@@ -429,10 +488,16 @@ impl ImportsList {
         let mut bar = crate::ui::crumbs(ctx);
         bar.push(Span::styled(
             format!(
-                "   imports  {}/{}  · {} sinks",
+                "   imports  {}/{}  · {} sinks · {} sources{}",
                 rows.len(),
                 self.items.len(),
-                self.sink_count()
+                self.sink_count(),
+                self.source_count(),
+                if self.model_backed {
+                    " · model catalog"
+                } else {
+                    " · heuristic fallback"
+                }
             ),
             Style::default().add_modifier(Modifier::DIM),
         ));
@@ -449,11 +514,16 @@ impl ImportsList {
                 } else if self.sinks_only {
                     format!(" sinks only · filter: {}", self.filter)
                 } else if self.filter.is_empty() {
-                    String::new()
+                    if self.model_backed {
+                        " presence catalog only · NOT vulnerability findings".to_string()
+                    } else {
+                        " model catalog unavailable · heuristic labels only · NOT findings"
+                            .to_string()
+                    }
                 } else {
                     format!(" filter: {}", self.filter)
                 },
-                " j/k move · / search · f sinks-only · p callers · Enter/x xrefs · m menu · v next list · i switch · q quit",
+                " j/k move · / search · f actual-sinks · p callers · Enter/x xrefs · m menu · v next list · i switch · q quit",
             ),
         };
         crate::ui::put_str(
@@ -479,12 +549,18 @@ impl ImportsList {
             let y = area.y + 2 + (row - self.top) as u16;
             let it = &self.items[i];
             let is_sel = row == self.sel;
-            let marker = match it.sink {
-                Some(c) if is_high(c) => "⚠ ",
-                Some(_) => "• ",
-                None => "  ",
+            let marker = match (it.is_sink(), it.is_source()) {
+                (true, true) => "◆ ",
+                (true, false) => "⚠ ",
+                (false, true) => "← ",
+                (false, false) => "  ",
             };
-            let tag = it.sink.map(|c| format!("  [{c}]")).unwrap_or_default();
+            let label = it.role_label();
+            let tag = if label.is_empty() {
+                String::new()
+            } else {
+                format!("  [{label}]")
+            };
             if is_sel {
                 let text = format!(
                     "{marker}{:<aw$}  {}{tag}",
@@ -502,17 +578,21 @@ impl ImportsList {
                 );
                 continue;
             }
-            let name_style = match it.sink {
-                Some(c) if is_high(c) => {
+            let name_style = match (it.is_sink(), it.is_source()) {
+                (true, _) if it.high_sink() => {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                 }
-                Some(_) => Style::default().fg(Color::Yellow),
-                None => Style::default().fg(crate::theme::NAME),
+                (true, true) => Style::default().fg(Color::Magenta),
+                (true, false) => Style::default().fg(Color::Yellow),
+                (false, true) => Style::default().fg(Color::Cyan),
+                (false, false) => Style::default().fg(crate::theme::NAME),
             };
-            let mark_style = match it.sink {
-                Some(c) if is_high(c) => Style::default().fg(Color::Red),
-                Some(_) => Style::default().fg(Color::Yellow),
-                None => Style::default(),
+            let mark_style = match (it.is_sink(), it.is_source()) {
+                (true, _) if it.high_sink() => Style::default().fg(Color::Red),
+                (true, true) => Style::default().fg(Color::Magenta),
+                (true, false) => Style::default().fg(Color::Yellow),
+                (false, true) => Style::default().fg(Color::Cyan),
+                (false, false) => Style::default(),
             };
             let spans = vec![
                 Span::styled(marker.to_string(), mark_style),

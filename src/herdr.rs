@@ -77,6 +77,13 @@ pub struct PaneAgent {
     pub agent: String,
 }
 
+/// Whether a live pane still hosts the agent session captured at lens launch.
+/// If launch supplied an expected id, an absent live id is a mismatch too —
+/// identity cannot fail open merely because Herdr returned a partial record.
+pub fn same_agent_session(expected: &str, live: &PaneAgent) -> bool {
+    expected.is_empty() || (!live.session.is_empty() && live.session == expected)
+}
+
 /// The agent hosted by a pane, or None if the pane is gone or hosts no detected
 /// agent (a plain shell). Never guesses — an empty pane id yields None.
 pub fn pane_agent(herdr: &str, pane: &str) -> Option<PaneAgent> {
@@ -140,4 +147,24 @@ pub fn open_picker(herdr: &str, target_pane: &str, envs: &[(&str, &str)]) -> Str
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{same_agent_session, PaneAgent};
+
+    fn agent(session: &str) -> PaneAgent {
+        PaneAgent {
+            session: session.to_string(),
+            ..PaneAgent::default()
+        }
+    }
+
+    #[test]
+    fn captured_agent_identity_fails_closed() {
+        assert!(same_agent_session("", &agent("anything")));
+        assert!(same_agent_session("expected", &agent("expected")));
+        assert!(!same_agent_session("expected", &agent("other")));
+        assert!(!same_agent_session("expected", &agent("")));
+    }
 }

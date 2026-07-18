@@ -5,6 +5,7 @@
 mod app;
 mod bn;
 mod cfg;
+mod classes;
 mod ctx;
 mod decomp;
 mod exports;

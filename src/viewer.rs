@@ -77,8 +77,10 @@ impl View {
 struct Frame {
     name: String,
     view: View,
+    code_view: View,
     top: usize,
     cline: usize,
+    focus_addr: Option<u64>,
 }
 
 /// The laid-out 2D CFG plus its interactive state: which block is selected and
@@ -196,6 +198,10 @@ pub struct Viewer {
     /// `^R` refresh after the agent renames this function finds the name gone,
     /// and recovers the new name by looking this address up in the rebuilt ctx.
     entry: Option<String>,
+    /// Interior callsite that led to this function. Kept separate from `name`
+    /// so mutations always target the containing function while IL/CFG toggles
+    /// can return to the evidence site.
+    focus_addr: Option<u64>,
     view: View,
     /// The IL rendering shared by linear and CFG modes — always a code view.
     /// `i`/`I` cycle it; `v` flips linear ⇄ CFG keeping it, so toggling back
@@ -248,6 +254,7 @@ impl Viewer {
         let mut viewer = Viewer {
             name,
             entry: None,
+            focus_addr: None,
             view: if is_code { View::Decomp } else { View::Xrefs },
             code_view: View::Decomp,
             lines: Vec::new(),
@@ -329,9 +336,42 @@ impl Viewer {
         }
         if matches!(self.view, View::Cfg) {
             self.load_cfg(ctx);
+            self.apply_focus();
             return;
         }
-        self.cfg_graph_view = None; // left the CFG view
+        // Leave CFG state before loading a linear view. An interior-address
+        // navigation resolves to the containing function
+        // via JSON and uses the address-bearing decompile to retain the exact
+        // evidence location without making that address the function identity.
+        self.cfg_graph_view = None;
+        if self.view == View::Decomp {
+            if let Some(focus) = self.focus_addr {
+                let identifier = format!("0x{focus:x}");
+                if let Some((name, entry, text)) = ctx.bn.decompile_json(&identifier) {
+                    self.name = ctx.name_by_addr.get(&entry).cloned().unwrap_or(name);
+                    self.entry = (!entry.is_empty()).then_some(entry);
+                    let dec = crate::decomp::dec_lines(&text);
+                    let resolved =
+                        crate::decomp::resolve_stmt_addr(&crate::decomp::line_addrs(&dec), focus);
+                    let line = resolved.and_then(|addr| {
+                        dec.iter()
+                            .position(|candidate| candidate.addr == Some(addr))
+                    });
+                    let plain = dec
+                        .into_iter()
+                        .map(|candidate| candidate.text)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.lines = syntax::tokenize_c(&plain);
+                    self.finish_linear_load(ctx);
+                    if let Some(line) = line {
+                        self.cline = line;
+                        self.top = line.saturating_sub(3);
+                    }
+                    return;
+                }
+            }
+        }
         let text = match self.view {
             View::Decomp => ctx.bn.decompile(&self.name),
             View::Mlil => ctx.bn.il(&self.name, "mlil"),
@@ -344,6 +384,11 @@ impl Viewer {
         } else {
             syntax::tokenize_plain(&text)
         };
+        self.finish_linear_load(ctx);
+        self.apply_focus();
+    }
+
+    fn finish_linear_load(&mut self, ctx: &Ctx) {
         // Stack layout is useful in every code view; local-name hotspots remain
         // limited to decompile/MLIL where BN actually renders those names.
         let local_variables = if self.view.is_code() {
@@ -359,6 +404,63 @@ impl Viewer {
         };
         self.spans = build_spans(&self.lines, ctx, &self.locals);
         self.active = None;
+    }
+
+    /// Re-center non-decompile views on the interior site retained by a goto.
+    /// Decompile is handled from its address-bearing JSON in `load` above.
+    fn apply_focus(&mut self) {
+        let Some(focus) = self.focus_addr else { return };
+        if self.view == View::Cfg {
+            let Some((index, key)) = self.cfg_cache.as_ref().and_then(|(_, _, blocks)| {
+                blocks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, block)| {
+                        let nearest = block
+                            .insns
+                            .iter()
+                            .filter_map(|insn| crate::ctx::parse_hex(&insn.a))
+                            .min_by_key(|addr| addr.abs_diff(focus))?;
+                        Some((nearest.abs_diff(focus), index, block.start.clone()))
+                    })
+                    .min_by_key(|(distance, _, _)| *distance)
+                    .map(|(_, index, key)| (index, key))
+            }) else {
+                return;
+            };
+            if self.cfg_graph_view.is_some() {
+                self.cfg_select(index);
+            } else if let Some(line) =
+                crate::ctx::parse_hex(&key).and_then(|addr| self.cfg_index.get(&addr).copied())
+            {
+                self.cline = line;
+                self.top = line.saturating_sub(3);
+            }
+            return;
+        }
+        if self.view == View::Decomp || self.lines.is_empty() {
+            return;
+        }
+        let best = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter_map(|(line, segments)| {
+                let token = segments.iter().find_map(|segment| {
+                    let text = segment.text.trim();
+                    let normalized = text.strip_prefix("0x").unwrap_or(text);
+                    (normalized.len() >= 6 && normalized.chars().all(|ch| ch.is_ascii_hexdigit()))
+                        .then(|| u64::from_str_radix(normalized, 16).ok())
+                        .flatten()
+                })?;
+                Some((token.abs_diff(focus), line))
+            })
+            .min_by_key(|(distance, _)| *distance)
+            .map(|(_, line)| line);
+        if let Some(line) = best {
+            self.cline = line;
+            self.top = line.saturating_sub(3);
+        }
     }
 
     /// Build the CFG view at the current IL (`code_view`): walk the function's
