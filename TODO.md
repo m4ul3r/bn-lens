@@ -152,6 +152,23 @@ slightly overflags that case — acceptable while framed as a hint, but a fortif
 could sharpen it. A catalog-side suppression/coverage marker (tombstone) would let the producer mark an
 omission as *intentional* so the heuristic defers to it.
 
+## Strings — format-string triage (done)
+
+**Status:** implemented. The Strings view classifies each string as a printf format string
+(`format_kind`): an `f` key filters to **format strings only** (the printf-sink attack surface — the
+strings that flow into `printf`/`syslog`/etc.), the header shows the format count, and any string
+containing `%n` (a format-string *write* primitive) is tagged red `⚠%n`. The classifier (hardened by an
+adversarial review) handles `+`/`#` flags, width/precision, length modifiers, and positional `$`
+(`%1$n`), skips `%%`, and ignores the ambiguous space flag; crucially a conversion only counts when
+*terminal* (end / non-letter next), so word/template/URL text (`"%name%"`, `"%usage"`, `"%2Fpath"`)
+isn't misread — at the cost of not detecting a conversion glued directly to trailing letters
+(`"%dms"`). It identifies printf-shaped text, not proven printf-sink provenance — a triage lens. `Esc`
+layers like the Imports view (drop text filter → drop format filter → Home). Pure `format_kind`,
+unit-tested.
+
+**Possible follow-ups:** a combined "command/shell template" tag (`/bin/sh`, path + `%s`) could extend
+the triage lens; true printf-sink provenance would need callsite/arg analysis, not string content.
+
 ## Done this pass (for context)
 
 - Write paths: local + **function rename** (`n`), **comments** (`;`), **bookmarks/tags** (`t`).
