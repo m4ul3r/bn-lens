@@ -32,6 +32,12 @@ const TYPES: &[&str] = &[
     "wchar_t", "FILE",
 ];
 
+/// Control-flow words highlighted in the plain (MLIL/disasm) tokenizer, which
+/// otherwise leaves identifiers unstyled. `return`/`goto` already read as
+/// keywords in decompile; MLIL adds `noreturn`. Kept narrow so mnemonics and
+/// registers stay unstyled.
+const PLAIN_KEYWORDS: &[&str] = &["return", "noreturn", "goto"];
+
 fn classify_ident(id: &str) -> Tok {
     if KEYWORDS.contains(&id) {
         Tok::Keyword
@@ -193,7 +199,15 @@ pub fn tokenize_plain(text: &str) -> Vec<Line> {
                     let t: &[char] = &ch[start..i];
                     let hexish =
                         (t.len() == 2 || t.len() >= 5) && t.iter().all(|c| c.is_ascii_hexdigit());
-                    segs.push(seg(t, if hexish { Tok::Num } else { Tok::Name }));
+                    let word: String = t.iter().collect();
+                    let kind = if hexish {
+                        Tok::Num
+                    } else if PLAIN_KEYWORDS.contains(&word.as_str()) {
+                        Tok::Keyword
+                    } else {
+                        Tok::Name
+                    };
+                    segs.push(seg(t, kind));
                 } else {
                     segs.push(seg(&ch[i..i + 1], Tok::Plain));
                     i += 1;
@@ -218,6 +232,26 @@ mod tests {
         assert_eq!(classify_ident("uint64_t"), Tok::Type);
         assert_eq!(classify_ident("int"), Tok::Type);
         assert_eq!(classify_ident("srv_state"), Tok::Name);
+    }
+
+    #[test]
+    fn plain_tokenizer_highlights_control_keywords_not_mnemonics() {
+        // MLIL/disasm control words read as keywords; mnemonics, registers, and
+        // hex columns keep their existing kinds.
+        let line = &tokenize_plain("0040338c  goto 16 @ 0x40336c")[0];
+        let segs = kinds(line);
+        assert!(segs.iter().any(|(t, k)| *t == "goto" && *k == Tok::Keyword));
+        assert!(segs.iter().any(|(t, k)| *t == "0040338c" && *k == Tok::Num));
+        assert!(segs.iter().any(|(t, k)| *t == "0x40336c" && *k == Tok::Type));
+
+        let ret = &tokenize_plain("00403404  noreturn")[0];
+        assert!(kinds(ret)
+            .iter()
+            .any(|(t, k)| *t == "noreturn" && *k == Tok::Keyword));
+
+        // `ret` is an aarch64 mnemonic, not the C `return` — must stay a Name.
+        let asm = &tokenize_plain("00403404  ret")[0];
+        assert!(kinds(asm).iter().any(|(t, k)| *t == "ret" && *k == Tok::Name));
     }
 
     #[test]

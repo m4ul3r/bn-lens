@@ -254,6 +254,7 @@ pub struct Viewer {
     vanchor: usize,
     search: String,               // committed query (for ]/[)
     search_input: Option<String>, // Some while typing after `/`
+    goto_input: Option<String>,   // Some while typing an address/symbol after `:`
     stack: Vec<Frame>,
     /// Views popped by `b`, so `w` can walk forward again. Cleared whenever a
     /// *new* navigation (goto/xrefs) branches off the history.
@@ -308,6 +309,7 @@ impl Viewer {
             vanchor: 0,
             search: String::new(),
             search_input: None,
+            goto_input: None,
             stack: Vec::new(),
             forward: Vec::new(),
             popup: Popup::None,
@@ -365,6 +367,7 @@ impl Viewer {
     /// `?`/`^R` (and `m` is already viewer-only) while this holds.
     pub(crate) fn is_capturing_text(&self) -> bool {
         self.search_input.is_some()
+            || self.goto_input.is_some()
             || matches!(
                 self.popup,
                 Popup::Ask { .. }
@@ -429,8 +432,8 @@ impl Viewer {
         }
         let text = match self.view {
             View::Decomp => ctx.bn.decompile(&self.name),
-            View::Mlil => ctx.bn.il(&self.name, "mlil"),
-            View::Disasm => ctx.bn.disasm(&self.name),
+            View::Mlil => self.linear_annotated(ctx, View::Mlil.il_level()),
+            View::Disasm => self.linear_annotated(ctx, View::Disasm.il_level()),
             View::Xrefs => ctx.bn.xrefs(&self.name),
             View::Cfg | View::Data => unreachable!("handled above"),
         };
@@ -441,6 +444,30 @@ impl Viewer {
         };
         self.finish_linear_load(ctx);
         self.apply_focus();
+    }
+
+    /// The annotated linear listing for the MLIL/disasm views: flatten the same
+    /// `bb.disassembly_text` blocks the CFG uses (`bn.cfg`) rather than the
+    /// plain-text `bn il`/`bn disasm`, so call targets, data references, and
+    /// stack slots are symbolized instead of bare addresses — and so a resolved
+    /// call renders as a `Func` hotspot, distinct from a local branch label. The
+    /// CFG block cache is shared: when it already holds this function at `il`,
+    /// the fetch is skipped (a linear↔CFG toggle at the same level is free).
+    fn linear_annotated(&mut self, ctx: &Ctx, il: &'static str) -> String {
+        let blocks = match self.cfg_cache.take() {
+            Some((name, cached_il, blocks)) if name == self.name && cached_il == il => blocks,
+            _ => ctx.bn.cfg(&self.name, il),
+        };
+        let text = crate::cfg::flat(&blocks);
+        self.cfg_cache = Some((self.name.clone(), il, blocks));
+        if text.trim().is_empty() {
+            match il {
+                "mlil" => "(no IL)".into(),
+                _ => "(no disassembly)".into(),
+            }
+        } else {
+            text
+        }
     }
 
     fn finish_linear_load(&mut self, ctx: &Ctx) {

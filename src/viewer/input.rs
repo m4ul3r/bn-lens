@@ -37,6 +37,10 @@ impl Viewer {
             self.search_key(key);
             return Exit::Stay;
         }
+        if self.goto_input.is_some() {
+            self.goto_key(key, ctx);
+            return Exit::Stay;
+        }
         if self.vmode {
             return self.visual_key(key, ctx);
         }
@@ -367,6 +371,30 @@ impl Viewer {
         }
     }
 
+    /// Address/symbol goto (`:`): edit the buffer, commit on Enter. On commit the
+    /// input is resolved and navigated in `goto_address`.
+    fn goto_key(&mut self, key: KeyEvent, ctx: &Ctx) {
+        match key.code {
+            KeyCode::Enter => {
+                if let Some(input) = self.goto_input.take() {
+                    self.goto_address(ctx, &input);
+                }
+            }
+            KeyCode::Esc => self.goto_input = None,
+            KeyCode::Backspace => {
+                if let Some(input) = self.goto_input.as_mut() {
+                    input.pop();
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Some(input) = self.goto_input.as_mut() {
+                    input.push(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Jump the cursor to the next/previous line containing the search query.
     fn jump_match(&mut self, direction: i64) {
         if self.search.is_empty() || self.lines.is_empty() {
@@ -480,6 +508,7 @@ impl Viewer {
                 self.vanchor = self.cline;
             }
             KeyCode::Char('/') => self.search_input = Some(String::new()),
+            KeyCode::Char(':') => self.goto_input = Some(String::new()),
             KeyCode::Char(']') => self.jump_match(1),
             KeyCode::Char('[') => self.jump_match(-1),
             KeyCode::Char('a') => self.open_ask_line(ctx),

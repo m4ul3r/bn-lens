@@ -28,6 +28,7 @@ pub fn asm_style(tok: Tok) -> Style {
         Tok::Type => Style::default().fg(Color::Cyan), // 0x… addresses
         Tok::Num => Style::default().add_modifier(Modifier::DIM), // bare hex: addr col, bytes, imms
         Tok::Str => Style::default().fg(Color::Yellow),
+        Tok::Keyword => Style::default().fg(Color::Magenta), // return/noreturn/goto
         Tok::Comment => Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::DIM),

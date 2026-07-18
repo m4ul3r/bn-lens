@@ -52,6 +52,21 @@ impl Viewer {
             }
             HotKind::Addr if span.code => {
                 let target = span.target.clone();
+                // A within-function jump target (an MLIL `goto`/branch label) in
+                // the linear views is already on screen: move the cursor to it in
+                // place, preserving the view and function, instead of reloading.
+                // Fall back to a real navigation when it's in another function.
+                if matches!(self.view, View::Mlil | View::Disasm) {
+                    if let Some(line) =
+                        crate::ctx::parse_hex(&target).and_then(|addr| self.line_for_addr(addr))
+                    {
+                        self.push_nav(); // ^O returns to the pre-jump position
+                        self.cline = line;
+                        self.top = line.saturating_sub(3);
+                        self.active = None;
+                        return;
+                    }
+                }
                 self.goto_to(ctx, target);
             }
             HotKind::Data | HotKind::Addr => {
@@ -351,11 +366,35 @@ impl Viewer {
 
     /// Navigate to `target` (a function name or code address), pushing the nav
     /// stack. From an xrefs view, land on the *use* of the current symbol.
+    /// The first linear-view line whose leading address token equals `addr`
+    /// (the instruction-address column `cfg::flat` prints); `None` when the
+    /// address isn't in the current listing (e.g. it belongs to another
+    /// function). Used for in-place `goto`/branch jumps.
+    fn line_for_addr(&self, addr: u64) -> Option<usize> {
+        self.lines.iter().position(|segments| {
+            segments.iter().find_map(|segment| {
+                let text = segment.text.trim();
+                let normalized = text.strip_prefix("0x").unwrap_or(text);
+                (normalized.len() >= 6 && normalized.chars().all(|ch| ch.is_ascii_hexdigit()))
+                    .then(|| u64::from_str_radix(normalized, 16).ok())
+                    .flatten()
+            }) == Some(addr)
+        })
+    }
+
     pub(super) fn goto_to(&mut self, ctx: &Ctx, target: String) {
         let landing = if self.view.is_code() {
             None
         } else {
             Some(self.name.clone())
+        };
+        // Preserve the reading level across a jump: following a call from MLIL
+        // lands in the target's MLIL, disasm→disasm, decompile→decompile. From a
+        // non-code view (xrefs/data) fall back to the last code view used.
+        let keep = if self.view.is_code() {
+            self.view
+        } else {
+            self.code_view
         };
         self.push_nav();
         self.focus_addr = target
@@ -363,8 +402,8 @@ impl Viewer {
             .then(|| crate::ctx::parse_hex(&target))
             .flatten();
         self.name = target;
-        self.view = View::Decomp;
-        self.code_view = View::Decomp;
+        self.view = keep;
+        self.code_view = keep;
         self.load(ctx);
         if self.focus_addr.is_none() {
             self.top = 0;
@@ -379,6 +418,65 @@ impl Viewer {
                 }
             }
         }
+    }
+
+    /// `:` goto — resolve a typed address or symbol and navigate to it,
+    /// preserving the current reading level. A code address lands in its
+    /// containing function (the real name in the header, the cursor on the
+    /// address); a data address opens the structured data view; anything
+    /// unresolvable reports on the status line.
+    pub(super) fn goto_address(&mut self, ctx: &Ctx, raw: &str) {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return;
+        }
+        let Some(addr_str) = self.resolve_goto_target(ctx, raw) else {
+            self.status = format!(" ✗ can't resolve '{raw}'");
+            return;
+        };
+        let Some(addr) = crate::ctx::parse_hex(&addr_str) else {
+            self.status = format!(" ✗ can't resolve '{raw}'");
+            return;
+        };
+        let id = format!("0x{addr:x}");
+        if let Some((name, entry, _)) = ctx.bn.decompile_json(&id) {
+            // A code address: land in the containing function, keeping the level.
+            let resolved = ctx.name_by_addr.get(&entry).cloned().unwrap_or(name);
+            let keep = if self.view.is_code() {
+                self.view
+            } else {
+                self.code_view
+            };
+            self.push_nav();
+            self.name = resolved;
+            self.entry = (!entry.is_empty()).then_some(entry);
+            self.focus_addr = Some(addr);
+            self.view = keep;
+            self.code_view = keep;
+            self.load(ctx);
+        } else {
+            // Not inside a function — treat it as data (open_data_view pushes nav).
+            self.open_data_view(ctx, &id);
+        }
+    }
+
+    /// Turn a `:`-entered token into a canonical `0x…` address: a known symbol
+    /// wins over a hex reading (so `add` stays a symbol), then `0x…`/bare-hex
+    /// parse as hex, else fall back to the general symbol resolver. `None` when
+    /// nothing resolves.
+    fn resolve_goto_target(&self, ctx: &Ctx, raw: &str) -> Option<String> {
+        if let Some(address) = ctx.addr_by_name.get(raw) {
+            return Some(address.clone());
+        }
+        if raw.starts_with("0x") || raw.starts_with("0X") {
+            return crate::ctx::parse_hex(raw).map(|addr| format!("0x{addr:x}"));
+        }
+        if raw.len() >= 3 && raw.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return u64::from_str_radix(raw, 16)
+                .ok()
+                .map(|addr| format!("0x{addr:x}"));
+        }
+        self.resolve_addr(ctx, raw)
     }
 
     /// Resolve a symbol or 0x-literal to an address — via the known map, else

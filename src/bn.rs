@@ -1482,26 +1482,6 @@ impl Bn {
         }
     }
 
-    /// IL dump at a given level (`hlil`/`mlil`/`llil`), via `--out`.
-    pub fn il(&self, name: &str, level: &str) -> String {
-        let out = self.run_out(&["il", name, "--view", level]);
-        if out.trim().is_empty() {
-            "(no IL)".into()
-        } else {
-            out
-        }
-    }
-
-    /// Linear disassembly of a function, via `--out`.
-    pub fn disasm(&self, name: &str) -> String {
-        let out = self.run_out(&["disasm", name]);
-        if out.trim().is_empty() {
-            "(no disassembly)".into()
-        } else {
-            out
-        }
-    }
-
     /// `n` instructions in address-linear order starting *exactly* at `addr`
     /// (unlike `--count`, which slices from the containing function's start).
     /// Used to show the single instruction at an xref callsite.

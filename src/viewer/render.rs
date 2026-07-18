@@ -105,6 +105,34 @@ fn wrap_cursor(
 }
 
 impl Viewer {
+    /// Screen rows a logical line occupies once wrapped to `avail` text columns
+    /// (min 1). Mirrors the wrapping in `render`: a string literal is ellipsized
+    /// to `STR_DISPLAY_LIMIT`, everything else counts its full character width.
+    fn wrapped_rows(&self, line: usize, avail: usize) -> usize {
+        if avail == 0 {
+            return 1;
+        }
+        let width: usize = self
+            .lines
+            .get(line)
+            .map(|segments| {
+                segments
+                    .iter()
+                    .map(|segment| {
+                        if segment.kind == crate::syntax::Tok::Str {
+                            super::hotspots::truncate_str_segment(&segment.text, STR_DISPLAY_LIMIT)
+                                .map(|shown| shown.chars().count())
+                                .unwrap_or_else(|| segment.text.chars().count())
+                        } else {
+                            segment.text.chars().count()
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        ((width + avail - 1) / avail).max(1)
+    }
+
     pub fn render(&mut self, area: Rect, buffer: &mut Buffer, ctx: &Ctx) {
         let height = area.height as usize;
         let width = area.width as usize;
@@ -117,13 +145,25 @@ impl Viewer {
             self.render_cfg_graph(area, buffer, ctx);
             return;
         }
-        let body_height = height.saturating_sub(3);
+        let body_height = height.saturating_sub(3).max(1);
         self.cline = self.cline.min(self.lines.len().saturating_sub(1));
-        if self.cline < self.top {
-            self.top = self.cline;
-        } else if self.cline >= self.top + body_height {
-            self.top = self.cline + 1 - body_height;
+        // Keep the cursor on screen measured in *rendered rows*, not logical
+        // lines: long MLIL/disasm lines wrap onto continuation rows and blank
+        // block separators add lines, so the old line-count window let the
+        // cursor scroll off the bottom. Walk up from the cursor, summing wrapped
+        // row heights, to find the highest `top` whose rows still fit the body.
+        let avail = code_width.saturating_sub(GUTTER_WIDTH as usize);
+        let mut rows = self.wrapped_rows(self.cline, avail);
+        let mut min_top = self.cline;
+        while min_top > 0 {
+            let above = self.wrapped_rows(min_top - 1, avail);
+            if rows + above > body_height {
+                break;
+            }
+            rows += above;
+            min_top -= 1;
         }
+        self.top = self.top.clamp(min_top, self.cline);
 
         let candidate = self.cur_span();
         // A popup is modal: recede the backdrop so no selection styling spills
@@ -161,7 +201,18 @@ impl Viewer {
             self.view.label().to_string()
         };
         let dim = Style::default().add_modifier(Modifier::DIM);
-        if let Some(query) = &self.search_input {
+        if let Some(query) = &self.goto_input {
+            crate::ui::put_str(
+                buffer,
+                area.x,
+                area.y + 1,
+                format!(" :{query}▏   (goto 0x… / name · Enter · Esc)"),
+                code_width,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+        } else if let Some(query) = &self.search_input {
             crate::ui::put_str(
                 buffer,
                 area.x,
@@ -243,7 +294,7 @@ impl Viewer {
         } else if self.vmode {
             " j/k extend · a ask · Esc cancel · ? help"
         } else {
-            " j/k · w/b hotspot · W/B calls · g act · n/;/t · a ask · / find · i il · v cfg · ^O/^F hist · q · ? help"
+            " j/k · w/b hotspot · W/B calls · g act · n/;/t · a ask · / find · : goto · i il · v cfg · ^O/^F hist · q · ? help"
         };
         crate::ui::render_bar(
             buffer,
@@ -283,7 +334,13 @@ impl Viewer {
             } else {
                 " "
             };
-            let gutter = format!("{:>4}{marker}│ ", line + 1);
+            // A blank line (e.g. a basic-block separator in the linear views)
+            // gets no row number, so the gap reads as a clean break.
+            let gutter = if self.line_text(line).trim().is_empty() {
+                format!("{:>4}{marker}│ ", "")
+            } else {
+                format!("{:>4}{marker}│ ", line + 1)
+            };
             let gutter_style = if modal {
                 Style::default()
                     .fg(Color::Green)

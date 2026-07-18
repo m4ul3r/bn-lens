@@ -496,6 +496,11 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
+        key: ":",
+        action: "goto address or symbol (0x… / name) — lands in the containing function, keeps the IL level",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
         key: "V",
         action: "start visual line selection",
     },

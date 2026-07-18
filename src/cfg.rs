@@ -99,6 +99,34 @@ fn heads_of(blocks: &[Block]) -> HashMap<u64, String> {
         .collect()
 }
 
+/// Flatten a function's basic blocks into an address-prefixed linear listing, in
+/// the order `bn` returned them (the block order the linear disasm/MLIL views
+/// have always shown), with a blank line between blocks so basic-block
+/// boundaries are visible. Each line is `<addr>  <tokens>`; the address is a bare
+/// 8-hex column so it reads as a dim gutter rather than a jump hotspot, while the
+/// `0x…` call/branch targets inside the token text stay navigable. The tokens
+/// come from `bb.disassembly_text`, so calls, data references, and stack slots
+/// are symbolized — the whole point of routing the linear views through here
+/// instead of `bn il`/`bn disasm`, whose plain text leaves them bare addresses.
+pub fn flat(blocks: &[CfgBlock]) -> String {
+    let mut out = String::new();
+    for block in blocks.iter().filter(|b| !b.insns.is_empty()) {
+        if !out.is_empty() {
+            out.push('\n'); // blank line separating basic blocks
+        }
+        for insn in &block.insns {
+            match parse_hex(&insn.a) {
+                Some(addr) => out.push_str(&format!("{addr:08x}")),
+                None => out.push_str(&insn.a),
+            }
+            out.push_str("  ");
+            out.push_str(&insn.t);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Short word for an edge kind (`TrueBranch` -> `true`); empty for a plain
 /// unconditional fallthrough.
 fn edge_word(kind: &str) -> &str {
@@ -1109,6 +1137,40 @@ mod tests {
 
     fn as_text(g: &GraphData) -> String {
         g.chars.iter().collect()
+    }
+
+    #[test]
+    fn flat_lists_blocks_in_bn_order_with_padded_addresses() {
+        // Blocks intentionally out of address order — BN's fall-through layout
+        // can place a higher address before a lower one, and flat preserves that
+        // order (it is what the linear views have always shown). The block start
+        // is an IL-index identity here; flat keys each line off `insn.a`.
+        let blocks = vec![
+            CfgBlock {
+                start: "0x21".into(),
+                insns: vec![
+                    insn("0x40cbf0", "var_1 = x20"),
+                    insn("0x40cc00", "pthread_mutex_lock(&log_mutex)"),
+                ],
+                edges: vec![],
+            },
+            CfgBlock {
+                start: "0x1c".into(),
+                insns: vec![insn("0x40cbd4", "if (x0 != 0) then 0x40cc88 else 0x40cbec")],
+                edges: vec![],
+            },
+        ];
+        let text = flat(&blocks);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "0040cbf0  var_1 = x20",
+                "0040cc00  pthread_mutex_lock(&log_mutex)",
+                "", // basic-block boundary
+                "0040cbd4  if (x0 != 0) then 0x40cc88 else 0x40cbec",
+            ],
+        );
     }
 
     #[test]
