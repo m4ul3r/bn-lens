@@ -115,11 +115,24 @@ editing remain explicit non-goals** — the view reads existing layouts but only
 (`bn types declare --file`); struct-field editing (`bn struct field`) if that non-goal is ever
 revisited.
 
-## Sink classifier — extend coverage (minor)
+## Sink classifier — extend coverage + catalog gap-fill (done)
 
-`imports.rs::sink_category` covers the classic libc set. Consider: `mempcpy`, `stpncpy`, wide-char
-(`wcscat`/`wcsncpy`), `alloca`, `realpath`, `getwd`, `syslog`-style format sinks, and glibc-prefixed
-names (`__isoc99_sscanf` → normalize `__isoc99_` too). Keep the substring set false-positive-safe.
+**Status:** implemented. `imports.rs::sink_category` now also covers `realpath`/`getwd` (buffer),
+`readlink`/`readlinkat`/`fgets`/`recvmsg` (source), and the `v*`/wide printf family
+(`vfprintf`/`vprintf`/`vdprintf`/`wprintf`/`fwprintf`/`vwprintf`/`vfwprintf`) — on top of the earlier
+`mempcpy`/`stpncpy`/`wcs*`/`alloca`/`__isoc99_` work. More importantly, the classifier now **supplements
+the `bn taint models --present` catalog on a per-import miss** instead of being bypassed whenever a
+catalog is present (`resolve_roles`): genuine catalog holes (e.g. `__vfprintf_chk`, a `dm_strncpy`
+wrapper) now surface. Provenance is explicit — a heuristic gap-fill renders as a dimmed `?` row with a
+`hint:` label and is counted separately in the header (`· N hint`), so a guessed candidate is never
+mistaken for a catalog fact. Full heuristic-fallback mode (no catalog) is unchanged (footer already
+discloses it globally; rows aren't individually dimmed). Pure `resolve_roles` is unit-tested for
+catalog-hit-authoritative vs catalog-miss-hint vs no-catalog behavior.
+
+**Possible follow-ups:** `realpath(path, NULL)` self-allocates (safe mode) so the `hint:buffer` label
+slightly overflags that case — acceptable while framed as a hint, but a fortified/arg-aware refinement
+could sharpen it. A catalog-side suppression/coverage marker (tombstone) would let the producer mark an
+omission as *intentional* so the heuristic defers to it.
 
 ## Done this pass (for context)
 

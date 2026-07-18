@@ -46,6 +46,8 @@ pub fn sink_category(name: &str) -> Option<&'static str> {
         ("wcscat", "buffer"),
         ("wcsncat", "buffer"),
         ("wmemcpy", "buffer"),
+        ("getwd", "buffer"),   // unbounded like gets — caller buffer, no size arg
+        ("realpath", "buffer"), // resolves into caller buffer (PATH_MAX overflow)
         ("system", "command"),
         ("popen", "command"),
         ("execl", "command"),
@@ -62,7 +64,14 @@ pub fn sink_category(name: &str) -> Option<&'static str> {
         ("snprintf", "format"),
         ("vsnprintf", "format"),
         ("dprintf", "format"),
+        ("vprintf", "format"),
+        ("vfprintf", "format"),
+        ("vdprintf", "format"),
         ("syslog", "format"),
+        ("wprintf", "format"),
+        ("fwprintf", "format"),
+        ("vwprintf", "format"),
+        ("vfwprintf", "format"),
         ("swprintf", "format"),
         ("vswprintf", "format"),
         ("scanf", "source"),
@@ -74,7 +83,11 @@ pub fn sink_category(name: &str) -> Option<&'static str> {
         ("read", "source"),
         ("recv", "source"),
         ("recvfrom", "source"),
+        ("recvmsg", "source"),
         ("fread", "source"),
+        ("fgets", "source"),
+        ("readlink", "source"),   // fills buffer from fs, no NUL terminator
+        ("readlinkat", "source"),
         ("getenv", "source"),
     ];
     if let Some((_, cat)) = EXACT.iter().find(|(tok, _)| *tok == lower) {
@@ -121,11 +134,40 @@ fn is_high(cat: &str) -> bool {
     cat.contains("overflow") || cat.contains("command") || cat == "buffer"
 }
 
+/// Resolve an import's roles, preferring the model catalog and supplementing a
+/// per-import *miss* with the conservative `sink_category` heuristic. Returns
+/// `(roles, heuristic)` where `heuristic` is true only when a present catalog
+/// was silent about this import and the heuristic filled the gap — those rows
+/// render as `hint:` candidates, visually distinct from catalog-authoritative
+/// findings. In full heuristic-fallback mode (no catalog, `model_backed=false`)
+/// every row is heuristic already and the footer discloses it, so rows are not
+/// individually flagged as hints (avoids dimming the entire list).
+fn resolve_roles(
+    name: &str,
+    raw_name: &str,
+    models: &std::collections::HashMap<String, ModelRoles>,
+    model_backed: bool,
+) -> (ModelRoles, bool) {
+    if let Some(roles) = models.get(raw_name).or_else(|| models.get(name)) {
+        return (roles.clone(), false); // catalog is authoritative where present
+    }
+    let mut roles = ModelRoles::default();
+    match sink_category(name) {
+        Some("source") => roles.source = true,
+        Some(category) => roles.sink_classes.push(category.to_string()),
+        None => {}
+    }
+    let filled = roles.source || !roles.sink_classes.is_empty();
+    (roles, model_backed && filled)
+}
+
 struct ImpItem {
     addr: String,
     name: String,
     raw_name: String,
     roles: ModelRoles,
+    /// Roles came from the heuristic filling a catalog gap (see `resolve_roles`).
+    heuristic: bool,
 }
 
 impl ImpItem {
@@ -142,10 +184,14 @@ impl ImpItem {
     }
 
     fn role_label(&self) -> String {
+        // Heuristic gap-fills render as `hint:` so their provenance is obvious;
+        // catalog-backed roles keep the authoritative `sink:` prefix.
+        let kind = if self.heuristic { "hint" } else { "sink" };
         let sink = (!self.roles.sink_classes.is_empty())
-            .then(|| format!("sink:{}", self.roles.sink_classes.join(",")));
+            .then(|| format!("{kind}:{}", self.roles.sink_classes.join(",")));
         match (self.roles.source, sink) {
             (true, Some(sink)) => format!("source+{sink}"),
+            (true, None) if self.heuristic => "source?".into(),
             (true, None) => "source".into(),
             (false, Some(sink)) => sink,
             (false, None) if self.roles.propagator => "propagator".into(),
@@ -235,27 +281,14 @@ impl ImportsList {
         let mut items: Vec<ImpItem> = imports
             .into_iter()
             .map(|import| {
-                let roles = models
-                    .get(&import.raw_name)
-                    .or_else(|| models.get(&import.name))
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        if model_backed {
-                            return ModelRoles::default();
-                        }
-                        let mut fallback = ModelRoles::default();
-                        match sink_category(&import.name) {
-                            Some("source") => fallback.source = true,
-                            Some(category) => fallback.sink_classes.push(category.to_string()),
-                            None => {}
-                        }
-                        fallback
-                    });
+                let (roles, heuristic) =
+                    resolve_roles(&import.name, &import.raw_name, &models, model_backed);
                 ImpItem {
                     addr: import.addr,
                     name: import.name,
                     raw_name: import.raw_name,
                     roles,
+                    heuristic,
                 }
             })
             .collect();
@@ -289,6 +322,11 @@ impl ImportsList {
 
     fn source_count(&self) -> usize {
         self.items.iter().filter(|it| it.is_source()).count()
+    }
+
+    /// Sinks/sources whose roles came from the heuristic filling a catalog gap.
+    fn hint_count(&self) -> usize {
+        self.items.iter().filter(|it| it.heuristic).count()
     }
 
     fn filtered(&self) -> Vec<usize> {
@@ -486,13 +524,19 @@ impl ImportsList {
         let x0 = area.x;
         let w = area.width as usize;
         let mut bar = crate::ui::crumbs(ctx);
+        let hints = self.hint_count();
         bar.push(Span::styled(
             format!(
-                "   imports  {}/{}  · {} sinks · {} sources{}",
+                "   imports  {}/{}  · {} sinks · {} sources{}{}",
                 rows.len(),
                 self.items.len(),
                 self.sink_count(),
                 self.source_count(),
+                if hints > 0 {
+                    format!(" · {hints} hint")
+                } else {
+                    String::new()
+                },
                 if self.model_backed {
                     " · model catalog"
                 } else {
@@ -549,11 +593,15 @@ impl ImportsList {
             let y = area.y + 2 + (row - self.top) as u16;
             let it = &self.items[i];
             let is_sel = row == self.sel;
-            let marker = match (it.is_sink(), it.is_source()) {
-                (true, true) => "◆ ",
-                (true, false) => "⚠ ",
-                (false, true) => "← ",
-                (false, false) => "  ",
+            let marker = if it.heuristic {
+                "? " // heuristic gap-fill — a candidate, not a catalog finding
+            } else {
+                match (it.is_sink(), it.is_source()) {
+                    (true, true) => "◆ ",
+                    (true, false) => "⚠ ",
+                    (false, true) => "← ",
+                    (false, false) => "  ",
+                }
             };
             let label = it.role_label();
             let tag = if label.is_empty() {
@@ -593,6 +641,16 @@ impl ImportsList {
                 (true, false) => Style::default().fg(Color::Yellow),
                 (false, true) => Style::default().fg(Color::Cyan),
                 (false, false) => Style::default(),
+            };
+            // Heuristic gap-fills recede — dimmed so they never masquerade as
+            // catalog-authoritative findings.
+            let (name_style, mark_style) = if it.heuristic {
+                (
+                    name_style.add_modifier(Modifier::DIM),
+                    mark_style.add_modifier(Modifier::DIM),
+                )
+            } else {
+                (name_style, mark_style)
             };
             let spans = vec![
                 Span::styled(marker.to_string(), mark_style),
@@ -642,7 +700,9 @@ impl ImportsList {
 
 #[cfg(test)]
 mod tests {
-    use super::sink_category;
+    use super::{resolve_roles, sink_category};
+    use crate::bn::ModelRoles;
+    use std::collections::HashMap;
 
     #[test]
     fn classifies_libc_sinks_and_fortified_variants() {
@@ -666,6 +726,67 @@ mod tests {
         assert_eq!(sink_category("wcsncpy"), Some("buffer"));
         assert_eq!(sink_category("alloca"), Some("buffer"));
         assert_eq!(sink_category("vsscanf"), Some("source"));
+        // path-writing buffer sinks
+        assert_eq!(sink_category("getwd"), Some("buffer"));
+        assert_eq!(sink_category("realpath"), Some("buffer"));
+        assert_eq!(sink_category("__realpath_chk"), Some("buffer"));
+        // wide / variadic format sinks
+        assert_eq!(sink_category("vfprintf"), Some("format"));
+        assert_eq!(sink_category("__vfprintf_chk"), Some("format")); // the motivating hole
+        assert_eq!(sink_category("wprintf"), Some("format"));
+        assert_eq!(sink_category("fwprintf"), Some("format"));
+        assert_eq!(sink_category("vwprintf"), Some("format"));
+        assert_eq!(sink_category("vfwprintf"), Some("format"));
+        // no-NUL-terminator + line sources
+        assert_eq!(sink_category("readlink"), Some("source"));
+        assert_eq!(sink_category("readlinkat"), Some("source"));
+        assert_eq!(sink_category("fgets"), Some("source"));
+        assert_eq!(sink_category("recvmsg"), Some("source"));
+    }
+
+    #[test]
+    fn catalog_hit_stays_authoritative_miss_falls_back_to_hint() {
+        let mut catalog = HashMap::new();
+        let mut memcpy_roles = ModelRoles::default();
+        memcpy_roles.sink_classes.push("overflow_len".into());
+        catalog.insert("memcpy".to_string(), memcpy_roles);
+
+        // Catalog hit: authoritative roles used verbatim, NOT flagged heuristic,
+        // even though the name also matches the local sink heuristic.
+        let (roles, heuristic) = resolve_roles("memcpy", "memcpy", &catalog, true);
+        assert!(!heuristic);
+        assert_eq!(roles.sink_classes, vec!["overflow_len".to_string()]);
+
+        // Catalog miss while catalog is present: heuristic supplements and the
+        // row is flagged as a hint (the motivating __vfprintf_chk gap).
+        let (roles, heuristic) = resolve_roles("__vfprintf_chk", "__vfprintf_chk", &catalog, true);
+        assert!(heuristic);
+        assert_eq!(roles.sink_classes, vec!["format".to_string()]);
+
+        // A catalog miss the heuristic also can't classify: no roles, no hint.
+        let (roles, heuristic) = resolve_roles("some_opaque_fn", "some_opaque_fn", &catalog, true);
+        assert!(!heuristic);
+        assert!(roles.sink_classes.is_empty() && !roles.source);
+    }
+
+    #[test]
+    fn no_catalog_mode_does_not_flag_rows_as_hints() {
+        // model_backed=false → full heuristic-fallback mode. Rows still classify
+        // but are NOT individually marked hints (the footer discloses provenance
+        // globally), so the whole list isn't dimmed.
+        let empty = HashMap::new();
+        let (roles, heuristic) = resolve_roles("strcpy", "strcpy", &empty, false);
+        assert!(!heuristic);
+        assert_eq!(roles.sink_classes, vec!["buffer".to_string()]);
+    }
+
+    #[test]
+    fn new_sinks_do_not_overflag_lookalikes() {
+        // bounded/benign neighbours of the new entries must stay clean
+        assert_eq!(sink_category("getcwd"), None); // takes a size arg
+        assert_eq!(sink_category("readlinkat_helper"), None); // not a segment token
+        assert_eq!(sink_category("realpathname"), None); // substring, not exact
+        assert_eq!(sink_category("wprintf_wrapper"), None);
     }
 
     #[test]
