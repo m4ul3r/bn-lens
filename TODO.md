@@ -24,12 +24,22 @@ cache, e.g. `~/.cache/bn/bndb/<name>.bndb`. A `bn save <path>` can redirect.
 and leave `bn save` to the launching agent? (Revisit — tied to the "bn-as-CLI vs. persistent-bridge"
 transport discussion.)
 
-## Startup latency on large binaries (minor)
+## Startup latency on large binaries (done)
 
-On a ~2000-function binary, `Ctx::build` is ~1.2 s because it runs 5 sequential `bn` calls
-(`function list` ~330 ms + exports + imports + sections + arch, each paying the ~130 ms Python-CLI
-startup — see the "bn-as-CLI" discussion). It's a one-time cost, but could be trimmed by running the
-independent calls concurrently, or lazy-loading exports/imports on first use. Not urgent.
+**Status:** implemented. `Ctx::build` keeps the two prerequisite reads sequential — `target_info` (the
+session-liveness gate) then `functions` (must be non-empty) — and fans out the remaining four
+independent reads (symbols, data-symbols, imports, sections) concurrently via `std::thread::scope`.
+Measured on a 2906-function target: serial sum ≈ 0.9 s → ≈ 0.6 s. `Bn` is `Sync` (its shared failure
+state is an `Arc<Mutex>`), so scoped threads share `&bn`; the four `Result`s apply via `?` in order.
+
+Keeping the prerequisites ahead of the fan-out (per an adversarial review) preserves the sequential
+**fail-fast**: a dead/dying session errors at `target_info` immediately rather than blocking on a
+concurrently-hung bulk read (`Command::output()` has no timeout). The four fanned-out reads are only
+reached once the session is known live — the sequential path would have called all four there anyway,
+so concurrency changes their latency, not liveness.
+
+**Possible follow-ups:** subprocess-level timeouts on `bn` calls would harden the remaining edge (a bulk
+read hanging after another errored); lazy-load exports/imports on first view use to trim further.
 
 ## Navigation / session persistence (side-parked)
 

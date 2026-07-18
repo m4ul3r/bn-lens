@@ -231,13 +231,39 @@ impl Ctx {
             }
         };
 
+        // Prerequisites run first and sequentially. `target_info` is the session
+        // -liveness gate and `functions` must be non-empty; checking them before
+        // the fan-out preserves the sequential *fail-fast* — a dead/dying session
+        // errors here immediately instead of blocking on a concurrently-hung read
+        // (`Command::output()` has no timeout). This is the realistic failure
+        // mode; guarding it is worth a little latency.
         let target_info = bn.target_info()?;
         let funcs = bn.functions_checked()?;
         if funcs.is_empty() {
             return Err(format!("{instance:?} / {target_sel} has no functions"));
         }
 
-        let (mut addr_by_name, mut data_names) = bn.symbols_checked()?;
+        // The remaining four reads are independent and only reached once the
+        // session is known live (the sequential path would call all four here
+        // too), so run them concurrently to shed the serial ~130 ms/call CLI
+        // startup — the bulk of `Ctx::build` latency on large binaries. `Bn` is
+        // `Sync` (its shared failure state is an `Arc<Mutex>`), so scoped threads
+        // share `&bn`; `?` below applies their `Result`s in the original order.
+        // `data_symbols` is best-effort and cannot error.
+        let (symbols, data_syms, import_names, sections_text) = std::thread::scope(|s| {
+            let sy = s.spawn(|| bn.symbols_checked());
+            let ds = s.spawn(|| bn.data_symbols());
+            let im = s.spawn(|| bn.imports_checked());
+            let se = s.spawn(|| bn.sections_checked());
+            (
+                sy.join().unwrap(),
+                ds.join().unwrap(),
+                im.join().unwrap(),
+                se.join().unwrap(),
+            )
+        });
+
+        let (mut addr_by_name, mut data_names) = symbols?;
         let mut func_names = HashSet::new();
         let mut name_by_addr = HashMap::new();
         let mut display_by_name = HashMap::new();
@@ -261,7 +287,7 @@ impl Ctx {
         // can't target it). Best-effort:
         // an empty result just falls back to exports + `data_<hex>` recognition.
         // Inserted before the name_by_addr fill below so it picks them up too.
-        for (addr, name) in bn.data_symbols() {
+        for (addr, name) in data_syms {
             if name.is_empty() || func_names.contains(&name) {
                 continue;
             }
@@ -273,8 +299,8 @@ impl Ctx {
                 .entry(addr.clone())
                 .or_insert_with(|| name.clone());
         }
-        let import_names = bn.imports_checked()?;
-        let sections_text = bn.sections_checked()?;
+        let import_names = import_names?;
+        let sections_text = sections_text?;
         let section_ranges = parse_section_ranges(&sections_text);
 
         Ok(Ctx {
