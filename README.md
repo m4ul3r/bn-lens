@@ -64,12 +64,8 @@ The picker's **`recent`** section keeps a live list of what you opened (`▸`) a
 referenced in its pane (`◆`) — a shared map of where you both are.
 
 The list pane has seven views, switched from the **`bn lens` menu** (`m`, or click the title):
-**Symbols**, **Strings**, **Imports**, **Exports**, **Classes**, **Types**, and **Marks**. Imports uses
-the active `bn taint models --present` catalog to label modeled sources and sinks; these are presence
-facts, explicitly **not vulnerability findings**, and `f` filters actual modeled sinks. Where the catalog
-is silent about a well-known libc sink/source, a conservative built-in heuristic fills the gap and marks
-it distinctly — a dimmed `?` row with a `hint:` label (counted separately in the header) so a guessed
-candidate is never mistaken for a catalog fact. Classes folds
+**Symbols**, **Strings**, **Imports**, **Exports**, **Classes**, **Types**, and **Marks**. Imports is a
+plain, filterable list of the binary's imported symbols. Classes folds
 STL/vendor noise and opens RTTI, base, vtable, method, and construction evidence. In Strings, Imports,
 and Exports, **`p`** shows exact callsite disassembly first and a clearly approximate (`C≈`) mapped
 pseudo-C statement second; `Enter`/`x` opens the full xrefs listing.

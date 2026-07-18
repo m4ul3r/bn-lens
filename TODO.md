@@ -125,49 +125,21 @@ editing remain explicit non-goals** — the view reads existing layouts but only
 (`bn types declare --file`); struct-field editing (`bn struct field`) if that non-goal is ever
 revisited.
 
-## Sink classifier — extend coverage + catalog gap-fill (done)
+## Import classification — removed (product decision, 2026-07-18)
 
-**Status:** implemented. `imports.rs::sink_category` now also covers `realpath`/`getwd` (buffer),
-`readlink`/`readlinkat`/`fgets`/`recvmsg` (source), and the `v*`/wide printf family
-(`vfprintf`/`vprintf`/`vdprintf`/`wprintf`/`fwprintf`/`vwprintf`/`vfwprintf`) — on top of the earlier
-`mempcpy`/`stpncpy`/`wcs*`/`alloca`/`__isoc99_` work. More importantly, the classifier now **supplements
-the `bn taint models --present` catalog on a per-import miss** instead of being bypassed whenever a
-catalog is present (`resolve_roles`): genuine catalog holes (e.g. `__vfprintf_chk`, a `dm_strncpy`
-wrapper) now surface. Provenance is explicit — a heuristic gap-fill renders as a dimmed `?` row with a
-`hint:` label and is counted separately in the header (`· N hint`), so a guessed candidate is never
-mistaken for a catalog fact. Full heuristic-fallback mode (no catalog) is unchanged (footer already
-discloses it globally; rows aren't individually dimmed). Pure `resolve_roles` is unit-tested for
-catalog-hit-authoritative vs catalog-miss-hint vs no-catalog behavior.
+The Imports view no longer classifies imports at all. It's a plain, address-ordered, filterable list of
+imported symbols (`p` peeks callers, `Enter`/`x` xrefs). Removed per user direction ("I don't like us
+classifying imports, we shouldn't do that"): the lens `sink_category` heuristic, the `resolve_roles`
+catalog-supplement + `hint:` provenance, **and** the display of bn's `taint models --present` catalog
+labels, plus the sinks-only `f` filter, role colors/markers, and sink/source/hint counts. `ModelRoles` /
+`model_roles_present` / `roles_from_catalog` were deleted from `bn.rs` too. **Do not reintroduce import
+classification in the lens.** (The `bn` CLI's own `taint`/`dataflow` tooling is where sink/source
+analysis belongs.)
 
-The segment-boundary wrapper matcher now also covers **source** tokens, in two tiers (hardened by an
-adversarial review against real firmware collisions): specific tokens (`recvfrom`/`recvmsg`,
-`readlink`/`readlinkat`, `fgets`, `getenv`) match on *any* whole segment, while colliding tokens
-(`recv`, `scanf`, `fscanf`, `fread`, and `system`) match only as the *trailing* segment — so `net_recv`
-/ `safe_fread` / `tsk_sys_System` flag but `rtw_init_recv_priv` / `scanf_float` / `spi_mem_fread_qio`
-don't. Bare `read` is excluded (benign: `reg_read`, `spi_read`), and `sscanf` is excluded as a taint
-propagator (parses an existing buffer), not an origin.
+## Strings — format filter removed (product decision, 2026-07-18)
 
-**Possible follow-ups:** `realpath(path, NULL)` self-allocates (safe mode) so the `hint:buffer` label
-slightly overflags that case — acceptable while framed as a hint, but a fortified/arg-aware refinement
-could sharpen it. A catalog-side suppression/coverage marker (tombstone) would let the producer mark an
-omission as *intentional* so the heuristic defers to it.
-
-## Strings — format-string triage (done)
-
-**Status:** implemented. The Strings view classifies each string as a printf format string
-(`format_kind`): an `f` key filters to **format strings only** (the printf-sink attack surface — the
-strings that flow into `printf`/`syslog`/etc.), the header shows the format count, and any string
-containing `%n` (a format-string *write* primitive) is tagged red `⚠%n`. The classifier (hardened by an
-adversarial review) handles `+`/`#` flags, width/precision, length modifiers, and positional `$`
-(`%1$n`), skips `%%`, and ignores the ambiguous space flag; crucially a conversion only counts when
-*terminal* (end / non-letter next), so word/template/URL text (`"%name%"`, `"%usage"`, `"%2Fpath"`)
-isn't misread — at the cost of not detecting a conversion glued directly to trailing letters
-(`"%dms"`). It identifies printf-shaped text, not proven printf-sink provenance — a triage lens. `Esc`
-layers like the Imports view (drop text filter → drop format filter → Home). Pure `format_kind`,
-unit-tested.
-
-**Possible follow-ups:** a combined "command/shell template" tag (`/bin/sh`, path + `%s`) could extend
-the triage lens; true printf-sink provenance would need callsite/arg analysis, not string content.
+The Strings view's `f` format-string filter and `⚠%n` tag were removed per user direction — a plain `/`
+search (e.g. `/%`) covers the same need. Strings is back to an address-ordered, filterable list.
 
 ## Known gap: function-doc comments are invisible in the Marks view
 
@@ -194,26 +166,20 @@ comments (`;` on a Tab/`w`/click-selected address) are unaffected — those list
 
 ## Autonomous loop session (2026-07-18, branch `auto/loop-2026-07-18`)
 
-~13 commits, 116 tests, each dogfooded through herdr on a throwaway `loop-dogfood` bn instance
-(vgscan→lvm, plus firmware service binaries) and adversarially reviewed with `codex e`:
+Dogfooded through herdr on throwaway `loop-dogfood*` bn instances (vgscan→lvm, plus firmware service
+binaries) and adversarially reviewed with `codex e`. **Kept:**
 
-- **Imports classifier** now *supplements* the `bn taint models --present` catalog on per-import misses
-  with explicit `hint:` provenance — surfaces catalog holes (`__vfprintf_chk`, `__vsyslog_chk`,
-  `dm_strncpy`). Catalog sink/source totals are kept *pure* (hints counted separately as `· N hint`,
-  not folded in). Two-tier segment-wrapper matching for sources (specific tokens any-segment; colliding
-  `recv`/`scanf`/`fread`/`system` trailing-only) — codex-hardened vs real firmware collisions
-  (`rtw_init_recv_priv`, `scanf_float`). Broad coverage: `realpath`/`getwd`, `readlink*`/`fgets`, `v*`/
-  wide printf, BSD/glibc `err`/`warn`/`error`, `asprintf`/`vasprintf`/`vsyslog`, `posix_spawn*`/`fexecve`,
-  `memccpy`.
 - **`Ctx::build`** fans out its 4 bulk `bn` reads via `std::thread::scope` after the sequential
   liveness-gating prerequisites (`target_info`, `functions`) — ~0.9 s → ~0.6 s, fail-fast preserved for
   the realistic dead-session case. (Residual: a bulk read hanging *after* another errors isn't fail-fast
   — needs subprocess timeouts; see the startup-latency section.)
 - **Viewer `:` goto** completes a unique symbol-name prefix (`vg_rev` → `vg_revert`), reports an
   ambiguous count, and shows a live hint in the prompt that mirrors Enter's resolution precedence.
-- **Strings view** `f` filters to printf format strings (the printf-sink surface) and tags `%n` write
-  primitives red `⚠%n`; `FmtKind` classified once per item at build (no per-render rescan).
 - **Docs**: help overlay updated; Marks module doc corrected re the function-doc gap above.
+
+**Reverted per user direction (2026-07-18):** all import classification (the classifier work this
+session *and* the pre-existing catalog display) and the Strings format filter — see the two "removed"
+sections above. Imports and Strings are now plain filterable lists.
 
 **Still open / deliberately not done here:** threaded `p` popup (below), CFG edge-following, the
 function-doc→Marks gap (above — a design call), `bn save` persistence (below).

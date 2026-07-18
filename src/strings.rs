@@ -13,8 +13,6 @@ use ratatui::text::Span;
 struct StrItem {
     addr: String,
     content: String,
-    /// Classified once at build time — render/filter run every frame.
-    fmt: FmtKind,
 }
 
 enum Mode {
@@ -39,8 +37,6 @@ pub struct StringsList {
     sel: usize,
     top: usize,
     pending_g: bool,
-    /// `f` filter: show only printf format strings (the printf-sink surface).
-    fmt_only: bool,
     usage: Option<Usage>,
 }
 
@@ -55,69 +51,6 @@ fn ellipsize(text: &str, max: usize) -> String {
 
 fn parse_hex(s: &str) -> Option<u64> {
     u64::from_str_radix(s.trim().strip_prefix("0x")?, 16).ok()
-}
-
-/// A string's printf-format character, for VR triage. Format strings are what
-/// flow into the printf-family sinks, so they're the interesting attack surface;
-/// `%n` is the write primitive that turns a format-string bug into an arbitrary
-/// write, so it's called out separately.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FmtKind {
-    None,
-    /// Has at least one real conversion (`%s`, `%d`, …).
-    Conv,
-    /// Contains `%n` — a format-string *write* primitive.
-    WriteN,
-}
-
-/// Classify `s` as a printf format string. Scans for `%` conversions, tolerating
-/// `+`/`#` flags, width/precision, length modifiers, and positional `$`, and
-/// skipping `%%`.
-///
-/// Two deliberate precision choices keep natural text from reading as a format
-/// string: the space flag is NOT honored (so `"50% off"` / `"100% done"` don't
-/// match), and a conversion char only counts when it's *terminal* — end of
-/// string or followed by a non-letter. That rejects word-shaped text like
-/// `"%name%"` (would otherwise be a `%n` write-primitive false positive),
-/// `"%usage"`, and URL-encoded `"%2Fpath"`, while still matching the common real
-/// forms `"%s"`, `"%02x%02x"`, `"%d.%d.%d"`, and `"%s: %d"`. It identifies
-/// printf-shaped text, not proven printf-sink provenance — a triage lens.
-fn format_kind(s: &str) -> FmtKind {
-    let b = s.as_bytes();
-    let mut kind = FmtKind::None;
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'%' {
-            i += 1;
-            continue;
-        }
-        let mut j = i + 1;
-        if j < b.len() && b[j] == b'%' {
-            i = j + 1; // literal %%
-            continue;
-        }
-        // flags (+/#, not the ambiguous space), width/precision, positional `$`,
-        // and length modifiers.
-        while j < b.len()
-            && matches!(b[j], b'+' | b'#' | b'-' | b'.' | b'*' | b'$' | b'0'..=b'9'
-                | b'l' | b'h' | b'L' | b'z' | b'j' | b't' | b'q')
-        {
-            j += 1;
-        }
-        // A conversion char only counts when terminal (end, or a non-letter
-        // next) — otherwise it's a word like `%name` / `%usage`, not a spec.
-        let terminal = j + 1 >= b.len() || !b[j + 1].is_ascii_alphabetic();
-        if j < b.len() && terminal {
-            match b[j] {
-                b'n' => return FmtKind::WriteN, // strongest signal — stop here
-                b'd' | b'i' | b'o' | b'u' | b'x' | b'X' | b'e' | b'E' | b'f' | b'F' | b'g'
-                | b'G' | b'a' | b'A' | b'c' | b's' | b'p' => kind = FmtKind::Conv,
-                _ => {}
-            }
-        }
-        i = j + 1;
-    }
-    kind
 }
 
 impl StringsList {
@@ -138,7 +71,6 @@ impl StringsList {
             sel: 0,
             top: 0,
             pending_g: false,
-            fmt_only: false,
             usage: None,
         }
     }
@@ -170,10 +102,7 @@ impl StringsList {
             .strings()
             .into_iter()
             .filter(|(_, addr)| addr.starts_with("0x") && seen.insert(addr.clone()))
-            .map(|(content, addr)| {
-                let fmt = format_kind(&content);
-                StrItem { addr, content, fmt }
-            })
+            .map(|(content, addr)| StrItem { addr, content })
             .collect();
         items.sort_by_key(|it| {
             let addr = parse_hex(&it.addr).unwrap_or(0);
@@ -187,20 +116,11 @@ impl StringsList {
         (0..self.items.len())
             .filter(|&i| {
                 let it = &self.items[i];
-                let text_ok = f.is_empty()
+                f.is_empty()
                     || it.content.to_lowercase().contains(&f)
-                    || it.addr.contains(&f);
-                let fmt_ok = !self.fmt_only || it.fmt != FmtKind::None;
-                text_ok && fmt_ok
+                    || it.addr.contains(&f)
             })
             .collect()
-    }
-
-    fn fmt_count(&self) -> usize {
-        self.items
-            .iter()
-            .filter(|it| it.fmt != FmtKind::None)
-            .count()
     }
 
     fn move_sel(&mut self, delta: i64) {
@@ -314,15 +234,12 @@ impl StringsList {
             // return to the Symbols list (never closes the pane).
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Esc => {
-                // Back out one step: drop the text filter, then the fmt filter,
-                // then return to Symbols (never closes the pane).
-                if !self.filter.is_empty() {
-                    self.filter.clear();
-                } else if self.fmt_only {
-                    self.fmt_only = false;
-                } else {
+                // Esc clears the filter if set, else returns to Symbols (never
+                // closes the pane).
+                if self.filter.is_empty() {
                     return Action::Home;
                 }
+                self.filter.clear();
                 self.sel = 0;
                 self.top = 0;
             }
@@ -340,11 +257,6 @@ impl StringsList {
                 self.filter.clear();
                 self.mode = Mode::Search;
                 self.sel = 0;
-            }
-            KeyCode::Char('f') => {
-                self.fmt_only = !self.fmt_only;
-                self.sel = 0;
-                self.top = 0;
             }
             KeyCode::Char('p') => self.open_usage(ctx),
             KeyCode::Enter | KeyCode::Char('x') => {
@@ -396,12 +308,7 @@ impl StringsList {
         let w = area.width as usize;
         let mut bar = crate::ui::crumbs(ctx);
         bar.push(Span::styled(
-            format!(
-                "   strings  {}/{}  · {} format",
-                rows.len(),
-                self.items.len(),
-                self.fmt_count()
-            ),
+            format!("   strings  {}/{}", rows.len(), self.items.len()),
             Style::default().add_modifier(Modifier::DIM),
         ));
         crate::ui::render_bar(buf, x0, area.y, w, &bar);
@@ -412,13 +319,12 @@ impl StringsList {
                 " type · ↑↓ pick · Enter xrefs · Tab list · Esc cancel · ? help",
             ),
             Mode::Normal => (
-                match (self.fmt_only, self.filter.is_empty()) {
-                    (true, true) => " format strings only".to_string(),
-                    (true, false) => format!(" format only · filter: {}", self.filter),
-                    (false, true) => String::new(),
-                    (false, false) => format!(" filter: {}", self.filter),
+                if self.filter.is_empty() {
+                    String::new()
+                } else {
+                    format!(" filter: {}", self.filter)
                 },
-                " j/k move · / search · f format · p usage · Enter/x xrefs · m menu · v next list · i switch · q quit",
+                " j/k move · / search · p usage · Enter/x xrefs · m menu · v next list · i switch · q quit",
             ),
         };
         crate::ui::put_str(
@@ -444,12 +350,8 @@ impl StringsList {
             let y = area.y + 2 + (row - self.top) as u16;
             let it = &self.items[i];
             let is_sel = row == self.sel;
-            // `%n` is a format-string write primitive — a genuine red flag.
-            let write_n = it.fmt == FmtKind::WriteN;
-            let tag = if write_n { "  ⚠%n" } else { "" };
             if is_sel {
-                let text =
-                    format!("{:<aw$}  \"{}\"{tag}", it.addr, it.content, aw = self.awidth);
+                let text = format!("{:<aw$}  \"{}\"", it.addr, it.content, aw = self.awidth);
                 crate::ui::put_str(
                     buf,
                     x0,
@@ -460,7 +362,7 @@ impl StringsList {
                 );
                 continue;
             }
-            let mut spans = vec![
+            let spans = vec![
                 Span::styled(
                     format!("{:<aw$}", it.addr, aw = self.awidth),
                     Style::default()
@@ -472,12 +374,6 @@ impl StringsList {
                     Style::default().fg(Color::Magenta),
                 ),
             ];
-            if write_n {
-                spans.push(Span::styled(
-                    tag.to_string(),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ));
-            }
             crate::ui::put_spans(buf, x0, y, w, &spans);
         }
 
@@ -511,64 +407,5 @@ impl StringsList {
             (bw - 4) as usize,
             Style::default().add_modifier(Modifier::DIM),
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{format_kind, FmtKind};
-
-    #[test]
-    fn detects_real_conversions() {
-        assert_eq!(format_kind("value=%d"), FmtKind::Conv);
-        assert_eq!(format_kind("%s: %d bytes"), FmtKind::Conv);
-        assert_eq!(format_kind("ptr %p width %-10s prec %.2f"), FmtKind::Conv);
-        assert_eq!(format_kind("%ld / %llu / %zu"), FmtKind::Conv);
-    }
-
-    #[test]
-    fn flags_write_primitive() {
-        assert_eq!(format_kind("overflow %n here"), FmtKind::WriteN);
-        // %n wins even alongside ordinary conversions
-        assert_eq!(format_kind("%s then %n"), FmtKind::WriteN);
-        assert_eq!(format_kind("%-8n"), FmtKind::WriteN);
-    }
-
-    #[test]
-    fn plain_text_and_percent_signs_are_not_formats() {
-        assert_eq!(format_kind("just a string"), FmtKind::None);
-        assert_eq!(format_kind("50% off"), FmtKind::None); // space flag not honored
-        assert_eq!(format_kind("100% done"), FmtKind::None);
-        assert_eq!(format_kind("progress: 42%"), FmtKind::None); // trailing %
-        assert_eq!(format_kind("literal %% only"), FmtKind::None); // escaped
-        assert_eq!(format_kind(""), FmtKind::None);
-    }
-
-    #[test]
-    fn terminal_rule_rejects_word_shaped_text() {
-        // conversion char must be terminal (end / non-letter next), so these
-        // word/template/URL shapes are NOT formats (adversarial-review cases)
-        assert_eq!(format_kind("%name%"), FmtKind::None); // was a %n false positive
-        assert_eq!(format_kind("%node_id"), FmtKind::None);
-        assert_eq!(format_kind("%usage"), FmtKind::None);
-        assert_eq!(format_kind("95%ile"), FmtKind::None);
-        assert_eq!(format_kind("%2Fpath"), FmtKind::None); // URL-encoded
-        // real forms with a separator after the conversion still match
-        assert_eq!(format_kind("%02x%02x"), FmtKind::Conv);
-        assert_eq!(format_kind("%s/%s"), FmtKind::Conv);
-        assert_eq!(format_kind("%s\n"), FmtKind::Conv);
-    }
-
-    #[test]
-    fn positional_and_flag_forms() {
-        // positional `$` write primitive
-        assert_eq!(format_kind("%1$n"), FmtKind::WriteN);
-        assert_eq!(format_kind("%2$hhn"), FmtKind::WriteN);
-        // `+`/`#` flags are honored (space is not)
-        assert_eq!(format_kind("%#08x"), FmtKind::Conv);
-        assert_eq!(format_kind("%+d"), FmtKind::Conv);
-        // documented false-negative trade-off: a conversion glued directly to
-        // trailing literal letters (no separator) is not detected
-        assert_eq!(format_kind("%dms"), FmtKind::None);
     }
 }

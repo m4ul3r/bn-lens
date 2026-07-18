@@ -380,35 +380,6 @@ struct ClassItemJson {
     artifact: bool,
 }
 
-/// Roles assigned by bn's active taint-model catalog to one raw binary symbol.
-/// This is a presence catalog, never a vulnerability verdict.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ModelRoles {
-    pub source: bool,
-    pub sink_classes: Vec<String>,
-    pub propagator: bool,
-}
-
-#[derive(Deserialize)]
-struct ModelsJson {
-    #[serde(default)]
-    items: Vec<ModelItemJson>,
-}
-
-#[derive(Deserialize)]
-struct ModelItemJson {
-    #[serde(default)]
-    role: String,
-    #[serde(default)]
-    class: String,
-    #[serde(default)]
-    raw_symbol: String,
-    #[serde(default)]
-    resolved_symbol: String,
-    #[serde(default)]
-    accepted_aliases: Vec<String>,
-}
-
 fn recovered_class(item: ClassItemJson) -> Option<ClassItem> {
     if item.name.is_empty() || item.artifact {
         None
@@ -421,38 +392,6 @@ fn recovered_class(item: ClassItemJson) -> Option<ClassItem> {
             bases: item.bases,
         })
     }
-}
-
-fn roles_from_catalog(catalog: ModelsJson) -> HashMap<String, ModelRoles> {
-    let mut roles: HashMap<String, ModelRoles> = HashMap::new();
-    for item in catalog.items {
-        let mut aliases = item.accepted_aliases;
-        aliases.push(item.raw_symbol);
-        aliases.push(item.resolved_symbol);
-        aliases.retain(|alias| !alias.is_empty());
-        aliases.sort();
-        aliases.dedup();
-        for alias in aliases {
-            let role = roles.entry(alias).or_default();
-            match item.role.as_str() {
-                "source" => role.source = true,
-                "sink" => {
-                    let class = if item.class.is_empty() {
-                        "sink".to_string()
-                    } else {
-                        item.class.clone()
-                    };
-                    if !role.sink_classes.contains(&class) {
-                        role.sink_classes.push(class);
-                        role.sink_classes.sort();
-                    }
-                }
-                "propagator" => role.propagator = true,
-                _ => {}
-            }
-        }
-    }
-    roles
 }
 
 /// One basic block of a function's CFG (from `Bn::cfg`): its start address, the
@@ -1200,19 +1139,6 @@ impl Bn {
         self.imports_list_checked().unwrap_or_default()
     }
 
-    /// Active taint-model roles keyed by every accepted raw symbol spelling.
-    /// These are catalog/presence facts, not taint findings.
-    pub fn model_roles_present(&self) -> Result<HashMap<String, ModelRoles>, String> {
-        let out =
-            self.run_out_state_checked(&["taint", "models", "--present", "--format", "json"])?;
-        let catalog: ModelsJson = serde_json::from_str(out.trim()).map_err(|error| {
-            let message = format!("bn taint models returned invalid JSON: {error}");
-            self.record_failure(&["taint", "models"], message.clone());
-            message
-        })?;
-        Ok(roles_from_catalog(catalog))
-    }
-
     /// `bn types` -> the full type list (name + kind) for the Types view,
     /// paged with `--offset` until the envelope reports `has_more: false` so a
     /// database past the page size is never silently truncated.
@@ -1796,8 +1722,8 @@ pub fn newest_live(bin: &str, exclude: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_local_list_json, parse_types_page, push_mark, recovered_class, roles_from_catalog,
-        AnalysisState, Bn, ClassItemJson, CommentListJson, ModelsJson, TagListJson,
+        parse_local_list_json, parse_types_page, push_mark, recovered_class, AnalysisState, Bn,
+        ClassItemJson, CommentListJson, TagListJson,
     };
 
     #[test]
@@ -1839,21 +1765,6 @@ mod tests {
         assert!(bn.last_error().is_some());
         assert!(bn.run_state_checked(&["function", "list"]).is_ok());
         assert_eq!(bn.last_error(), None);
-    }
-
-    #[test]
-    fn model_roles_merge_aliases_without_calling_presence_findings() {
-        let json = r#"{"items":[
-          {"role":"source","raw_symbol":"read","resolved_symbol":"read","accepted_aliases":["read"]},
-          {"role":"sink","class":"overflow_len","raw_symbol":"read","resolved_symbol":"read","accepted_aliases":["read"]},
-          {"role":"propagator","raw_symbol":"memcpy","accepted_aliases":["__memcpy_chk"]}
-        ]}"#;
-        let catalog = serde_json::from_str::<ModelsJson>(json).expect("model catalog");
-        let roles = roles_from_catalog(catalog);
-        assert!(roles["read"].source);
-        assert_eq!(roles["read"].sink_classes, ["overflow_len"]);
-        assert!(roles["memcpy"].propagator);
-        assert!(roles["__memcpy_chk"].propagator);
     }
 
     #[test]

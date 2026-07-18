@@ -204,11 +204,6 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "STRINGS",
-        key: "f",
-        action: "toggle format-strings-only (printf-sink surface); ⚠%n marks write primitives",
-    },
-    HelpLine::Entry {
-        scope: "STRINGS",
         key: "p",
         action: "peek uses (exact asm + approximate mapped C at each site)",
     },
@@ -225,7 +220,7 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "STRINGS",
         key: "Esc / q",
-        action: "clear filter, then format filter, then back to symbols / quit",
+        action: "clear filter, then back to symbols / quit",
     },
     HelpLine::Section("IMPORTS"),
     HelpLine::Entry {
@@ -235,13 +230,8 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "IMPORTS",
-        key: "f",
-        action: "toggle modeled sinks-only (sources remain visible when off)",
-    },
-    HelpLine::Entry {
-        scope: "IMPORTS",
         key: "/",
-        action: "filter by name / address / model role",
+        action: "filter by name or address",
     },
     HelpLine::Entry {
         scope: "IMPORTS",
@@ -261,7 +251,7 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "IMPORTS",
         key: "Esc / q",
-        action: "clear filter/sinks-only, then back to symbols / quit",
+        action: "clear filter, then back to symbols / quit",
     },
     HelpLine::Section("EXPORTS"),
     HelpLine::Entry {
