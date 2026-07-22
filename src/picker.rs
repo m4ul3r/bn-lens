@@ -915,16 +915,19 @@ impl Picker {
         // Counted from the filter, not the rows: folding a section hides lines
         // but doesn't change how many symbols match.
         let shown = self.visible_all().len();
+        // View-state is its own group: a ` · ` boundary, then the count.
         let mut bar = crate::ui::crumbs(ctx);
+        bar.push(crate::ui::crumb_sep());
         bar.push(Span::styled(
-            format!("   symbols  {}/{}", shown, self.all.len()),
+            format!("symbols  {}/{}", shown, self.all.len()),
             Style::default().add_modifier(Modifier::DIM),
         ));
         // Surface a non-default class/order in the header — a filtered list that
         // looks like the whole list is a lie about what you're looking at.
         if self.class != Class::All || self.order != Order::Addr {
+            bar.push(crate::ui::crumb_sep());
             bar.push(Span::styled(
-                format!("  ·  {} · {}", self.class.label(), self.order.label()),
+                format!("{} · {}", self.class.label(), self.order.label()),
                 Style::default().fg(theme::MARK),
             ));
         }

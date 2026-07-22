@@ -39,38 +39,52 @@ pub fn clean_target_label(sel: &str) -> String {
     base.to_string()
 }
 
-/// The shared header "breadcrumbs": tool · `-i instance` · `-t target` · arch.
+/// The dim ` · ` that divides one logical group of the header from the next
+/// (brand | selector | arch | analysis | view-state). Punctuation carries the
+/// structure: ` · ` only ever means a group boundary, plain spaces separate
+/// facets *within* a group (the `-i`/`-t` selector), so the delimiter reads as
+/// meaning rather than noise. Shared so appenders (the picker's count) match.
+pub fn crumb_sep() -> Span<'static> {
+    Span::styled(" · ", Style::default().add_modifier(Modifier::DIM))
+}
+
+/// The shared header "breadcrumbs": tool · `-i instance  -t target` · arch.
 /// The `-i` is shown verbatim so an agent reading the pane can copy it into
 /// `bn -i <>`; the `-t` target is cleaned of the bndb cache hash for legibility
 /// (still a valid selector — see [`clean_target_label`]).
+///
+/// Colour ranks the fields: cyan is the brand's alone (the clickable home
+/// button); the two selector *values* are bold (instance blue, target white —
+/// the target is the primary subject); the arch is muted grey context; a stale
+/// analysis state is the one thing loud enough to interrupt (bold yellow).
 pub fn crumbs(ctx: &Ctx) -> Vec<Span<'static>> {
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut v = vec![
         Span::styled(" bn lens ", bold.fg(Color::Cyan)),
-        Span::styled(" · ", dim),
+        crumb_sep(),
         Span::styled("-i ", dim),
         Span::styled(ctx.instance_label.clone(), bold.fg(Color::Blue)),
     ];
     if !ctx.target.is_empty() {
+        // Within the selector group: a plain gap, not a ` · ` boundary.
         v.push(Span::styled("  -t ", dim));
         v.push(Span::styled(
             clean_target_label(&ctx.target),
-            Style::default().fg(Color::White),
+            bold.fg(Color::White),
         ));
     }
     if !ctx.arch.is_empty() {
+        v.push(crumb_sep());
         v.push(Span::styled(
-            format!("  · {}", ctx.arch),
-            Style::default().fg(Color::Cyan),
+            ctx.arch.clone(),
+            Style::default().fg(Color::Gray),
         ));
     }
     if !ctx.analysis_complete() {
+        v.push(crumb_sep());
         v.push(Span::styled(
-            format!(
-                "  · ⚠ {} ANALYSIS",
-                ctx.analysis_state.label().to_uppercase()
-            ),
+            format!("⚠ {} ANALYSIS", ctx.analysis_state.label().to_uppercase()),
             bold.fg(Color::Yellow),
         ));
     }
