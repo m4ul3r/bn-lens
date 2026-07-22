@@ -116,9 +116,7 @@ impl StringsList {
         (0..self.items.len())
             .filter(|&i| {
                 let it = &self.items[i];
-                f.is_empty()
-                    || it.content.to_lowercase().contains(&f)
-                    || it.addr.contains(&f)
+                f.is_empty() || it.content.to_lowercase().contains(&f) || it.addr.contains(&f)
             })
             .collect()
     }

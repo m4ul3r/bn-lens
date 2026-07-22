@@ -106,6 +106,11 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "LIST",
+        key: "click -t crumb",
+        action: "quick-switch target within this instance",
+    },
+    HelpLine::Entry {
+        scope: "LIST",
         key: "v",
         action: "next list view (symbols→strings→imports→exports→classes→types→marks) — not the IL cycle",
     },
@@ -152,6 +157,26 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "PICKER",
+        key: "Enter / Space",
+        action: "on a section rule: fold it (e.g. collapse .plt to one line)",
+    },
+    HelpLine::Entry {
+        scope: "PICKER",
+        key: "z / Z",
+        action: "fold the section you're in / fold every section",
+    },
+    HelpLine::Entry {
+        scope: "PICKER",
+        key: "f",
+        action: "cycle row class: all → named → unnamed → imports",
+    },
+    HelpLine::Entry {
+        scope: "PICKER",
+        key: "o",
+        action: "cycle order: by address (sectioned) → by size → by blocks",
+    },
+    HelpLine::Entry {
+        scope: "PICKER",
         key: "s",
         action: "show sections",
     },
@@ -163,7 +188,7 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "PICKER",
         key: "Esc",
-        action: "clear filter (never quits)",
+        action: "clear filter, then class/order (never quits)",
     },
     HelpLine::Entry {
         scope: "PICKER",
@@ -476,8 +501,13 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "PgUp/Dn · ^U/^D  (cfg graph)",
-        action: "scroll the top-left block inspector (always shows the highlight)",
+        key: "HJKL · z  (cfg graph)",
+        action: "pan the canvas · recentre it on the selected block",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "e · PgUp/Dn · ^U/^D  (cfg graph)",
+        action: "toggle the block inspector · scroll it when shown",
     },
     HelpLine::Entry {
         scope: "VIEWER",

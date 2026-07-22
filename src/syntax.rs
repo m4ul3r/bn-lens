@@ -242,7 +242,9 @@ mod tests {
         let segs = kinds(line);
         assert!(segs.iter().any(|(t, k)| *t == "goto" && *k == Tok::Keyword));
         assert!(segs.iter().any(|(t, k)| *t == "0040338c" && *k == Tok::Num));
-        assert!(segs.iter().any(|(t, k)| *t == "0x40336c" && *k == Tok::Type));
+        assert!(segs
+            .iter()
+            .any(|(t, k)| *t == "0x40336c" && *k == Tok::Type));
 
         let ret = &tokenize_plain("00403404  noreturn")[0];
         assert!(kinds(ret)
@@ -251,7 +253,9 @@ mod tests {
 
         // `ret` is an aarch64 mnemonic, not the C `return` — must stay a Name.
         let asm = &tokenize_plain("00403404  ret")[0];
-        assert!(kinds(asm).iter().any(|(t, k)| *t == "ret" && *k == Tok::Name));
+        assert!(kinds(asm)
+            .iter()
+            .any(|(t, k)| *t == "ret" && *k == Tok::Name));
     }
 
     #[test]

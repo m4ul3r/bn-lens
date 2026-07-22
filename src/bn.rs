@@ -146,7 +146,8 @@ pub struct Instance {
     pub started_at: String,
 }
 
-/// One recovered function: display address + name.
+/// One recovered function: display address + name, plus the size/complexity
+/// facts BN already returns in the function list (rendered as picker columns).
 #[derive(Clone)]
 pub struct Func {
     pub addr: String,
@@ -154,6 +155,10 @@ pub struct Func {
     pub name: String,
     /// Human-facing demangled/short name.
     pub display_name: String,
+    /// Byte length of the function body.
+    pub size: u64,
+    /// Basic-block count (a cheap branching/complexity proxy).
+    pub basic_block_count: u32,
 }
 
 #[derive(Deserialize)]
@@ -174,6 +179,10 @@ struct FunctionItemJson {
     raw_name: String,
     #[serde(default)]
     display_name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    basic_block_count: u32,
 }
 
 /// One Binary Ninja local/parameter. Stack variables use a signed frame offset
@@ -1044,6 +1053,8 @@ impl Bn {
                     addr: item.address,
                     name,
                     display_name,
+                    size: item.size,
+                    basic_block_count: item.basic_block_count,
                 })
             }));
             if !page.has_more || returned == 0 {
