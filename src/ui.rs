@@ -91,6 +91,41 @@ pub fn crumbs(ctx: &Ctx) -> Vec<Span<'static>> {
     v
 }
 
+/// Build a bottom hint bar from grouped `(key, description)` pairs: the **key**
+/// is bold so it pops, the description dim so it recedes, and groups are divided
+/// by the same ` · ` boundary the header uses (facets within a group joined by a
+/// plain gap). This turns a flat wall of keys into a scannable keymap — your eye
+/// lands on the bright keys and the groups (move / act / view / meta) read as
+/// clusters. Pass `("", desc)` for a label with no key, or `(key, "")` for a
+/// bare key. `render_bar` supplies the background.
+pub fn hint_bar(groups: &[&[(&str, &str)]]) -> Vec<Span<'static>> {
+    let key = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut spans = vec![Span::styled(" ", dim)];
+    for (gi, group) in groups.iter().enumerate() {
+        if gi > 0 {
+            spans.push(crumb_sep());
+        }
+        for (ii, (k, desc)) in group.iter().enumerate() {
+            if ii > 0 {
+                spans.push(Span::styled("  ", dim));
+            }
+            if !k.is_empty() {
+                spans.push(Span::styled(k.to_string(), key));
+            }
+            if !desc.is_empty() {
+                let text = if k.is_empty() {
+                    desc.to_string()
+                } else {
+                    format!(" {desc}")
+                };
+                spans.push(Span::styled(text, dim));
+            }
+        }
+    }
+    spans
+}
+
 /// Header column span `[x0, x1)` of the clickable `-t <target>` crumb (bar-
 /// relative), or None when no target crumb is drawn. Derived by scanning the
 /// spans [`crumbs`] actually produces, so it can't drift from the rendering.

@@ -272,25 +272,30 @@ impl MarksList {
         let x0 = area.x;
         let w = area.width as usize;
         let mut bar = crate::ui::crumbs(ctx);
+        bar.push(crate::ui::crumb_sep());
         bar.push(Span::styled(
-            format!("   marks  {}/{}", rows.len(), self.items.len()),
+            format!("marks  {}/{}", rows.len(), self.items.len()),
             Style::default().add_modifier(Modifier::DIM),
         ));
         crate::ui::render_bar(buf, x0, area.y, w, &bar);
 
-        let (state, keys) = match self.mode {
-            Mode::Search => (
-                format!(" /{}", self.filter),
-                " type · ↑↓ pick · Enter open · Tab list · Esc cancel · ? help",
-            ),
-            Mode::Normal => (
-                if self.filter.is_empty() {
-                    String::new()
-                } else {
-                    format!(" filter: {}", self.filter)
-                },
-                " j/k move · / search · Enter open · x xrefs · m menu · v next list · i switch · q quit",
-            ),
+        let state = match self.mode {
+            Mode::Search => format!(" /{}", self.filter),
+            Mode::Normal if !self.filter.is_empty() => format!(" filter: {}", self.filter),
+            Mode::Normal => String::new(),
+        };
+        let hint = match self.mode {
+            Mode::Search => crate::ui::hint_bar(&[
+                &[("type", ""), ("↑↓", "pick")],
+                &[("Enter", "open"), ("Tab", "list"), ("Esc", "cancel")],
+                &[("?", "help")],
+            ]),
+            Mode::Normal => crate::ui::hint_bar(&[
+                &[("j/k", "move"), ("/", "search")],
+                &[("Enter", "open"), ("x", "xrefs")],
+                &[("m", "menu"), ("v", "list"), ("i", "switch")],
+                &[("q", "quit")],
+            ]),
         };
         crate::ui::put_str(
             buf,
@@ -300,16 +305,7 @@ impl MarksList {
             w,
             Style::default().add_modifier(Modifier::DIM),
         );
-        crate::ui::render_bar(
-            buf,
-            x0,
-            area.y + area.height.saturating_sub(1),
-            w,
-            &[Span::styled(
-                keys,
-                Style::default().add_modifier(Modifier::DIM),
-            )],
-        );
+        crate::ui::render_bar(buf, x0, area.y + area.height.saturating_sub(1), w, &hint);
 
         if rows.is_empty() {
             crate::ui::put_str(

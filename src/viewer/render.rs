@@ -296,23 +296,38 @@ impl Viewer {
         }
 
         let hint = if self.stack_view.is_open() {
-            " stack · j/k slots · Enter jump · n rename · S/q close · ? help"
+            crate::ui::hint_bar(&[
+                &[("", "stack")],
+                &[("j/k", "slots"), ("Enter", "jump"), ("n", "rename")],
+                &[("S/q", "close"), ("?", "help")],
+            ])
         } else if self.search_input.is_some() {
-            " type to find · Enter jump · Esc cancel · ? help"
+            crate::ui::hint_bar(&[
+                &[("", "type to find")],
+                &[("Enter", "jump"), ("Esc", "cancel")],
+                &[("?", "help")],
+            ])
         } else if self.vmode {
-            " j/k extend · a ask · Esc cancel · ? help"
+            crate::ui::hint_bar(&[
+                &[("j/k", "extend")],
+                &[("a", "ask")],
+                &[("Esc", "cancel"), ("?", "help")],
+            ])
         } else {
-            " j/k · w/b hotspot · W/B calls · g act · n/;/t · a ask · / find · : goto · i il · v cfg · ^O/^F hist · q · ? help"
+            crate::ui::hint_bar(&[
+                &[("j/k", ""), ("w/b", "hotspot"), ("W/B", "calls")],
+                &[("g", "act"), ("n/;/t", "edit"), ("a", "ask")],
+                &[("/", "find"), (":", "goto")],
+                &[("i", "il"), ("v", "cfg")],
+                &[("^O/^F", "hist"), ("q", "back"), ("?", "help")],
+            ])
         };
         crate::ui::render_bar(
             buffer,
             area.x,
             area.y + area.height.saturating_sub(1),
             width,
-            &[Span::styled(
-                hint,
-                Style::default().add_modifier(Modifier::DIM),
-            )],
+            &hint,
         );
 
         let search_lower = self.search.to_lowercase();
@@ -518,14 +533,19 @@ impl Viewer {
         ];
         crate::ui::put_spans(buffer, area.x, area.y + 1, width, &info);
 
-        let hint =
-            " hjkl select · HJKL pan · z centre · e panel · ]/[ block · Enter read · Space list · i il · v linear · q list";
+        let hint = crate::ui::hint_bar(&[
+            &[("hjkl", "select"), ("]/[", "block")],
+            &[("HJKL", "pan"), ("z", "centre"), ("e", "panel")],
+            &[("Enter", "read"), ("Space", "list")],
+            &[("i", "il"), ("v", "linear")],
+            &[("q", "back")],
+        ]);
         crate::ui::render_bar(
             buffer,
             area.x,
             area.y + area.height.saturating_sub(1),
             width,
-            &[Span::styled(hint, dim)],
+            &hint,
         );
 
         let body_top = area.y + 2;

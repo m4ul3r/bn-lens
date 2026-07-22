@@ -932,19 +932,24 @@ impl Picker {
             ));
         }
         crate::ui::render_bar(buf, x0, area.y, w, &bar);
-        let (state, keys) = match self.mode {
-            Mode::Search => (
-                format!(" /{}", self.filter),
-                " type · ↑↓ pick · Enter open · Tab list · Esc cancel · ? help",
-            ),
-            Mode::Normal => (
-                if self.filter.is_empty() {
-                    String::new()
-                } else {
-                    format!(" filter: {}", self.filter)
-                },
-                " j/k move · / search · Enter open/fold · z/Z fold · x xrefs · f class · o order · m menu · v next list · i switch · ? help · q quit",
-            ),
+        let state = match self.mode {
+            Mode::Search => format!(" /{}", self.filter),
+            Mode::Normal if !self.filter.is_empty() => format!(" filter: {}", self.filter),
+            Mode::Normal => String::new(),
+        };
+        let hint = match self.mode {
+            Mode::Search => crate::ui::hint_bar(&[
+                &[("type", ""), ("↑↓", "pick")],
+                &[("Enter", "open"), ("Tab", "list"), ("Esc", "cancel")],
+                &[("?", "help")],
+            ]),
+            Mode::Normal => crate::ui::hint_bar(&[
+                &[("j/k", "move"), ("/", "search")],
+                &[("Enter", "open/fold"), ("z/Z", "fold"), ("x", "xrefs")],
+                &[("f", "class"), ("o", "order")],
+                &[("m", "menu"), ("v", "list"), ("i", "switch")],
+                &[("?", "help"), ("q", "quit")],
+            ]),
         };
         crate::ui::put_str(
             buf,
@@ -954,16 +959,7 @@ impl Picker {
             w,
             Style::default().add_modifier(Modifier::DIM),
         );
-        crate::ui::render_bar(
-            buf,
-            x0,
-            area.y + area.height.saturating_sub(1),
-            w,
-            &[Span::styled(
-                keys,
-                Style::default().add_modifier(Modifier::DIM),
-            )],
-        );
+        crate::ui::render_bar(buf, x0, area.y + area.height.saturating_sub(1), w, &hint);
 
         for (ri, row) in rows.iter().enumerate().skip(self.top).take(listh) {
             let y = area.y + 2 + (ri - self.top) as u16;

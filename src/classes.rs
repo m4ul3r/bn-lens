@@ -254,9 +254,10 @@ impl ClassesList {
         let width = area.width as usize;
         let vtables = self.items.iter().filter(|item| item.has_vtable).count();
         let mut bar = crate::ui::crumbs(ctx);
+        bar.push(crate::ui::crumb_sep());
         bar.push(Span::styled(
             format!(
-                "   classes  {}/{}  · {} vtable · STL/vendor folded",
+                "classes  {}/{}  · {} vtable · STL/vendor folded",
                 rows.len(),
                 self.items.len(),
                 vtables
@@ -283,10 +284,12 @@ impl ClassesList {
             area.x,
             area.y + area.height.saturating_sub(1),
             width,
-            &[Span::styled(
-                " j/k move · / search · Enter/p evidence · m menu · v next list · i switch · q quit",
-                Style::default().add_modifier(Modifier::DIM),
-            )],
+            &crate::ui::hint_bar(&[
+                &[("j/k", "move"), ("/", "search")],
+                &[("Enter/p", "evidence")],
+                &[("m", "menu"), ("v", "list"), ("i", "switch")],
+                &[("q", "quit")],
+            ]),
         );
 
         if let Some(error) = &self.error {
