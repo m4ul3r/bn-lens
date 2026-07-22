@@ -96,11 +96,15 @@ struct CfgGraph {
     top: usize,
     left: usize,
     /// While true the viewport tracks the selected block (after hjkl). A mouse
-    /// pan/scroll clears it so free panning isn't snapped back to the selection.
+    /// pan/scroll or keyboard pan clears it so free panning isn't snapped back.
     follow: bool,
-    /// Always-on top-left inspector for the currently highlighted block's full
-    /// instructions (updates whenever `sel` changes).
+    /// Request from `z`: recentre the viewport on the selected block on the next
+    /// render (where the viewport dimensions are known).
+    recenter: bool,
+    /// Top-left inspector for the highlighted block's full instructions (updates
+    /// whenever `sel` changes). Toggled off with `e` so it can't cover the graph.
     expand: CfgExpand,
+    expand_on: bool,
 }
 
 /// Top-left panel: the selected block's full instructions, tokenized for
@@ -574,14 +578,26 @@ impl Viewer {
                 self.cfg_graph_view = Some(CfgGraph {
                     data,
                     sel,
-                    top: usize::MAX, // sentinel: render positions the entry near the top
+                    top: usize::MAX, // sentinel: render centres the graph on first draw
                     left: 0,
                     follow: true,
+                    recenter: false,
                     expand,
+                    expand_on: true,
                 });
                 self.lines = Vec::new();
                 self.spans = Vec::new();
                 self.cfg_index = std::collections::HashMap::new();
+                // Locals for the inspector's hotspot layer — the same map the
+                // linear views build — so a local reads grey there too. Calls,
+                // data, and addresses need no locals (they resolve via ctx), but
+                // parity with linear means carrying the local names as well.
+                let locals = ctx.bn.local_list(&self.name);
+                self.locals = if matches!(self.code_view, View::Decomp | View::Mlil) {
+                    local_type_map(&locals)
+                } else {
+                    std::collections::HashMap::new()
+                };
                 self.status = format!(
                     " cfg·{} · {count} blocks · graph · hjkl spatial · ]/[ block · Space list · i il · v linear",
                     self.code_view.label()
@@ -734,6 +750,39 @@ impl Viewer {
         }
         g.sel = idx;
         Self::sync_cfg_expand(g);
+    }
+
+    /// Pan the CFG canvas by `(dx, dy)` cells (`HJKL` — free keyboard pan).
+    /// Clears follow so the canvas stays where you put it; the render clamps it
+    /// to the padded virtual canvas so a pan can't lose the graph. A no-op before
+    /// the first render has placed the graph (`top` still the sentinel).
+    pub(crate) fn cfg_pan(&mut self, dx: i64, dy: i64) {
+        let Some(g) = self.cfg_graph_view.as_mut() else {
+            return;
+        };
+        if g.top == usize::MAX {
+            return;
+        }
+        g.follow = false;
+        g.top = (g.top as i64 + dy).max(0) as usize;
+        g.left = (g.left as i64 + dx).max(0) as usize;
+    }
+
+    /// Recentre the viewport on the selected block (`z`). Deferred to the render,
+    /// which knows the viewport size, via the `recenter` flag.
+    pub(crate) fn cfg_recenter(&mut self) {
+        if let Some(g) = self.cfg_graph_view.as_mut() {
+            g.recenter = true;
+            g.follow = true;
+        }
+    }
+
+    /// Toggle the top-left block inspector (`e`). Off gives the graph the whole
+    /// canvas; on shows the highlighted block's full instructions.
+    pub(crate) fn cfg_toggle_expand(&mut self) {
+        if let Some(g) = self.cfg_graph_view.as_mut() {
+            g.expand_on = !g.expand_on;
+        }
     }
 
     /// Enter/`g` in the CFG graph: drop into the block list scrolled to the

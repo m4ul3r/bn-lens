@@ -405,21 +405,7 @@ impl Viewer {
                     } else if sibling {
                         Style::default().fg(Color::Black).bg(Color::Yellow)
                     } else {
-                        match span.kind {
-                            HotKind::Func => Style::default()
-                                .fg(theme::FUNC)
-                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                            HotKind::Data => Style::default()
-                                .fg(theme::DATA)
-                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                            HotKind::Addr => Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                            HotKind::Str => Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::UNDERLINED),
-                            HotKind::Local => Style::default().fg(Color::Gray),
-                        }
+                        hotspot_style(span.kind)
                     }
                 } else if matches!(self.view, View::Mlil | View::Disasm | View::Cfg) {
                     // MLIL/disasm and the CFG list (which shows disassembly) use
@@ -533,7 +519,7 @@ impl Viewer {
         crate::ui::put_spans(buffer, area.x, area.y + 1, width, &info);
 
         let hint =
-            " hjkl spatial · b/w·]/[ block · PgUp/Dn panel · Enter read · Space list · i il · v linear · ^O/^F hist · q list";
+            " hjkl select · HJKL pan · z centre · e panel · ]/[ block · Enter read · Space list · i il · v linear · q list";
         crate::ui::render_bar(
             buffer,
             area.x,
@@ -546,24 +532,55 @@ impl Viewer {
         let bottom = area.y + area.height.saturating_sub(1);
         let view_h = bottom.saturating_sub(body_top) as usize;
 
-        // The graph is a canvas with empty padding above and below, so it can be
-        // panned freely (a block can sit anywhere in the viewport, not just be
-        // clamped tight to the content). `g.top` is an offset into this padded
-        // virtual space; the real graph occupies rows [pad_v, pad_v + h).
+        // The graph is a canvas with empty padding on every side, so any block
+        // can be brought to the centre of the viewport rather than clamped tight
+        // to the content. `g.top`/`g.left` index this padded virtual space; real
+        // content occupies rows [pad_v, pad_v+h) and cols [pad_h, pad_h+w).
         let pad_v = (view_h / 2).max(4);
+        let pad_h = (width / 2).max(8);
         let virt_h = g.data.h + 2 * pad_v;
+        let virt_w = g.data.w + 2 * pad_h;
         // Scroll-off margin so the selection isn't jammed against an edge.
         let margin = 3usize;
 
-        // First render of a freshly-built graph: rest the entry near the top (a
-        // few rows of padding above), rather than floating in the middle of the
-        // top pad. Panning up from here reveals the rest of the pad.
-        if g.top == usize::MAX {
-            g.top = pad_v.saturating_sub(margin);
+        // Centre a content rect (canvas coords) in the viewport.
+        let center = |top: usize, left: usize, h: usize, w: usize| -> (usize, usize) {
+            (
+                (top + pad_v + h / 2).saturating_sub(view_h / 2),
+                (left + pad_h + w / 2).saturating_sub(width / 2),
+            )
+        };
+
+        // Initial placement (fresh graph) or an explicit `z` recentre. A fresh
+        // graph centres its whole bounding box when it fits, else rests the entry
+        // near the top so you start reading at the root; `z` centres the current
+        // selection. Either way the graph opens *centred*, not jammed top-left
+        // under the inspector.
+        if g.top == usize::MAX || g.recenter {
+            if g.recenter {
+                if let Some(b) = g.data.blocks.get(g.sel) {
+                    (g.top, g.left) = center(b.top, b.left, b.h, b.w);
+                }
+                g.recenter = false;
+            } else {
+                let entry = g.data.blocks.get(g.data.entry);
+                g.top = if g.data.h <= view_h {
+                    pad_v.saturating_sub((view_h - g.data.h) / 2)
+                } else {
+                    entry.map_or(0, |b| b.top) + pad_v.saturating_sub(margin)
+                };
+                g.left = if g.data.w <= width {
+                    pad_h.saturating_sub((width - g.data.w) / 2)
+                } else if let Some(b) = entry {
+                    center(b.top, b.left, b.h, b.w).1
+                } else {
+                    pad_h
+                };
+            }
         }
 
-        // In follow-mode (after hjkl) the viewport tracks the selection; a mouse
-        // pan clears follow so the canvas stays where the user dragged it.
+        // In follow-mode (after hjkl/z) the viewport tracks the selection; a
+        // mouse or keyboard pan clears follow so the canvas stays put.
         if g.follow {
             if let Some(sel) = g.data.blocks.get(g.sel) {
                 let vtop = sel.top + pad_v;
@@ -573,10 +590,11 @@ impl Viewer {
                 if vtop + sel.h + margin > g.top + view_h {
                     g.top = (vtop + sel.h + margin).saturating_sub(view_h);
                 }
-                if sel.left < g.left {
-                    g.left = sel.left;
+                let vleft = sel.left + pad_h;
+                if vleft < g.left + margin {
+                    g.left = vleft.saturating_sub(margin);
                 }
-                let need_r = sel.left + sel.w;
+                let need_r = vleft + sel.w + margin;
                 if need_r > g.left + width {
                     g.left = need_r.saturating_sub(width);
                 }
@@ -584,19 +602,20 @@ impl Viewer {
         }
         // Clamp to the padded canvas so a pan can't lose the graph entirely.
         g.top = g.top.min(virt_h.saturating_sub(view_h.max(1)));
-        g.left = g.left.min(g.data.w.saturating_sub(width.max(1)));
+        g.left = g.left.min(virt_w.saturating_sub(width.max(1)));
 
         // Record on-screen block rects for click hit-testing (in screen coords).
         self.cfg_hit.clear();
         for (i, b) in g.data.blocks.iter().enumerate() {
             let vtop = b.top + pad_v;
+            let vleft = b.left + pad_h;
             let off_v = vtop + b.h <= g.top || vtop >= g.top + view_h;
-            let off_h = b.left + b.w <= g.left || b.left >= g.left + width;
+            let off_h = vleft + b.w <= g.left || vleft >= g.left + width;
             if off_v || off_h {
                 continue;
             }
             let sy = body_top as i64 + vtop as i64 - g.top as i64;
-            let sx = area.x as i64 + b.left as i64 - g.left as i64;
+            let sx = area.x as i64 + vleft as i64 - g.left as i64;
             let x0 = sx.max(area.x as i64) as u16;
             let x1 = (sx + b.w as i64).min(area.x as i64 + width as i64) as u16;
             let y0 = sy.max(body_top as i64) as u16;
@@ -604,7 +623,7 @@ impl Viewer {
             self.cfg_hit.push((x0, x1, y0, y1, i));
         }
 
-        // Draw the visible canvas window, cell by cell (skipping the pad rows).
+        // Draw the visible canvas window, cell by cell (skipping the pad cells).
         let sel_rect = g.data.blocks.get(g.sel);
         for vy in 0..view_h {
             let crow = (g.top + vy) as i64 - pad_v as i64;
@@ -617,9 +636,13 @@ impl Viewer {
             }
             let y = body_top + vy as u16;
             for vx in 0..width {
-                let col = g.left + vx;
+                let ccol = (g.left + vx) as i64 - pad_h as i64;
+                if ccol < 0 {
+                    continue; // left padding
+                }
+                let col = ccol as usize;
                 if col >= g.data.w {
-                    break;
+                    break; // right padding
                 }
                 let (ch, color) = g.data.cell(row, col);
                 if ch == ' ' {
@@ -637,16 +660,16 @@ impl Viewer {
             }
         }
 
-        // Pan affordances: ‹ › on a mid-body row when the canvas extends off the
-        // sides (the graph is wider than the pane and panned to follow selection).
+        // Pan affordances: ‹ › on a mid-body row when *content* (not padding)
+        // extends off the sides.
         let mid = body_top + (view_h / 2) as u16;
         let mark = Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD);
-        if g.left > 0 {
+        if g.left > pad_h {
             crate::ui::put_str(buffer, area.x, mid, "‹", 1, mark);
         }
-        if g.left + width < g.data.w {
+        if g.left + width < pad_h + g.data.w {
             crate::ui::put_str(
                 buffer,
                 area.x + area.width.saturating_sub(1),
@@ -657,9 +680,22 @@ impl Viewer {
             );
         }
 
-        // Always-on top-left inspector for the highlighted block (syntax-
-        // highlighted full instructions). Drawn last so it sits above the graph.
-        render_cfg_expand(buffer, area, body_top, bottom, &mut g.expand);
+        // Top-left inspector for the highlighted block (syntax-highlighted full
+        // instructions). Drawn last so it sits above the graph; `e` hides it when
+        // it's in the way.
+        if g.expand_on {
+            render_cfg_expand(
+                buffer,
+                area,
+                body_top,
+                bottom,
+                &mut g.expand,
+                ctx,
+                &self.locals,
+            );
+        } else {
+            g.expand.hit = None;
+        }
         self.cfg_graph_view = Some(g);
     }
 
@@ -1062,10 +1098,11 @@ impl Viewer {
     }
 }
 
-/// Render the always-on block inspector: the selected block's instructions,
-/// syntax-highlighted with the disasm palette, in a content-sized box pinned to
-/// the top-left. Caps height so the graph stays visible underneath/around it;
-/// long blocks scroll with PgUp/PgDn (or the wheel when the pointer is over the
+/// Render the block inspector: the selected block's instructions, tokenized
+/// with the disasm palette *and* layered with the same call/data/address/local
+/// hotspot colours the linear views use, in a content-sized box pinned to the
+/// top-left. Caps height so the graph stays visible underneath/around it; long
+/// blocks scroll with PgUp/PgDn (or the wheel when the pointer is over the
 /// panel). Records the panel's screen bounds on `exp.hit` for mouse hit-testing.
 fn render_cfg_expand(
     buffer: &mut Buffer,
@@ -1073,6 +1110,8 @@ fn render_cfg_expand(
     body_top: u16,
     bottom: u16,
     exp: &mut CfgExpand,
+    ctx: &Ctx,
+    locals: &std::collections::HashMap<String, String>,
 ) {
     let avail_h = bottom.saturating_sub(body_top) as usize;
     // Leave at least half the body for the graph so the panel never eats the
@@ -1104,18 +1143,38 @@ fn render_cfg_expand(
     if exp.off > max_off {
         exp.off = max_off;
     }
-    for (i, line) in exp.lines.iter().skip(exp.off).take(view_rows).enumerate() {
+    // Promote tokens to typed hotspots — the same pass the linear views run — so
+    // a call/data/address/local reads with its colour here too, not flat asm.
+    let hotspots = super::hotspots::build_spans(&exp.lines, ctx, locals);
+    let kind_at: HashMap<(usize, usize), HotKind> =
+        hotspots.iter().map(|h| ((h.line, h.col), h.kind)).collect();
+    for (i, line) in exp.lines.iter().enumerate().skip(exp.off).take(view_rows) {
+        let mut col = 0usize;
         let spans: Vec<Span> = line
             .iter()
             .map(|seg| {
-                let mut st = theme::asm_style(seg.kind);
-                if st.fg.is_none() {
-                    st = st.fg(fg);
-                }
-                Span::styled(seg.text.clone(), st.bg(bg))
+                let style = match kind_at.get(&(i, col)) {
+                    Some(kind) => hotspot_style(*kind).bg(bg),
+                    None => {
+                        let mut st = theme::asm_style(seg.kind);
+                        if st.fg.is_none() {
+                            st = st.fg(fg);
+                        }
+                        st.bg(bg)
+                    }
+                };
+                col += seg.text.chars().count();
+                Span::styled(seg.text.clone(), style)
             })
             .collect();
-        crate::ui::put_spans(buffer, panel_x + 2, panel_y + 1 + i as u16, inner_w, &spans);
+        let row = i - exp.off;
+        crate::ui::put_spans(
+            buffer,
+            panel_x + 2,
+            panel_y + 1 + row as u16,
+            inner_w,
+            &spans,
+        );
     }
 
     // Scroll affordance when content overflows the panel.
@@ -1136,6 +1195,28 @@ fn render_cfg_expand(
                     .add_modifier(Modifier::DIM),
             );
         }
+    }
+}
+
+/// The colour a hotspot token renders in — a call blue, a data ref cyan, an
+/// address yellow, a string magenta, a local grey (all but locals underlined).
+/// Shared by the linear renderer and the CFG block inspector so the two can't
+/// drift apart. Callers add a background if they draw on a filled panel.
+fn hotspot_style(kind: HotKind) -> Style {
+    match kind {
+        HotKind::Func => Style::default()
+            .fg(theme::FUNC)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        HotKind::Data => Style::default()
+            .fg(theme::DATA)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        HotKind::Addr => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        HotKind::Str => Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::UNDERLINED),
+        HotKind::Local => Style::default().fg(Color::Gray),
     }
 }
 

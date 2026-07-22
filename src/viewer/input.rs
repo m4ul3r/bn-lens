@@ -585,12 +585,17 @@ impl Viewer {
     /// `i`/`I`: cycle the IL rendering (Decomp → MLIL → Disasm and back). In a
     /// linear view the view itself changes; in the CFG view the graph stays up
     /// and re-fetches its blocks at the new IL. From an xrefs view, enter the
-    /// current IL linearly (no cycle).
+    /// current IL linearly (no cycle). The instruction under the cursor is kept
+    /// across the switch — decompile→MLIL lands on the same statement's IL, not
+    /// the top of the function.
     fn cycle_il(&mut self, ctx: &Ctx, direction: i32) {
         // The data view has no IL rendering; `i`/`I` are no-ops there.
         if self.view == View::Data {
             return;
         }
+        // Remember where we are *before* changing the view, so the reload can
+        // re-centre the new listing on the same address.
+        let anchor = self.current_code_addr(ctx);
         if self.view != View::Xrefs {
             let order = [View::Decomp, View::Mlil, View::Disasm];
             let current = order
@@ -603,7 +608,17 @@ impl Viewer {
         if self.view != View::Cfg {
             self.view = self.code_view;
         }
+        // Drive the reload's re-centering through `focus_addr` (the same anchor
+        // goto uses), then restore the prior focus so a *later* unrelated reload
+        // — a comment/tag redraw — doesn't snap the view back to this spot.
+        let prev_focus = self.focus_addr;
+        if let Some(addr) = anchor {
+            self.focus_addr = Some(addr);
+        }
         self.reload_view(ctx);
+        if anchor.is_some() {
+            self.focus_addr = prev_focus;
+        }
     }
 
     /// `v`: flip linear ⇄ CFG for the current function, keeping the IL
@@ -648,9 +663,10 @@ impl Viewer {
     }
 
     /// Keys for the 2D CFG graph: hjkl move spatially, w/b and ]/[ step block
-    /// index order, PgUp/PgDn scroll the always-on inspector, Enter reads the
-    /// block as a list, Space toggles graph⇄list, i/I cycle the IL in place,
-    /// v drops back to the linear view. History is ^O/^F (same as linear).
+    /// index order, capitals `HJKL` pan the canvas and `z` recentres it on the
+    /// selection, `e` toggles the block inspector, PgUp/PgDn scroll the inspector,
+    /// Enter reads the block as a list, Space toggles graph⇄list, i/I cycle the IL
+    /// in place, v drops back to the linear view. History is ^O/^F (same as linear).
     fn cfg_graph_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -669,6 +685,14 @@ impl Viewer {
             KeyCode::Char('l') | KeyCode::Right => self.cfg_move(CfgDir::Right),
             KeyCode::Char('j') | KeyCode::Down => self.cfg_move(CfgDir::Down),
             KeyCode::Char('k') | KeyCode::Up => self.cfg_move(CfgDir::Up),
+            // Capitals pan the whole canvas (keyboard twin of a mouse drag); `z`
+            // recentres it on the selection, `e` toggles the block inspector.
+            KeyCode::Char('H') => self.cfg_pan(-6, 0),
+            KeyCode::Char('L') => self.cfg_pan(6, 0),
+            KeyCode::Char('K') => self.cfg_pan(0, -3),
+            KeyCode::Char('J') => self.cfg_pan(0, 3),
+            KeyCode::Char('z') => self.cfg_recenter(),
+            KeyCode::Char('e') => self.cfg_toggle_expand(),
             // Sequential walk (address/layout order) — distinct from spatial hjkl.
             // `w`/`b` match linear-view "next/prev unit" muscle memory.
             KeyCode::Char('w') | KeyCode::Char(']') => self.cfg_step(1),

@@ -302,6 +302,29 @@ impl Viewer {
         }
     }
 
+    /// The instruction address under the cursor in a linear code view, used to
+    /// keep your place across an `i`/`I` IL switch (decompile→MLIL and back). A
+    /// deliberately-selected address hotspot wins; otherwise MLIL/disasm read the
+    /// line's leading address column, and decompile — which carries addresses
+    /// only in its `--addresses` JSON, not in the rendered lines — re-maps the
+    /// cursor line through that JSON, snapping to the nearest addressed line
+    /// at/below the cursor (a declaration or brace line has no address of its own).
+    pub(super) fn current_code_addr(&self, ctx: &Ctx) -> Option<u64> {
+        match self.view {
+            View::Mlil | View::Disasm => self
+                .explicit_addr()
+                .and_then(|addr| crate::ctx::parse_hex(&addr)),
+            View::Decomp => {
+                let (_, _, text) = ctx.bn.decompile_json(&self.name)?;
+                let dec = crate::decomp::dec_lines(&text);
+                dec.get(self.cline..)
+                    .and_then(|rest| rest.iter().find_map(|line| line.addr))
+                    .or_else(|| dec.iter().take(self.cline).rev().find_map(|line| line.addr))
+            }
+            _ => None,
+        }
+    }
+
     /// Reflect a completed local rename in place — no re-decompile. A local
     /// rename is just an identifier swap within this function, so we retext the
     /// tokens, move the locals entry, and rebuild spans.
@@ -443,8 +466,7 @@ impl Viewer {
                     }
                 },
                 NameMatch::Ambiguous(count) => {
-                    self.status =
-                        format!(" ✗ '{raw}' matches {count} names — be more specific");
+                    self.status = format!(" ✗ '{raw}' matches {count} names — be more specific");
                     return;
                 }
                 NameMatch::None => {
