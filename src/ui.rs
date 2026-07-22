@@ -77,6 +77,30 @@ pub fn crumbs(ctx: &Ctx) -> Vec<Span<'static>> {
     v
 }
 
+/// Header column span `[x0, x1)` of the clickable `-t <target>` crumb (bar-
+/// relative), or None when no target crumb is drawn. Derived by scanning the
+/// spans [`crumbs`] actually produces, so it can't drift from the rendering.
+pub fn target_crumb_span(ctx: &Ctx) -> Option<(u16, u16)> {
+    target_span_of(&crumbs(ctx))
+}
+
+fn target_span_of(spans: &[Span]) -> Option<(u16, u16)> {
+    let mut x = 0u16;
+    for (i, s) in spans.iter().enumerate() {
+        let w = s.content.chars().count() as u16;
+        if s.content == "  -t " {
+            let label_w = spans
+                .get(i + 1)
+                .map(|t| t.content.chars().count() as u16)
+                .unwrap_or(0);
+            // start at the `-t` itself (skip the two-space gap)
+            return Some((x + 2, x + w + label_w));
+        }
+        x += w;
+    }
+    None
+}
+
 /// `set_stringn` that also clips *vertically*. ratatui clips x but panics on a
 /// `y` outside the buffer, so every popup write (drawn at a box-relative `y`
 /// that can fall below a short pane) must go through this to honour the
@@ -185,7 +209,30 @@ pub fn render_bar(buf: &mut Buffer, x0: u16, y: u16, width: usize, spans: &[Span
 
 #[cfg(test)]
 mod tests {
-    use super::clean_target_label;
+    use super::{clean_target_label, target_span_of};
+    use ratatui::text::Span;
+
+    #[test]
+    fn target_span_covers_the_dash_t_crumb() {
+        // mirror of crumbs(): " bn lens "(9) " · "(3) "-i "(3) "sess-a"(6)
+        // then "  -t "(5) "netcfgd"(7)
+        let spans = vec![
+            Span::raw(" bn lens "),
+            Span::raw(" · "),
+            Span::raw("-i "),
+            Span::raw("sess-a"),
+            Span::raw("  -t "),
+            Span::raw("netcfgd"),
+        ];
+        // starts on the `-t` (two-space gap excluded), ends after the label
+        assert_eq!(target_span_of(&spans), Some((23, 33)));
+    }
+
+    #[test]
+    fn target_span_absent_without_a_target_crumb() {
+        let spans = vec![Span::raw(" bn lens "), Span::raw(" · ")];
+        assert_eq!(target_span_of(&spans), None);
+    }
 
     #[test]
     fn strips_cache_hash_from_bndb_selector() {

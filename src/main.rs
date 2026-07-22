@@ -20,6 +20,7 @@ mod picker;
 mod strings;
 mod switch;
 mod syntax;
+mod target_menu;
 mod theme;
 mod types;
 mod ui;

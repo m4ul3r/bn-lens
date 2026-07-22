@@ -12,6 +12,7 @@ use crate::menu::{Choice, Menu};
 use crate::picker::{Action, Picker};
 use crate::strings::StringsList;
 use crate::switch::{Outcome, Switcher};
+use crate::target_menu::{Outcome as TgtOutcome, TargetMenu};
 use crate::types::TypesList;
 use crate::ui;
 use crate::viewer::{Exit, Viewer};
@@ -59,6 +60,8 @@ struct App {
     types: Option<TypesList>,     // built lazily on first switch to Types
     marks: Option<MarksList>,     // built lazily on first switch to Marks
     menu: Menu,
+    /// Quick target dropdown (click the `-t` crumb) — same instance only.
+    tgt_menu: Option<TargetMenu>,
     viewer: Option<Viewer>,
     switcher: Option<Switcher>,
     help: Help,
@@ -92,6 +95,7 @@ impl App {
             types: None,
             marks: None,
             menu: Menu::default(),
+            tgt_menu: None,
             viewer: None,
             switcher: None,
             help: Help::default(),
@@ -117,12 +121,27 @@ impl App {
         } else {
             Some(target)
         };
+        self.rebuild_ctx(Some(instance), tgt);
+    }
+
+    /// Re-point the lens at another target of the *current* instance (from the
+    /// `-t` crumb dropdown); keep current on failure.
+    fn apply_target(&mut self, target: String) {
+        if target == self.ctx.target {
+            return; // already there — nothing to rebuild
+        }
+        let instance =
+            (self.ctx.instance_label != "(default)").then(|| self.ctx.instance_label.clone());
+        self.rebuild_ctx(instance, Some(target));
+    }
+
+    fn rebuild_ctx(&mut self, instance: Option<String>, target: Option<String>) {
         match Ctx::build(
             &self.bn_bin,
             &self.herdr,
             &self.agent_pane,
-            Some(instance),
-            tgt,
+            instance,
+            target,
         ) {
             Ok(ctx) => {
                 self.ctx = ctx;
@@ -139,6 +158,17 @@ impl App {
             }
             Err(error) => self.refresh_error = Some(error),
         }
+    }
+
+    /// Open the target dropdown anchored under the `-t` crumb. An empty list
+    /// (no targets, or a failed `bn target list`) doesn't open — the failure
+    /// surfaces through the shared backend-error bar instead.
+    fn open_target_menu(&mut self, anchor_x: u16) {
+        let items = self.ctx.bn.target_list();
+        if items.is_empty() {
+            return;
+        }
+        self.tgt_menu = Some(TargetMenu::new(items, &self.ctx.target, anchor_x));
     }
 
     /// The menu entry corresponding to the current top-level view.
@@ -523,6 +553,18 @@ impl App {
             }
             return false;
         }
+        // The target dropdown, like the view menu, owns every key while open.
+        if let Some(tm) = &mut self.tgt_menu {
+            match tm.on_key(k) {
+                TgtOutcome::Continue => {}
+                TgtOutcome::Cancel => self.tgt_menu = None,
+                TgtOutcome::Apply(target) => {
+                    self.tgt_menu = None;
+                    self.apply_target(target);
+                }
+            }
+            return false;
+        }
         // Global shortcuts, suppressed while a text field is capturing input so
         // `?`/`m`/`^R` stay typeable inside search/comment/ask/rename fields.
         let capturing = self.capturing_text();
@@ -638,6 +680,17 @@ impl App {
             }
             return false;
         }
+        if let Some(tm) = &mut self.tgt_menu {
+            match tm.on_mouse(m) {
+                TgtOutcome::Continue => {}
+                TgtOutcome::Cancel => self.tgt_menu = None,
+                TgtOutcome::Apply(target) => {
+                    self.tgt_menu = None;
+                    self.apply_target(target);
+                }
+            }
+            return false;
+        }
         // Clicking the `bn lens` title toggles the dropdown (list mode only, and
         // not over a list sub-popup).
         if self.viewer.is_none()
@@ -647,6 +700,21 @@ impl App {
         {
             self.menu.toggle(self.active_choice());
             return false;
+        }
+        // Clicking the `-t <target>` crumb opens the quick target dropdown
+        // (same guards as the title button).
+        if self.viewer.is_none()
+            && self.switcher.is_none()
+            && !self.list_popup_open()
+            && matches!(m.kind, crossterm::event::MouseEventKind::Down(_))
+            && m.row == self.area.y
+        {
+            if let Some((x0, x1)) = ui::target_crumb_span(&self.ctx) {
+                if m.column >= self.area.x + x0 && m.column < self.area.x + x1 {
+                    self.open_target_menu(self.area.x + x0);
+                    return false;
+                }
+            }
         }
         if self.switcher.is_some() {
             return false;
@@ -786,6 +854,9 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
             }
             let choice = app.active_choice();
             app.menu.render(app.area, f.buffer_mut(), choice);
+            if let Some(tm) = &mut app.tgt_menu {
+                tm.render(app.area, f.buffer_mut());
+            }
             app.help
                 .render(app.area, f.buffer_mut(), app.help_context());
             app.draw_refresh(f.buffer_mut(), app.area);
