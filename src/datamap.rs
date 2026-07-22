@@ -252,8 +252,95 @@ fn string_decl_line(var: &DataVar, addr: u64, base: u64, bytes: &[u8]) -> Line {
     ]
 }
 
-/// Emit `ADDR  hh hh …  |ascii|` rows for `[from, to)` in 16-byte lines. Sets
-/// `focus` to the row that spans `focus_addr` (first match wins).
+/// Fold a run of this many identical full rows (or more) into one summary line.
+/// Below it, showing the rows costs less attention than a fold marker would.
+const COLLAPSE_MIN: usize = 3;
+
+/// The colour class of a raw byte, so the hex reads as a heat-map: an
+/// uninitialised/padding zero recedes (dim), a printable-ASCII byte pops in the
+/// string colour (an inline string jumps out of a sparse region without reading
+/// a single pair), and any other value renders as plain data. `None` is an
+/// unread byte (`??`), treated like a zero — nothing to see.
+fn byte_kind(byte: Option<u8>) -> Tok {
+    match byte {
+        Some(value) if (0x20..=0x7e).contains(&value) => Tok::Str,
+        Some(0) | None => Tok::Comment,
+        Some(_) => Tok::Plain,
+    }
+}
+
+/// The hex + ASCII segments for one row of up to `HEX_COLS` bytes, each byte
+/// coloured by [`byte_kind`] and consecutive same-class bytes merged into a
+/// single segment. Padded to a fixed width so the ASCII gutter stays aligned on
+/// a short final row.
+fn hex_ascii_segs(row: &[Option<u8>]) -> Vec<Seg> {
+    // Flush the accumulated same-class run into a segment.
+    fn flush(segs: &mut Vec<Seg>, kind: &mut Option<Tok>, run: &mut String) {
+        if let Some(k) = kind.take() {
+            segs.push(seg(std::mem::take(run), k));
+        }
+    }
+    let mut segs = Vec::new();
+    // Hex column: group runs of the same colour class.
+    let mut kind: Option<Tok> = None;
+    let mut run = String::new();
+    let mut width = 0usize;
+    for &byte in row {
+        let k = byte_kind(byte);
+        let piece = match byte {
+            Some(value) => format!("{value:02x} "),
+            None => "?? ".to_string(),
+        };
+        width += piece.chars().count();
+        if kind == Some(k) {
+            run.push_str(&piece);
+        } else {
+            flush(&mut segs, &mut kind, &mut run);
+            run = piece;
+            kind = Some(k);
+        }
+    }
+    flush(&mut segs, &mut kind, &mut run);
+    if width < HEX_COLS * 3 {
+        segs.push(seg(" ".repeat(HEX_COLS * 3 - width), Tok::Plain));
+    }
+    // ASCII gutter, coloured the same way so it doubles as the heat-map key.
+    segs.push(seg(" |", Tok::Comment));
+    let mut kind: Option<Tok> = None;
+    let mut run = String::new();
+    for &byte in row {
+        let k = byte_kind(byte);
+        let ch = byte.map_or('.', printable);
+        if kind == Some(k) {
+            run.push(ch);
+        } else {
+            flush(&mut segs, &mut kind, &mut run);
+            run = ch.to_string();
+            kind = Some(k);
+        }
+    }
+    flush(&mut segs, &mut kind, &mut run);
+    segs.push(seg("|", Tok::Comment));
+    segs
+}
+
+/// A fold line standing in for a run of identical bytes: `ADDR  ⋯ N bytes =
+/// 0xVV`. The byte count is the one thing worth reading (the region's size), so
+/// it carries the colour; the rest recedes.
+fn fold_line(start: u64, bytes: usize, value: u8) -> Line {
+    vec![
+        seg(format!("{start:08x}"), Tok::Comment),
+        seg("  ⋯  ", Tok::Comment),
+        seg(format!("{bytes} bytes"), Tok::Type),
+        seg(format!(" = 0x{value:02x}"), Tok::Comment),
+    ]
+}
+
+/// Emit `ADDR  hh hh …  |ascii|` rows for `[from, to)` in 16-byte lines, with two
+/// legibility passes: a run of `COLLAPSE_MIN`+ identical full rows collapses to a
+/// single [`fold_line`] (so a zero-filled `.bss` buffer reads as its size, not a
+/// screen of `00`), and every byte is coloured by [`byte_kind`]. Sets `focus` to
+/// the row/fold that spans `focus_addr` (first match wins).
 fn emit_hex_rows(
     lines: &mut Vec<Line>,
     focus: &mut Option<usize>,
@@ -263,38 +350,57 @@ fn emit_hex_rows(
     bytes: &[u8],
     focus_addr: u64,
 ) {
+    // Materialise the rows first so identical runs can be detected before render.
+    let mut rows: Vec<(u64, Vec<Option<u8>>)> = Vec::new();
     let mut addr = from;
     while addr < to {
         let row_end = (addr + HEX_COLS as u64).min(to);
-        let mut hex = String::new();
-        let mut ascii = String::new();
-        for byte_addr in addr..row_end {
-            match byte_at(bytes, base, byte_addr) {
-                Some(value) => {
-                    hex.push_str(&format!("{value:02x} "));
-                    ascii.push(printable(value));
+        let row = (addr..row_end).map(|a| byte_at(bytes, base, a)).collect();
+        rows.push((addr, row));
+        addr = row_end;
+    }
+
+    // A full row that is a single repeated value is a fold candidate.
+    let uniform = |row: &[Option<u8>]| -> Option<u8> {
+        match row.first() {
+            Some(&Some(value))
+                if row.len() == HEX_COLS && row.iter().all(|b| *b == Some(value)) =>
+            {
+                Some(value)
+            }
+            _ => None,
+        }
+    };
+
+    let mut i = 0;
+    while i < rows.len() {
+        if let Some(value) = uniform(&rows[i].1) {
+            let mut j = i + 1;
+            while j < rows.len() && uniform(&rows[j].1) == Some(value) {
+                j += 1;
+            }
+            if j - i >= COLLAPSE_MIN {
+                let start = rows[i].0;
+                let end = rows[j - 1].0 + HEX_COLS as u64;
+                if focus.is_none() && start <= focus_addr && focus_addr < end {
+                    *focus = Some(lines.len());
                 }
-                None => {
-                    hex.push_str("?? ");
-                    ascii.push('.');
-                }
+                lines.push(fold_line(start, (end - start) as usize, value));
+                i = j;
+                continue;
             }
         }
-        while hex.chars().count() < HEX_COLS * 3 {
-            hex.push(' ');
-        }
-        if focus.is_none() && addr <= focus_addr && focus_addr < row_end {
+        let (row_addr, row) = &rows[i];
+        if focus.is_none() && *row_addr <= focus_addr && focus_addr < row_addr + row.len() as u64 {
             *focus = Some(lines.len());
         }
-        lines.push(vec![
-            seg(format!("{addr:08x}"), Tok::Comment),
+        let mut segs = vec![
+            seg(format!("{row_addr:08x}"), Tok::Comment),
             seg("  ", Tok::Plain),
-            seg(hex, Tok::Num),
-            seg(" |", Tok::Comment),
-            seg(ascii, Tok::Comment),
-            seg("|", Tok::Comment),
-        ]);
-        addr = row_end;
+        ];
+        segs.extend(hex_ascii_segs(row));
+        lines.push(segs);
+        i += 1;
     }
 }
 
@@ -498,6 +604,59 @@ mod tests {
                 .any(|l| l.contains("00 01 02 03") && l.contains('|')),
             "{joined:?}"
         );
+    }
+
+    #[test]
+    fn collapses_a_run_of_identical_rows_into_one_fold_line() {
+        // 0x80 bytes (8 rows) of 0x00 — a zero-filled .bss buffer.
+        let bytes = vec![0u8; 0x80];
+        let out = linear(".bss", 0x2000, 0x2080, &[], &bytes, 0x2000);
+        let joined: Vec<String> = out.lines.iter().map(text).collect();
+        // The whole run folds to one summary line, no `00 00 00` rows survive.
+        assert!(
+            joined
+                .iter()
+                .any(|l| l.contains("⋯") && l.contains("128 bytes") && l.contains("0x00")),
+            "{joined:?}"
+        );
+        assert!(
+            !joined.iter().any(|l| l.contains("00 00 00 00")),
+            "raw zero rows should have folded: {joined:?}"
+        );
+        // Focus (interior of the run) lands on the fold line, not off the top.
+        assert!(out.focus.is_some());
+    }
+
+    #[test]
+    fn a_short_run_below_the_threshold_stays_expanded() {
+        // Two identical rows (< COLLAPSE_MIN) are not worth a fold marker.
+        let bytes = vec![0u8; 0x20];
+        let out = linear(".data", 0x3000, 0x3020, &[], &bytes, 0x3000);
+        let joined: Vec<String> = out.lines.iter().map(text).collect();
+        assert!(!joined.iter().any(|l| l.contains("⋯")), "{joined:?}");
+        assert!(
+            joined.iter().any(|l| l.contains("00 00 00 00")),
+            "{joined:?}"
+        );
+    }
+
+    #[test]
+    fn printable_bytes_get_the_string_colour() {
+        // A row mixing zeros and ASCII: the ASCII bytes carry Tok::Str.
+        let mut bytes = vec![0u8; 16];
+        bytes[4..7].copy_from_slice(b"hi!");
+        let out = linear(".data", 0x4000, 0x4010, &[], &bytes, 0x4000);
+        let row = out.lines.last().unwrap();
+        // The "68 69 21 " (hi!) hex bytes are a Str-kind segment.
+        assert!(
+            row.iter()
+                .any(|s| s.kind == Tok::Str && s.text.contains("68 69 21")),
+            "{row:?}"
+        );
+        // A zero byte is a Comment (dim) segment, not Str.
+        assert!(row
+            .iter()
+            .any(|s| s.kind == Tok::Comment && s.text.contains("00")));
     }
 
     #[test]
