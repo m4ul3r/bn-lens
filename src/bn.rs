@@ -1655,7 +1655,7 @@ impl Bn {
             self.call_local("decompile", serde_json::json!({"identifier": name}))
         {
             return match result {
-                Ok(value) => match text_field(&value) {
+                Ok(value) => match decompile_render(&value) {
                     text if text.trim().is_empty() => "(no output)".into(),
                     text => text,
                 },
@@ -2075,6 +2075,61 @@ fn text_field(value: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// Render a socket `decompile` result the way the CLI's text mode did
+/// (`function.py:246-257`): a leading resolution note, the pseudo-C, then any
+/// warnings.
+///
+/// Reading only `text` off the socket silently dropped both — the interior-address
+/// disclosure and every `warnings[]` entry: the #446 thunk/veneer "this is a
+/// PLT/GOT trampoline, not self-recursion" note, the analysis-stub warning, and
+/// the pseudo-C→wrapped-HLIL degradation notice (`read_decompile.py:144-162`).
+/// Those are load-bearing on a live target, so the socket path must reconstruct
+/// them rather than leave the reader with unexplained-looking output.
+fn decompile_render(value: &serde_json::Value) -> String {
+    let mut body = text_field(value);
+    let warnings: Vec<String> = value
+        .get("warnings")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|warning| format!("warning: {warning}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !warnings.is_empty() {
+        body = format!("{body}\n\n{}", warnings.join("\n"));
+    }
+    format!("{}{body}", resolution_note(value))
+}
+
+/// The CLI's `_resolution_note` (`formatters.py:124-143`): a `// bn: …` line when a
+/// function-scoped read resolved an interior address to its containing function.
+/// Empty when the result carries no `resolved_from` (an exact start or a name),
+/// which is the common case. `requested_address` and `offset` are already-rendered
+/// strings from the bridge (`seam.py:430`).
+fn resolution_note(value: &serde_json::Value) -> String {
+    let Some(resolved) = value.get("resolved_from").filter(|v| v.is_object()) else {
+        return String::new();
+    };
+    let field = |parent: Option<&serde_json::Value>, key: &str| {
+        parent
+            .and_then(|v| v.get(key))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+            .to_string()
+    };
+    let function = value.get("function");
+    format!(
+        "// bn: {} is inside {} @ {} ({}); showing the containing function\n",
+        field(Some(resolved), "requested_address"),
+        field(function, "name"),
+        field(function, "address"),
+        field(Some(resolved), "offset"),
+    )
+}
+
 /// Re-encode a string the way Python's `json.dumps(s, ensure_ascii=True)` does,
 /// **without** the surrounding quotes.
 ///
@@ -2157,6 +2212,12 @@ fn render_sections(value: &serde_json::Value) -> Vec<String> {
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // The CLI's `_render_sections_rows` prints `none` for an empty set (below any
+    // w+x line); mirror it so the popup never renders as a bare verdict with no body.
+    if items.is_empty() {
+        lines.push("none".into());
+        return lines;
+    }
     for item in items {
         let get = |key: &str| {
             item.get(key)
@@ -2254,9 +2315,9 @@ pub fn newest_live(bin: &str, exclude: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_unknown_op, json_escape_ascii, parse_local_list_json, parse_types_page, push_mark,
-        recovered_class, render_sections, text_field, AnalysisState, Bn, ClassItemJson,
-        CommentListJson, TagListJson,
+        decompile_render, is_unknown_op, json_escape_ascii, parse_local_list_json,
+        parse_types_page, push_mark, recovered_class, render_sections, text_field, AnalysisState,
+        Bn, ClassItemJson, CommentListJson, TagListJson,
     };
 
     #[test]
@@ -2345,6 +2406,47 @@ mod tests {
         assert_eq!(text_field(&serde_json::json!({"text": "body"})), "body");
         assert_eq!(text_field(&serde_json::json!({})), "");
         assert_eq!(text_field(&serde_json::json!({"text": 7})), "");
+    }
+
+    #[test]
+    fn decompile_render_appends_the_warnings_the_cli_text_mode_showed() {
+        // A #446 thunk/veneer decompile: the socket `text` reads like an infinite
+        // self-recursion, and the warning is the only thing that says otherwise.
+        // Dropping it (reading `text` alone) is the regression this guards.
+        let value = serde_json::json!({
+            "text": "int32_t sub_401000()\n{\n    return sub_401000();\n}",
+            "warnings": [
+                "thunk/veneer -> memcpy @ 0x402000: this is a PLT/GOT trampoline \
+                 (a jump to the real body), not a self-recursive function.",
+            ],
+        });
+        let rendered = decompile_render(&value);
+        assert!(rendered.starts_with("int32_t sub_401000()"));
+        assert!(rendered.contains("\n\nwarning: thunk/veneer -> memcpy @ 0x402000:"));
+    }
+
+    #[test]
+    fn decompile_render_prefixes_the_interior_address_resolution_note() {
+        // A goto/xref bounce to a mid-function address resolves to the container;
+        // the leading note is what tells the reader the entry differs on purpose.
+        let value = serde_json::json!({
+            "text": "void handler()\n{\n}",
+            "function": {"name": "handler", "address": "0x401000"},
+            "resolved_from": {"requested_address": "0x401014", "offset": "+0x14"},
+        });
+        let rendered = decompile_render(&value);
+        assert_eq!(
+            rendered.lines().next(),
+            Some("// bn: 0x401014 is inside handler @ 0x401000 (+0x14); showing the containing function")
+        );
+    }
+
+    #[test]
+    fn decompile_render_is_bare_text_when_there_is_nothing_to_annotate() {
+        // The common case — an exact-name decompile with no warnings — must be
+        // byte-identical to the plain `text`, no stray note or blank lines.
+        let value = serde_json::json!({"text": "void f()\n{\n}"});
+        assert_eq!(decompile_render(&value), "void f()\n{\n}");
     }
 
     #[test]

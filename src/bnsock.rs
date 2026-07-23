@@ -140,9 +140,13 @@ fn socket_is_live(path: &Path) -> bool {
 }
 
 fn connect_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
-    // `UnixStream::connect` has no timeout parameter; for AF_UNIX the connect
-    // either completes immediately or fails, so a plain connect plus per-op
-    // read/write timeouts is equivalent in practice.
+    // `UnixStream::connect` has no timeout parameter, and `timeout` therefore only
+    // bounds the per-op read/write below — not the connect itself. A connect
+    // normally completes or fails at once, but against a bridge whose listen
+    // backlog is full it can block. That is the same unbounded wait the old
+    // `Command::output()` CLI path had (also no connect timeout), so this is
+    // parity, not a new hang; the read/write timeout still bounds a bridge that
+    // accepts and then stalls.
     let stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
