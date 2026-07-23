@@ -67,19 +67,22 @@ pub(super) fn symbolize_dump(dump: &str, reverse_symbols: &HashMap<String, Strin
 }
 
 /// Indices of the spans `w`/`b`/Tab visit: functions other than the one in
-/// view (signature self-name is only a self-goto), data globals, executable
-/// addresses, strings, and **every** local — including BN register temps
-/// (`v0_2`, `x0_1`). Those temps look like spill noise but are the first thing
-/// you rename while cleaning a decompile; skipping them made `w` jump past
-/// whole argument lists. Falls back to every span when nothing qualifies.
+/// view (signature self-name is only a self-goto), data globals, **every**
+/// in-section address — code (a jump/branch target) *and* data (a bare `.bss`/
+/// `.data` pointer you can open in the data view) — strings, and every local,
+/// including BN register temps (`v0_2`, `x0_1`). Those temps look like spill
+/// noise but are the first thing you rename while cleaning a decompile; skipping
+/// them made `w` jump past whole argument lists. A bare data address like
+/// `0x6f9dc0` is just as actionable as a named global (`g` opens the data view,
+/// `p` peeks) — only the call ring [`call_stops`] excludes it. Falls back to
+/// every span when nothing qualifies.
 pub(super) fn tab_stops(spans: &[Hotspot], viewed: &str) -> Vec<usize> {
     let stops: Vec<usize> = spans
         .iter()
         .enumerate()
         .filter(|(_, span)| match span.kind {
             HotKind::Func => span.target != viewed,
-            HotKind::Data | HotKind::Str | HotKind::Local => true,
-            HotKind::Addr => span.code,
+            HotKind::Data | HotKind::Str | HotKind::Local | HotKind::Addr => true,
         })
         .map(|(index, _)| index)
         .collect();
@@ -401,12 +404,13 @@ mod tests {
             spot("v0_2", HotKind::Local, false, 2),
             spot("frame_len", HotKind::Local, false, 3),
             spot("strcpy", HotKind::Func, true, 4),
-            spot("0x1000", HotKind::Addr, false, 5), // non-code address
-            spot("0x4010", HotKind::Addr, true, 6),
+            spot("0x1000", HotKind::Addr, false, 5), // data address — actionable, a stop
+            spot("0x4010", HotKind::Addr, true, 6),  // code address — a stop
             spot("boot", HotKind::Str, false, 7),
         ];
-        // Self-name and non-code addr skipped; temps + named locals + calls stay.
-        assert_eq!(tab_stops(&spans, "parse_frame"), vec![1, 2, 3, 4, 6, 7]);
+        // Only the self-name is skipped; temps + named locals + calls + *both*
+        // code and data addresses stay (data addr `w`/`b` was the missing case).
+        assert_eq!(tab_stops(&spans, "parse_frame"), vec![1, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]
