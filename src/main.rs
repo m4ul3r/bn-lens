@@ -4,6 +4,7 @@
 //!   bn-lens picker   (herdr pane)   — run the TUI
 mod app;
 mod bn;
+mod bnsock;
 mod cfg;
 mod classes;
 mod ctx;

@@ -88,6 +88,12 @@ pub fn crumbs(ctx: &Ctx) -> Vec<Span<'static>> {
             bold.fg(Color::Yellow),
         ));
     }
+    // Transport. Reads normally go straight to the bridge socket; falling back to
+    // spawning `bn` costs ~127 ms per call, so an unannounced fallback would read
+    // as an unexplained 2x slowdown. Only the degraded state is called out.
+    if !ctx.bn.is_direct() {
+        v.push(Span::styled("  · ⚠ cli fallback", bold.fg(Color::Yellow)));
+    }
     v
 }
 
