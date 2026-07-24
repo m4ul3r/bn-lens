@@ -720,12 +720,23 @@ impl Viewer {
 
     fn show_peek(&mut self, ctx: &Ctx, symbol: &str, address: &str) {
         let dump = ctx.bn.read(address, 256);
+        // Decode candidate pointers at the target's own width/endianness: a
+        // hardcoded 64-bit LE read annotates nothing on a 32-bit firmware target,
+        // which is exactly where the `→ name` matters most.
+        let fmt = ptr_fmt(ctx);
+        let mut lines = symbolize_dump(&dump, &ctx.name_by_addr, fmt);
+        if fmt.is_none() {
+            // Say so rather than leave a silently unannotated dump: an absent
+            // `→ name` otherwise reads as "no pointers in this window".
+            lines.push(String::new());
+            lines.push(format!(
+                "(pointer names unavailable: no pointer width reported for arch '{}')",
+                ctx.arch
+            ));
+        }
         self.popup = Popup::Peek {
             title: format!("peek {symbol} @ {address}"),
-            // Decode candidate pointers at the target's own width/endianness: a
-            // hardcoded 64-bit LE read annotates nothing on a 32-bit firmware
-            // target, which is exactly where the `→ name` matters most.
-            lines: symbolize_dump(&dump, &ctx.name_by_addr, ptr_fmt(&ctx.arch)),
+            lines,
             tokens: None,
             goto: None,
             off: 0,

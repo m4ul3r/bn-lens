@@ -26,34 +26,64 @@ pub(super) fn ellipsize(text: &str, max_chars: usize) -> String {
 /// width in bytes and its byte order. Mirrors `DATA_MAP_PROGRAM`'s
 /// `psz = bv.address_size`, so the raw peek and the typed data map cannot
 /// disagree about what counts as a pointer.
+///
+/// There is deliberately **no `Default`**. The old default (64-bit
+/// little-endian) is a guess about the target, and a misdecoded word does not
+/// merely fail to match the symbol map: it can collide with a real reverse-symbol
+/// address and print a confident wrong name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PtrFmt {
     pub width: usize,
     pub big_endian: bool,
 }
 
-impl Default for PtrFmt {
-    /// 64-bit little-endian — the pre-fix hardcoded behaviour, and the fallback
-    /// for an architecture name we don't recognise.
-    fn default() -> Self {
-        Self {
-            width: 8,
-            big_endian: false,
+/// The target's pointer format, or `None` when it is not known.
+///
+/// Resolution order:
+///
+/// 1. **What BN itself reported** — `Ctx::ptr_size` / `Ctx::big_endian`, i.e.
+///    `bv.address_size` and `bv.endianness` as carried by `bn target info`.
+///    Authoritative for *any* architecture, including custom ones. (Today's bn
+///    does not put these on the `target_info` payload — verified against
+///    `bridge.py::_target_info`, which sends `arch`/`platform`/`image_base`/… —
+///    so this tier activates when a bn that does ships. The fields decode as
+///    absent until then, they are not assumed.)
+/// 2. [`arch_ptr_fmt`], the architecture-*name* table below: a legacy fallback
+///    covering the names BN ships, for bns that report nothing.
+/// 3. `None` — annotate nothing. Assuming 64-bit little-endian for every
+///    architecture outside the table (SPARC, anything custom) is what produced
+///    the wrong-name class above; a missing annotation is recoverable, a
+///    fabricated `→ name` on a firmware target is not.
+pub(super) fn ptr_fmt(ctx: &Ctx) -> Option<PtrFmt> {
+    resolve_ptr_fmt(ctx.ptr_size, ctx.big_endian, &ctx.arch)
+}
+
+/// [`ptr_fmt`] over the three facts it reads, so the resolution order is testable
+/// without a live `Ctx`.
+pub(super) fn resolve_ptr_fmt(
+    ptr_size: Option<usize>,
+    big_endian: Option<bool>,
+    arch: &str,
+) -> Option<PtrFmt> {
+    match (ptr_size, big_endian) {
+        (Some(width), Some(big_endian)) if (1..=8).contains(&width) => {
+            Some(PtrFmt { width, big_endian })
         }
+        _ => arch_ptr_fmt(arch),
     }
 }
 
-/// The pointer format of a Binary Ninja architecture name (`Ctx::arch`, which is
-/// `str(bv.arch)`: `x86_64`, `armv7`, `mipsel32`, `ppc64_le`, …).
+/// The pointer format of a Binary Ninja architecture *name* (`Ctx::arch`, which
+/// is `str(bv.arch)`: `x86_64`, `armv7`, `mipsel32`, `ppc64_le`, …), or `None`
+/// for a name not in the table.
 ///
-/// Width tracks `bv.address_size`, the same fact the typed data map keys its
-/// pointers off. Endianness comes from BN's own naming convention: the
-/// big-endian architectures are the unsuffixed MIPS/PPC names plus the explicit
-/// `eb` ARM variants, and every little-endian counterpart is spelled out
-/// (`mipsel32`, `ppc_le`). An unrecognised name falls back to 64-bit
-/// little-endian — a mis-decoded word simply fails to hit the symbol map, so a
-/// wrong guess costs a missing annotation, never a wrong name.
-pub(super) fn ptr_fmt(arch: &str) -> PtrFmt {
+/// Endianness comes from BN's own naming convention: the big-endian
+/// architectures are the unsuffixed MIPS/PPC names plus the explicit `eb` ARM
+/// variants, and every little-endian counterpart is spelled out (`mipsel32`,
+/// `ppc_le`). This is a *fallback* for bns that don't report the authoritative
+/// fields — see [`ptr_fmt`] — and it is exhaustive by construction: an
+/// unrecognised name yields `None`, never a guess.
+pub(super) fn arch_ptr_fmt(arch: &str) -> Option<PtrFmt> {
     let name = arch.trim().to_ascii_lowercase();
     let width = match name.as_str() {
         "x86_64" | "aarch64" | "aarch64eb" | "arm64" | "mips64" | "mipsel64" | "cavium-mips64"
@@ -61,7 +91,7 @@ pub(super) fn ptr_fmt(arch: &str) -> PtrFmt {
         "x86" | "i386" | "armv7" | "armv7eb" | "thumb2" | "thumb2eb" | "mips32" | "mipsel32"
         | "ppc" | "ppc_le" | "ppc_ps" | "ppc_qpx" | "rv32gc" | "rv32gc_wch" | "riscv32" => 4,
         "x86_16" | "msp430" | "z80" | "6502" => 2,
-        _ => 8,
+        _ => return None,
     };
     let big_endian = matches!(
         name.as_str(),
@@ -76,7 +106,7 @@ pub(super) fn ptr_fmt(arch: &str) -> PtrFmt {
             | "ppc_ps"
             | "ppc_qpx"
     );
-    PtrFmt { width, big_endian }
+    Some(PtrFmt { width, big_endian })
 }
 
 /// Decode `bytes` as one word in `fmt`'s byte order.
@@ -94,17 +124,24 @@ fn decode_word(bytes: &[u8], big_endian: bool) -> u64 {
     value
 }
 
-/// Annotate a hex dump: any pointer-sized word (per `fmt`, from the target's
-/// architecture — **not** a hardcoded 64-bit little-endian read) that matches a
-/// known symbol address gets a `+off→name` note, so a function-pointer table or
-/// vtable reads as names, not raw bytes. Each row is stepped at the pointer
-/// stride, so a 32-bit target annotates `+0x0`/`+0x4`/`+0x8`/`+0xc` where a
-/// 64-bit one annotates `+0x0`/`+0x8`.
+/// Annotate a hex dump: any pointer-sized word (per `fmt`, from the target's own
+/// metadata — **not** a hardcoded 64-bit little-endian read) that matches a known
+/// symbol address gets a `+off→name` note, so a function-pointer table or vtable
+/// reads as names, not raw bytes. Each row is stepped at the pointer stride, so a
+/// 32-bit target annotates `+0x0`/`+0x4`/`+0x8`/`+0xc` where a 64-bit one
+/// annotates `+0x0`/`+0x8`.
+///
+/// `fmt: None` (the target's pointer format is unknown — see [`ptr_fmt`]) returns
+/// the dump verbatim. Guessing a width would let a misdecoded word collide with a
+/// real symbol address and print a name that is simply wrong.
 pub(super) fn symbolize_dump(
     dump: &str,
     reverse_symbols: &HashMap<String, String>,
-    fmt: PtrFmt,
+    fmt: Option<PtrFmt>,
 ) -> Vec<String> {
+    let Some(fmt) = fmt else {
+        return dump.lines().map(str::to_string).collect();
+    };
     let width = fmt.width.clamp(1, 8);
     dump.lines()
         .map(|line| {
@@ -439,9 +476,20 @@ pub(super) fn build_spans(
 
 #[cfg(test)]
 mod tests {
+    /// 64-bit little-endian — spelled out at each use site now that `PtrFmt` has
+    /// no `Default`, because defaulting *is* the bug this guards against.
+    const LE64: PtrFmt = PtrFmt {
+        width: 8,
+        big_endian: false,
+    };
+
+    fn le64() -> Option<PtrFmt> {
+        Some(LE64)
+    }
+
     use super::{
-        call_stops, classify_name, covering_span, ptr_fmt, symbolize_dump, tab_stops,
-        truncate_str_segment, valid_ident, HotKind, Hotspot, PtrFmt,
+        arch_ptr_fmt, call_stops, classify_name, covering_span, resolve_ptr_fmt, symbolize_dump,
+        tab_stops, truncate_str_segment, valid_ident, HotKind, Hotspot, PtrFmt,
     };
     use std::collections::HashMap;
 
@@ -629,7 +677,7 @@ mod tests {
         let mut reverse_symbols = HashMap::new();
         reverse_symbols.insert("0x402760".to_string(), "handle_inbound_c2_msg".to_string());
         let dump = "00415258: 00 00 00 00 00 00 00 00 60 27 40 00 00 00 00 00  ........";
-        let output = symbolize_dump(dump, &reverse_symbols, PtrFmt::default());
+        let output = symbolize_dump(dump, &reverse_symbols, Some(LE64));
         assert!(
             output[0].contains("+0x8→handle_inbound_c2_msg"),
             "got: {}",
@@ -641,7 +689,7 @@ mod tests {
     fn leaves_nonmatching_lines_untouched() {
         let reverse_symbols = HashMap::new();
         let dump = "00415258: 01 02 03 04 05 06 07 08 00 00 00 00 00 00 00 00  ........";
-        let output = symbolize_dump(dump, &reverse_symbols, PtrFmt::default());
+        let output = symbolize_dump(dump, &reverse_symbols, Some(LE64));
         assert_eq!(output[0], dump);
     }
 
@@ -653,12 +701,9 @@ mod tests {
         reverse_symbols.insert("0x11b04".to_string(), "handle_set".to_string());
         let dump = "0002b400: 30 1a 01 00 04 1b 01 00 00 00 00 00 00 00 00 00  0...............";
         // Read as 64-bit (the old hardcoded behaviour) neither entry resolves.
-        assert_eq!(
-            symbolize_dump(dump, &reverse_symbols, PtrFmt::default())[0],
-            dump
-        );
+        assert_eq!(symbolize_dump(dump, &reverse_symbols, Some(LE64))[0], dump);
         // At the target's own pointer width both do, stepped at that stride.
-        let output = symbolize_dump(dump, &reverse_symbols, ptr_fmt("armv7"));
+        let output = symbolize_dump(dump, &reverse_symbols, arch_ptr_fmt("armv7"));
         assert!(
             output[0].contains("+0x0→handle_get") && output[0].contains("+0x4→handle_set"),
             "got: {}",
@@ -671,43 +716,91 @@ mod tests {
         let mut reverse_symbols = HashMap::new();
         reverse_symbols.insert("0x11a30".to_string(), "handle_get".to_string());
         let dump = "0002b400: 00 01 1a 30 00 00 00 00 00 00 00 00 00 00 00 00  ...0............";
-        let output = symbolize_dump(dump, &reverse_symbols, ptr_fmt("mips32"));
+        let output = symbolize_dump(dump, &reverse_symbols, arch_ptr_fmt("mips32"));
         assert!(output[0].contains("+0x0→handle_get"), "got: {}", output[0]);
         // The same bytes on the little-endian sibling architecture are not a
         // pointer, and must not be annotated.
         assert_eq!(
-            symbolize_dump(dump, &reverse_symbols, ptr_fmt("mipsel32"))[0],
+            symbolize_dump(dump, &reverse_symbols, arch_ptr_fmt("mipsel32"))[0],
             dump
         );
     }
 
     #[test]
-    fn pointer_format_follows_the_architecture_name() {
-        let le = |width| PtrFmt {
-            width,
-            big_endian: false,
+    fn the_architecture_name_table_never_guesses() {
+        let le = |width| {
+            Some(PtrFmt {
+                width,
+                big_endian: false,
+            })
         };
-        let be = |width| PtrFmt {
-            width,
-            big_endian: true,
+        let be = |width| {
+            Some(PtrFmt {
+                width,
+                big_endian: true,
+            })
         };
-        assert_eq!(ptr_fmt("x86_64"), le(8));
-        assert_eq!(ptr_fmt("aarch64"), le(8));
-        assert_eq!(ptr_fmt("x86"), le(4));
-        assert_eq!(ptr_fmt("armv7"), le(4));
-        assert_eq!(ptr_fmt("thumb2"), le(4));
-        assert_eq!(ptr_fmt("armv7eb"), be(4));
-        assert_eq!(ptr_fmt("mips32"), be(4));
-        assert_eq!(ptr_fmt("mipsel32"), le(4));
-        assert_eq!(ptr_fmt("ppc"), be(4));
-        assert_eq!(ptr_fmt("ppc_le"), le(4));
-        assert_eq!(ptr_fmt("ppc64"), be(8));
-        assert_eq!(ptr_fmt("ppc64_le"), le(8));
-        assert_eq!(ptr_fmt("rv32gc"), le(4));
-        assert_eq!(ptr_fmt("x86_16"), le(2));
-        // Case/whitespace tolerated; anything unknown keeps the 64-bit LE default.
-        assert_eq!(ptr_fmt(" ARMv7 "), le(4));
-        assert_eq!(ptr_fmt("some-future-arch"), PtrFmt::default());
-        assert_eq!(ptr_fmt(""), PtrFmt::default());
+        assert_eq!(arch_ptr_fmt("x86_64"), le(8));
+        assert_eq!(arch_ptr_fmt("aarch64"), le(8));
+        assert_eq!(arch_ptr_fmt("x86"), le(4));
+        assert_eq!(arch_ptr_fmt("armv7"), le(4));
+        assert_eq!(arch_ptr_fmt("thumb2"), le(4));
+        assert_eq!(arch_ptr_fmt("armv7eb"), be(4));
+        assert_eq!(arch_ptr_fmt("mips32"), be(4));
+        assert_eq!(arch_ptr_fmt("mipsel32"), le(4));
+        assert_eq!(arch_ptr_fmt("ppc"), be(4));
+        assert_eq!(arch_ptr_fmt("ppc_le"), le(4));
+        assert_eq!(arch_ptr_fmt("ppc64"), be(8));
+        assert_eq!(arch_ptr_fmt("ppc64_le"), le(8));
+        assert_eq!(arch_ptr_fmt("rv32gc"), le(4));
+        assert_eq!(arch_ptr_fmt("x86_16"), le(2));
+        // Case/whitespace tolerated.
+        assert_eq!(arch_ptr_fmt(" ARMv7 "), le(4));
+        // A valid BN/custom architecture the table never enumerated (SPARC is the
+        // immediate real example) must not decode as 64-bit little-endian. A
+        // misdecoded word can collide with a real reverse-symbol address and print
+        // a confident wrong name, which is worse than no annotation.
+        assert_eq!(arch_ptr_fmt("sparcv9"), None);
+        assert_eq!(arch_ptr_fmt("some-future-arch"), None);
+        assert_eq!(arch_ptr_fmt(""), None);
+    }
+
+    #[test]
+    fn reported_target_metadata_outranks_the_architecture_name() {
+        // What BN itself says (`bv.address_size` / `bv.endianness`) is authoritative
+        // for *any* architecture, including one the name table has wrong or has
+        // never heard of.
+        assert_eq!(
+            resolve_ptr_fmt(Some(4), Some(true), "sparcv9"),
+            Some(PtrFmt {
+                width: 4,
+                big_endian: true
+            })
+        );
+        assert_eq!(
+            resolve_ptr_fmt(Some(8), Some(false), "mips32"),
+            Some(LE64),
+            "reported metadata wins over the table's big-endian 4-byte guess"
+        );
+        // Half-reported (one field missing) is not enough to build a format from,
+        // so it falls back to the table rather than pairing a real width with an
+        // assumed byte order.
+        assert_eq!(
+            resolve_ptr_fmt(Some(4), None, "mips32"),
+            arch_ptr_fmt("mips32")
+        );
+        assert_eq!(resolve_ptr_fmt(None, Some(true), "sparcv9"), None);
+        // An out-of-range width is a payload surprise, not a target fact.
+        assert_eq!(resolve_ptr_fmt(Some(0), Some(false), "sparcv9"), None);
+        assert_eq!(resolve_ptr_fmt(Some(99), Some(false), "x86_64"), le64());
+    }
+
+    #[test]
+    fn an_unknown_pointer_format_annotates_nothing() {
+        // The dump comes back verbatim — no guessed-width reads at all.
+        let mut reverse_symbols = HashMap::new();
+        reverse_symbols.insert("0x402760".to_string(), "handle_inbound_c2_msg".to_string());
+        let dump = "00415258: 00 00 00 00 00 00 00 00 60 27 40 00 00 00 00 00  ........";
+        assert_eq!(symbolize_dump(dump, &reverse_symbols, None), vec![dump]);
     }
 }
