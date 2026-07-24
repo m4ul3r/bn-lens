@@ -16,6 +16,7 @@ use crate::target_menu::{Outcome as TgtOutcome, TargetMenu};
 use crate::types::TypesList;
 use crate::ui;
 use crate::viewer::{Exit, Viewer};
+use crossterm::cursor::Show;
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -30,11 +31,83 @@ use std::io;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
+/// Minimum spacing between partner-status polls.
+const POLL_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// What a finished ctx rebuild does to the UI. A `^R` refresh re-reads the *same*
+/// instance/target, so the picker's history and the open viewer survive it; a
+/// re-point lands on a different binary, so every cached list and the open viewer
+/// belong to the old target and have to go.
+#[derive(Clone, Copy, PartialEq)]
+enum Rebuild {
+    Refresh,
+    Repoint,
+}
+
 /// An in-flight ctx rebuild running on a worker thread, so the UI keeps drawing
 /// (a counting banner) while the ~1s of sequential `bn` calls run off-thread.
 struct Refreshing {
     started: Instant,
+    kind: Rebuild,
     rx: Receiver<Result<Ctx, String>>,
+}
+
+/// An in-flight partner-status poll. Both `herdr` reads it needs are untimed
+/// `Command::output()` calls, and running them inline at 1 Hz put two subprocess
+/// spawns in front of every keystroke — a slow or hung `herdr` stopped redraws
+/// and stopped accepting keys, `q` included. The answer is purely advisory (a
+/// header glyph and the `◆ agent` group), so a late or dropped one costs nothing.
+struct StatusPoll {
+    rx: Receiver<PartnerStatus>,
+}
+
+struct PartnerStatus {
+    partner: Option<crate::herdr::PaneAgent>,
+    /// Raw pane scrollback; scanned for agent-mentioned symbols on delivery.
+    transcript: String,
+}
+
+/// Whether a fresh partner poll may start. Pure so the scheduling rule is
+/// testable: never two at once (a slow `herdr` must not queue up spawns), never
+/// while a ctx rebuild owns the screen (it would stutter the banner's counter and
+/// can't be acted on anyway), and at most one per [`POLL_INTERVAL`].
+fn poll_due(since_last: Option<Duration>, in_flight: bool, rebuilding: bool) -> bool {
+    !in_flight && !rebuilding && since_last.is_none_or(|d| d >= POLL_INTERVAL)
+}
+
+/// Runs its closure when dropped, however the scope is left: a normal return, an
+/// error propagated by `?`, or a panic unwinding through it. The terminal
+/// teardown hangs off this because every `?` in the event loop jumped over the
+/// cleanup that used to sit at the bottom of it, leaving a raw-mode shell that
+/// needed `reset`.
+struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> OnDrop<F> {
+    fn new(f: F) -> Self {
+        OnDrop(Some(f))
+    }
+}
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
+/// Put the terminal back the way we found it: cooked mode, primary screen, mouse
+/// reporting off, cursor shown again (ratatui hides it while drawing and leaving
+/// the alternate screen does not restore `?25h`). Every step is best-effort and
+/// idempotent, so this is safe to call from `Drop` and from a panic hook.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        Show
+    );
 }
 
 /// An in-flight `p` usage peek running on a worker thread. The requesting view
@@ -85,7 +158,9 @@ struct App {
     agent_pane: String,
     herdr: String,
     partner: Option<crate::herdr::PaneAgent>,
+    /// When the last partner poll was *started* (not delivered).
     last_poll: Option<Instant>,
+    status_poll: Option<StatusPoll>,
     refreshing: Option<Refreshing>,
     peeking: Option<Peeking>,
     /// Context-rebuild failures belong to the old ctx, so retain them here;
@@ -121,6 +196,7 @@ impl App {
             herdr,
             partner: None,
             last_poll: None,
+            status_poll: None,
             refreshing: None,
             peeking: None,
             refresh_error: None,
@@ -138,7 +214,7 @@ impl App {
         } else {
             Some(target)
         };
-        self.rebuild_ctx(Some(instance), tgt);
+        self.start_rebuild(Some(instance), tgt, Rebuild::Repoint);
     }
 
     /// Re-point the lens at another target of the *current* instance (from the
@@ -149,32 +225,7 @@ impl App {
         }
         let instance =
             (self.ctx.instance_label != "(default)").then(|| self.ctx.instance_label.clone());
-        self.rebuild_ctx(instance, Some(target));
-    }
-
-    fn rebuild_ctx(&mut self, instance: Option<String>, target: Option<String>) {
-        match Ctx::build(
-            &self.bn_bin,
-            &self.herdr,
-            &self.agent_pane,
-            instance,
-            target,
-        ) {
-            Ok(ctx) => {
-                self.ctx = ctx;
-                self.picker = Picker::new(&self.ctx);
-                self.strings = None;
-                self.imports = None;
-                self.exports = None;
-                self.classes = None;
-                self.types = None;
-                self.marks = None;
-                self.view = AppView::Symbols;
-                self.viewer = None;
-                self.refresh_error = None;
-            }
-            Err(error) => self.refresh_error = Some(error),
-        }
+        self.start_rebuild(instance, Some(target), Rebuild::Repoint);
     }
 
     /// Open the target dropdown anchored under the `-t` crumb. An empty list
@@ -312,23 +363,48 @@ impl App {
     /// instance — renamed functions, new symbols — show up. The event loop shows
     /// a counting banner and ignores input until [`poll_refresh`] applies it.
     fn start_refresh(&mut self) {
+        let instance =
+            (self.ctx.instance_label != "(default)").then(|| self.ctx.instance_label.clone());
+        let target = (!self.ctx.target.is_empty()).then(|| self.ctx.target.clone());
+        self.start_rebuild(instance, target, Rebuild::Refresh);
+    }
+
+    /// Build a ctx on a worker thread. Both the `^R` refresh and a switcher /
+    /// `-t` re-point come through here: `Ctx::build` is ~1s of sequential `bn`
+    /// calls, and running the re-point inline froze the TUI on a stale frame with
+    /// no indication it was working (`^R` had already been moved off-thread).
+    fn start_rebuild(&mut self, instance: Option<String>, target: Option<String>, kind: Rebuild) {
         if self.refreshing.is_some() {
             return;
         }
         let bn_bin = self.bn_bin.clone();
         let herdr = self.herdr.clone();
         let agent_pane = self.agent_pane.clone();
-        let instance =
-            (self.ctx.instance_label != "(default)").then(|| self.ctx.instance_label.clone());
-        let target = (!self.ctx.target.is_empty()).then(|| self.ctx.target.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(Ctx::build(&bn_bin, &herdr, &agent_pane, instance, target));
         });
         self.refreshing = Some(Refreshing {
             started: Instant::now(),
+            kind,
             rx,
         });
+    }
+
+    /// Adopt a rebuilt ctx that points somewhere new: every cached list and the
+    /// open viewer describe the old target, so they go rather than being
+    /// refreshed in place.
+    fn adopt_repointed(&mut self, ctx: Ctx) {
+        self.ctx = ctx;
+        self.picker = Picker::new(&self.ctx);
+        self.strings = None;
+        self.imports = None;
+        self.exports = None;
+        self.classes = None;
+        self.types = None;
+        self.marks = None;
+        self.view = AppView::Symbols;
+        self.viewer = None;
     }
 
     /// Apply a finished refresh, keeping the picker's history and reloading the
@@ -338,7 +414,13 @@ impl App {
         let Some(refreshing) = &self.refreshing else {
             return;
         };
+        let kind = refreshing.kind;
         match refreshing.rx.try_recv() {
+            Ok(Ok(ctx)) if kind == Rebuild::Repoint => {
+                self.adopt_repointed(ctx);
+                self.refresh_error = None;
+                self.refreshing = None;
+            }
             Ok(Ok(ctx)) => {
                 self.ctx = ctx;
                 self.picker.refresh(&self.ctx);
@@ -456,7 +538,11 @@ impl App {
             return;
         };
         let secs = refreshing.started.elapsed().as_secs_f32();
-        let label = format!("⟳ refreshing bn context…  {secs:.1}s   · Esc to cancel");
+        let what = match refreshing.kind {
+            Rebuild::Refresh => "refreshing bn context",
+            Rebuild::Repoint => "switching bn target",
+        };
+        let label = format!("⟳ {what}…  {secs:.1}s   · Esc to cancel");
         let width = area.width as usize;
         let y = area.y + area.height.saturating_sub(1);
         let style = Style::default()
@@ -470,33 +556,59 @@ impl App {
         crate::ui::put_str(buf, x, y, label, width, style);
     }
 
-    /// Refresh the pairing partner (throttled to ~1s).
+    /// Deliver a finished partner poll and start the next one when due (~1s).
+    /// Both `herdr` reads run on a worker thread — see [`StatusPoll`] — so a slow
+    /// or wedged `herdr` can no longer stall redraws or swallow keystrokes.
     fn poll_status(&mut self) {
-        // Don't do blocking herdr I/O while a refresh owns the screen — it would
-        // stutter the banner's counter and can't be acted on anyway.
-        if self.refreshing.is_some() {
+        if let Some(poll) = &self.status_poll {
+            match poll.rx.try_recv() {
+                Ok(status) => {
+                    self.partner = status.partner;
+                    // Refresh the "recently viewed by agent" set from the pane's
+                    // scrollback — but only trust it when the transcript actually
+                    // concerns this target, so another binary's addresses/names
+                    // don't get matched against the one in view (fail-closed
+                    // provenance). The scan is pure and needs `&Ctx`, so it stays
+                    // here; only the two subprocess spawns moved off-thread.
+                    let tokens = self.ctx.recent_agent_tokens(&status.transcript);
+                    self.picker.update_agent(tokens);
+                    self.status_poll = None;
+                }
+                Err(TryRecvError::Disconnected) => self.status_poll = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if self.agent_pane.is_empty() {
+            self.partner = None; // ask is off: nothing to poll, no herdr spawn
             return;
         }
-        let now = Instant::now();
-        let due = self.last_poll.map_or(true, |t| {
-            now.duration_since(t) >= Duration::from_millis(1000)
+        if !poll_due(
+            self.last_poll.map(|t| t.elapsed()),
+            self.status_poll.is_some(),
+            self.refreshing.is_some(),
+        ) {
+            return;
+        }
+        self.last_poll = Some(Instant::now());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let herdr = self.herdr.clone();
+        let pane = self.agent_pane.clone();
+        std::thread::spawn(move || {
+            let partner = crate::herdr::pane_agent(&herdr, &pane);
+            let transcript = crate::herdr::pane_read(&herdr, &pane, 400);
+            let _ = tx.send(PartnerStatus {
+                partner,
+                transcript,
+            });
         });
-        if due {
-            self.partner = if self.agent_pane.is_empty() {
-                None
-            } else {
-                crate::herdr::pane_agent(&self.herdr, &self.agent_pane)
-            };
-            // refresh the "recently viewed by agent" set from the pane's
-            // scrollback — but only trust it when the transcript actually
-            // concerns this target, so another binary's addresses/names don't
-            // get matched against the one in view (fail-closed provenance).
-            if !self.agent_pane.is_empty() {
-                let text = crate::herdr::pane_read(&self.herdr, &self.agent_pane, 400);
-                let tokens = self.ctx.recent_agent_tokens(&text);
-                self.picker.update_agent(tokens);
-            }
-            self.last_poll = Some(now);
+        self.status_poll = Some(StatusPoll { rx });
+    }
+
+    /// Deliver the switcher's worker reads (instance list, targets, target info)
+    /// while the modal is open. A no-op otherwise.
+    fn poll_switcher(&mut self) {
+        if let Some(switcher) = &mut self.switcher {
+            switcher.poll();
         }
     }
 
@@ -879,8 +991,11 @@ pub fn run() -> i32 {
         Err(e) => {
             eprintln!("\n  bn lens: {e}\n\n  [enter to close]");
             let _ = enable_raw_mode();
+            // Cooked mode again even if `event::read` errors or panics.
+            let _restore = OnDrop::new(|| {
+                let _ = disable_raw_mode();
+            });
             let _ = event::read();
-            let _ = disable_raw_mode();
             return 1;
         }
     };
@@ -892,7 +1007,30 @@ pub fn run() -> i32 {
 }
 
 fn event_loop(ctx: Ctx) -> io::Result<()> {
+    // A panic payload printed while the terminal is still raw + on the alternate
+    // screen smears over the TUI and is unreadable, so restore first, then let
+    // the normal hook print. The guard below covers the unwind (and every
+    // `?`-return); this hook covers the message.
+    let ui_thread = std::thread::current().id();
+    let prior_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Only a panic on this thread ends the process. A worker's panic is
+        // contained — its channel just disconnects and the app reports the
+        // failure — so tearing the terminal down there would wreck a TUI that is
+        // still running (`Ctx::build` joins its reads with `unwrap`, so that is a
+        // reachable case).
+        if std::thread::current().id() == ui_thread {
+            restore_terminal();
+        }
+        prior_hook(info);
+    }));
+
     enable_raw_mode()?;
+    // Armed immediately: from here on, *every* exit path — normal, `?`, panic —
+    // leaves a usable terminal. This is the crash class the Rust rewrite exists
+    // to kill, and the teardown used to be reachable only from the loop's
+    // `break Ok(())`.
+    let _restore = OnDrop::new(restore_terminal);
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let mut term = Terminal::new(CrosstermBackend::new(out))?;
@@ -902,6 +1040,7 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
         app.poll_refresh();
         app.poll_peek();
         app.poll_status();
+        app.poll_switcher();
         term.draw(|f| {
             app.area = f.area();
             match &mut app.viewer {
@@ -955,9 +1094,13 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
             app.draw_refresh(f.buffer_mut(), app.area);
         })?;
 
-        // Tick faster while a refresh or peek is in flight so their counters
-        // stay smooth; otherwise wake ~1/s to refresh the partner status.
-        let timeout = if app.refreshing.is_some() || app.peeking.is_some() {
+        // Tick faster while a refresh, peek or switcher read is in flight so
+        // counters stay smooth and a delivered column appears promptly; otherwise
+        // wake ~1/s to refresh the partner status.
+        let busy = app.refreshing.is_some()
+            || app.peeking.is_some()
+            || app.switcher.as_ref().is_some_and(Switcher::pending);
+        let timeout = if busy {
             Duration::from_millis(100)
         } else {
             Duration::from_millis(400)
@@ -979,8 +1122,64 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
         }
     };
 
-    disable_raw_mode()?;
-    let mut out = io::stdout();
-    execute!(out, LeaveAlternateScreen, DisableMouseCapture)?;
-    res
+    res // `_restore` puts the terminal back as this scope ends
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{poll_due, OnDrop, POLL_INTERVAL};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn the_terminal_guard_runs_on_return_and_while_unwinding() {
+        static RESTORED: AtomicUsize = AtomicUsize::new(0);
+        fn bump() {
+            RESTORED.fetch_add(1, Ordering::SeqCst);
+        }
+        // Normal scope exit.
+        {
+            let _guard = OnDrop::new(bump);
+        }
+        assert_eq!(RESTORED.load(Ordering::SeqCst), 1);
+        // The `?`-return path: an early return out of the guarded scope.
+        fn bail() -> Result<(), &'static str> {
+            let _guard = OnDrop::new(bump);
+            Err("backend write failed")?;
+            unreachable!()
+        }
+        assert!(bail().is_err());
+        assert_eq!(RESTORED.load(Ordering::SeqCst), 2);
+        // The panic path — the one that used to leave a raw-mode shell needing
+        // `reset`, since the teardown sat after the event loop.
+        let prior = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(|| {
+            let _guard = OnDrop::new(bump);
+            panic!("clamp min > max");
+        });
+        std::panic::set_hook(prior);
+        assert!(result.is_err());
+        assert_eq!(RESTORED.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn partner_polls_never_overlap_or_run_during_a_rebuild() {
+        // First tick of the process: nothing polled yet, so it's due.
+        assert!(poll_due(None, false, false));
+        // Never a second spawn while one is outstanding — a hung `herdr` used to
+        // block the loop; queueing more spawns behind it would be worse.
+        assert!(!poll_due(None, true, false));
+        // Never during a ctx rebuild: the banner owns the screen.
+        assert!(!poll_due(None, false, true));
+        // Throttled to POLL_INTERVAL.
+        assert!(!poll_due(Some(Duration::from_millis(0)), false, false));
+        assert!(!poll_due(
+            Some(POLL_INTERVAL - Duration::from_millis(1)),
+            false,
+            false
+        ));
+        assert!(poll_due(Some(POLL_INTERVAL), false, false));
+        assert!(poll_due(Some(Duration::from_secs(30)), false, false));
+    }
 }
