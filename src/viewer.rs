@@ -138,9 +138,9 @@ enum RenameScope {
     Symbol,
 }
 
-/// Where a comment/tag lands: a concrete address (a line/hotspot address) or
-/// the whole current function.
-#[derive(Clone)]
+/// Where a comment/tag lands: a concrete address (a line/hotspot address, or
+/// the current function's entry for a bare `;`) or the whole current function.
+#[derive(Clone, Debug, PartialEq)]
 enum AnnTarget {
     Addr(String),
     Func(String),
@@ -210,6 +210,10 @@ enum Popup {
         /// Insertion caret as a **char** index into `buf` (0..=char count), for
         /// full in-place editing (move, insert/delete mid-string).
         cursor: usize,
+        /// Whether the popup opened on an *existing* comment (pre-filled `buf`).
+        /// Clearing it to empty then deletes the comment; a new comment left
+        /// empty is just discarded.
+        existing: bool,
     },
     Tag {
         target: AnnTarget,
@@ -247,6 +251,12 @@ pub struct Viewer {
     /// and forth stays on the same IL.
     code_view: View,
     lines: Vec<Line>,
+    /// Per-line instruction address for the current linear code listing, aligned
+    /// to `lines` by index (`None` on a line with no address of its own — a
+    /// declaration, brace, or blank separator). Cached at load so the header can
+    /// show where the cursor is without re-decompiling every frame; empty for
+    /// non-code views.
+    code_addrs: Vec<Option<u64>>,
     spans: Vec<Hotspot>,
     locals: std::collections::HashMap<String, String>, // name -> type (this fn)
     stack_view: StackView,
@@ -302,6 +312,7 @@ impl Viewer {
             view: if is_code { View::Decomp } else { View::Xrefs },
             code_view: View::Decomp,
             lines: Vec::new(),
+            code_addrs: Vec::new(),
             spans: Vec::new(),
             locals: std::collections::HashMap::new(),
             stack_view: StackView::default(),
@@ -401,6 +412,8 @@ impl Viewer {
             self.load_data(ctx);
             return;
         }
+        // Rebuilt below for the code views; empty means "no address readout".
+        self.code_addrs = Vec::new();
         // Leave CFG state before loading a linear view. An interior-address
         // navigation resolves to the containing function
         // via JSON and uses the address-bearing decompile to retain the exact
@@ -419,6 +432,7 @@ impl Viewer {
                         dec.iter()
                             .position(|candidate| candidate.addr == Some(addr))
                     });
+                    self.code_addrs = dec.iter().map(|candidate| candidate.addr).collect();
                     let plain = dec
                         .into_iter()
                         .map(|candidate| candidate.text)
@@ -446,8 +460,57 @@ impl Viewer {
         } else {
             syntax::tokenize_plain(&text)
         };
+        self.code_addrs = self.line_addr_column(ctx, &text);
         self.finish_linear_load(ctx);
         self.apply_focus();
+    }
+
+    /// Per-line addresses aligned to `self.lines`, for the header's cursor-address
+    /// readout. Decompile carries addresses only in its `--addresses` JSON (the
+    /// rendered text intentionally keeps warnings/notes, so it's fetched
+    /// separately and mapped by the same line index `current_code_addr` relies
+    /// on); MLIL/disasm print an 8-hex address column, so it's read straight off
+    /// the flattened listing that produced the lines.
+    fn line_addr_column(&self, ctx: &Ctx, linear_text: &str) -> Vec<Option<u64>> {
+        match self.view {
+            View::Decomp => ctx
+                .bn
+                .decompile_json(&self.name)
+                .map(|(_, _, addr_text)| {
+                    crate::decomp::dec_lines(&addr_text)
+                        .iter()
+                        .map(|line| line.addr)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            View::Mlil | View::Disasm => linear_text
+                .lines()
+                .map(|line| {
+                    let bytes = line.as_bytes();
+                    (bytes.len() >= 8 && bytes[..8].iter().all(u8::is_ascii_hexdigit))
+                        .then(|| u64::from_str_radix(&line[..8], 16).ok())
+                        .flatten()
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The instruction address the cursor is on, for the header readout: the
+    /// current line's own address, else the nearest addressed line at/below it,
+    /// else above (so a brace or blank line still reports a sensible address).
+    /// `None` outside a linear code view.
+    pub(super) fn cursor_addr(&self) -> Option<u64> {
+        if self.code_addrs.is_empty() {
+            return None;
+        }
+        let clamp = self.cline.min(self.code_addrs.len().saturating_sub(1));
+        self.code_addrs
+            .get(clamp)
+            .copied()
+            .flatten()
+            .or_else(|| self.code_addrs[clamp..].iter().find_map(|addr| *addr))
+            .or_else(|| self.code_addrs[..clamp].iter().rev().find_map(|addr| *addr))
     }
 
     /// The annotated linear listing for the MLIL/disasm views: flatten the same

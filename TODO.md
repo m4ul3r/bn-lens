@@ -141,28 +141,24 @@ analysis belongs.)
 The Strings view's `f` format-string filter and `⚠%n` tag were removed per user direction — a plain `/`
 search (e.g. `/%`) covers the same need. Strings is back to an address-ordered, filterable list.
 
-## Known gap: function-doc comments are invisible in the Marks view
+## Function-level comments and the Marks view
 
-**Status:** found while dogfooding; not fixed (needs a design call). A bare `;` on a function (no address
-hotspot selected) sets the function's **documentation** comment via `bn comment set --function <fn>`
-(bn: "Target the function's documentation comment (fn.comment) … NOT an address"). But `bn comment list`
-— what `marks.rs::build` (via `ctx.bn.marks()`) uses to populate the Marks view — **only enumerates
-address-scoped comments; it does not return function docs**, and there is no bulk enumeration flag
-(`function list` doesn't expose a doc field either, and per-function `comment get` would be thousands of
-calls). Consequence: a comment you add to a whole function shows inline in that function but **never
-appears in the aggregate Marks "shared map"**, which advertises "every annotation." Address-hotspot
-comments (`;` on a Tab/`w`/click-selected address) are unaffected — those list fine.
+**Status:** fixed (2026-07-23) via option 1 of the original three. A bare `;` on a function (no address
+hotspot selected) now writes a comment at the function's **entry address**
+(`viewer/actions.rs::func_comment_target`) instead of the `fn.comment` doc: BN renders an entry-address
+comment atop the function just like a doc (see `bn.rs::comment_get_func`), and — being address-scoped —
+it enumerates via `bn comment list`, so it lists in Marks and for every other client of the instance.
+`comment_set_func` (the doc write) remains only as a fallback when bn can't report an entry address.
 
-**Fix options (pick one — a deliberate choice, not an autonomous change):**
-1. Make a bare `;` on a function set an **entry-address** comment instead of the function doc — it would
-   then list in Marks and render inline at the entry. `comment_edit_target` already reads an
-   entry-address comment back (see the `entry_comment` branch), so the read path is half-there. Changes
-   where the comment displays (inline vs. the doc block atop the signature).
-2. Track function-doc comments the lens itself sets in an **App-scoped session list** and merge them into
-   Marks. Completes the map for the working session but not for docs set elsewhere/previously, and needs
-   rename/delete reconciliation.
-3. Ask the `bn` side to add function-doc enumeration to `comment list` (e.g. `--include-docs`); then
-   `marks()` merges them with no lens-side state. Cleanest but needs a `bn` change (out of this repo).
+**Residual gap:** a pre-existing `fn.comment` doc — set before this change, or by another client via
+`bn comment set --function` — still never lists in Marks, because `bn comment list` has no doc
+enumeration and there is no viable bulk read (`function list` exposes no doc field; per-function
+`comment get` would be thousands of calls). `;` on such a function keeps editing the doc in place (it
+doesn't fork a duplicate entry-address note). Closing that residual needs the upstream `bn` change
+(`comment list --include-docs` or similar — /opt/bn, out of this repo); rejected alternatives: a
+doc+entry double-write (same text rendered twice atop the function, two writes per gesture) and a
+lens-side session record of docs (dies with the process/ctx rebuild, and would need state threaded
+through `app.rs`).
 
 ## Autonomous loop session (2026-07-18, branch `auto/loop-2026-07-18`)
 

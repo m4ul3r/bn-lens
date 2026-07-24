@@ -254,6 +254,7 @@ impl Viewer {
             target,
             buf,
             cursor,
+            existing,
         } = &mut self.popup
         else {
             return Exit::Stay;
@@ -269,9 +270,26 @@ impl Viewer {
         };
         match key.code {
             KeyCode::Enter => {
-                let (target, text) = (target.clone(), buf.clone());
+                let (target, text, had) = (target.clone(), buf.clone(), *existing);
                 self.popup = Popup::None;
                 if text.is_empty() {
+                    // Clearing an existing comment deletes it; an empty new
+                    // comment is just discarded (nothing to write).
+                    if !had {
+                        return Exit::Stay;
+                    }
+                    let ok = match &target {
+                        super::AnnTarget::Addr(addr) => ctx.bn.comment_delete_addr(addr),
+                        super::AnnTarget::Func(func) => ctx.bn.comment_delete_func(func),
+                    };
+                    if ok {
+                        self.status = format!(
+                            " ✓ comment cleared {}   (`bn save` to persist)",
+                            target.label()
+                        );
+                        return Exit::ReloadView;
+                    }
+                    self.status = format!(" ✗ comment {} clear failed", target.label());
                     return Exit::Stay;
                 }
                 let ok = match &target {
