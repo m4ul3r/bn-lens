@@ -75,18 +75,21 @@ impl ClassesList {
         self.evidence.is_some()
     }
 
+    /// Full Unicode case folding, matching every other list filter — a demangled
+    /// symbol carrying a non-ASCII character must not filter differently here
+    /// than it does in Symbols or Types.
     fn filtered(&self) -> Vec<usize> {
-        let filter = self.filter.to_ascii_lowercase();
+        let filter = self.filter.to_lowercase();
         (0..self.items.len())
             .filter(|&index| {
                 let item = &self.items[index];
                 filter.is_empty()
-                    || item.name.to_ascii_lowercase().contains(&filter)
-                    || item.confidence.to_ascii_lowercase().contains(&filter)
+                    || item.name.to_lowercase().contains(&filter)
+                    || item.confidence.to_lowercase().contains(&filter)
                     || item
                         .bases
                         .iter()
-                        .any(|base| base.to_ascii_lowercase().contains(&filter))
+                        .any(|base| base.to_lowercase().contains(&filter))
             })
             .collect()
     }
@@ -167,7 +170,10 @@ impl ClassesList {
                 }
                 KeyCode::Down => self.move_sel(1),
                 KeyCode::Up => self.move_sel(-1),
-                KeyCode::Char(ch) => {
+                // A ctrl chord is never text: crossterm decodes ^U as
+                // `Char('u') + CONTROL`, so an unguarded arm turns a line-edit
+                // reflex into a literal letter in the filter.
+                KeyCode::Char(ch) if !control => {
                     self.filter.push(ch);
                     self.sel = 0;
                 }
@@ -394,6 +400,63 @@ impl ClassesList {
             " j/k scroll · h/l pan · 0 reset · Enter/p/q/Esc close ",
             inner,
             Style::default().add_modifier(Modifier::DIM),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::picker::tests::{ctrl, plain};
+
+    fn class(name: &str) -> ClassItem {
+        ClassItem {
+            name: name.into(),
+            method_count: 2,
+            has_vtable: true,
+            confidence: "rtti".into(),
+            bases: Vec::new(),
+        }
+    }
+
+    fn list_of(names: &[&str]) -> ClassesList {
+        let mut list = ClassesList::new(&Ctx::stub());
+        list.items = names.iter().map(|n| class(n)).collect();
+        list.error = None;
+        list
+    }
+
+    #[test]
+    fn the_filter_case_folds_beyond_ascii() {
+        // `to_ascii_lowercase` leaves a non-ASCII capital alone, so a demangled
+        // name carrying one filtered differently here than in every other list.
+        let mut list = list_of(&["Ünicode_Codec", "PlainCodec"]);
+        list.filter = "ünicode".into();
+        assert_eq!(
+            list.filtered().len(),
+            1,
+            "a non-ASCII capital must fold like every other list's filter"
+        );
+        // ASCII folding is unchanged.
+        list.filter = "plaincodec".into();
+        assert_eq!(list.filtered().len(), 1);
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_filter() {
+        let ctx = Ctx::stub();
+        let mut list = list_of(&["PlainCodec"]);
+        list.on_key(plain('/'), &ctx);
+        for ch in "codec".chars() {
+            list.on_key(plain(ch), &ctx);
+        }
+        assert_eq!(list.filter, "codec");
+        for ch in ['a', 'e', 'u', 'w', 'r'] {
+            list.on_key(ctrl(ch), &ctx);
+        }
+        assert_eq!(
+            list.filter, "codec",
+            "a ctrl chord must not push its letter into the filter"
         );
     }
 }

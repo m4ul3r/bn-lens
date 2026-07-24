@@ -31,6 +31,10 @@ struct Usage {
 
 pub struct ImportsList {
     items: Vec<ImpItem>,
+    /// Backend read failure. Rendered instead of the rows, because an empty
+    /// import table is a conclusion about attack surface and a failed read must
+    /// never be able to pass for one.
+    error: Option<String>,
     awidth: usize,
     filter: String,
     prev_filter: String,
@@ -47,7 +51,7 @@ fn parse_hex(s: &str) -> Option<u64> {
 
 impl ImportsList {
     pub fn new(ctx: &Ctx) -> Self {
-        let items = Self::build(ctx);
+        let (items, error) = Self::build(ctx);
         let awidth = items
             .iter()
             .map(|it| it.addr.len())
@@ -56,6 +60,7 @@ impl ImportsList {
             .max(10);
         ImportsList {
             items,
+            error,
             awidth,
             filter: String::new(),
             prev_filter: String::new(),
@@ -68,7 +73,9 @@ impl ImportsList {
     }
 
     pub fn refresh(&mut self, ctx: &Ctx) {
-        self.items = Self::build(ctx);
+        let (items, error) = Self::build(ctx);
+        self.items = items;
+        self.error = error;
         self.awidth = self
             .items
             .iter()
@@ -80,21 +87,28 @@ impl ImportsList {
         // past every row and blank the list until the next keypress).
         self.sel = self.sel.min(self.filtered().len().saturating_sub(1));
         self.top = self.top.min(self.sel);
+        // The list underneath moved; a surviving popup would describe the
+        // pre-refresh selection.
+        self.usage = None;
     }
 
-    fn build(ctx: &Ctx) -> Vec<ImpItem> {
-        let mut items: Vec<ImpItem> = ctx
-            .bn
-            .imports_list()
-            .into_iter()
-            .map(|import| ImpItem {
-                addr: import.addr,
-                name: import.name,
-                raw_name: import.raw_name,
-            })
-            .collect();
+    fn build(ctx: &Ctx) -> (Vec<ImpItem>, Option<String>) {
+        let (mut items, error) = match ctx.bn.imports_list_checked() {
+            Ok(imports) => (
+                imports
+                    .into_iter()
+                    .map(|import| ImpItem {
+                        addr: import.addr,
+                        name: import.name,
+                        raw_name: import.raw_name,
+                    })
+                    .collect::<Vec<ImpItem>>(),
+                None,
+            ),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         items.sort_by_key(|it| parse_hex(&it.addr).unwrap_or(0));
-        items
+        (items, error)
     }
 
     pub fn is_searching(&self) -> bool {
@@ -212,7 +226,10 @@ impl ImportsList {
                 }
                 KeyCode::Down => self.move_sel(1),
                 KeyCode::Up => self.move_sel(-1),
-                KeyCode::Char(c) => {
+                // A ctrl chord is never text: crossterm decodes ^U as
+                // `Char('u') + CONTROL`, so an unguarded arm turns a line-edit
+                // reflex into a literal letter in the filter.
+                KeyCode::Char(c) if !ctrl => {
                     self.filter.push(c);
                     self.sel = 0;
                 }
@@ -340,6 +357,21 @@ impl ImportsList {
         );
         crate::ui::render_bar(buf, x0, area.y + area.height.saturating_sub(1), w, &hint);
 
+        // A failed read must dominate the (necessarily empty) table — never let
+        // `0/0` read as "this binary imports nothing".
+        if let Some(error) = &self.error {
+            crate::ui::put_str(
+                buf,
+                x0 + 2,
+                area.y + 3,
+                format!("✗ {error}"),
+                w.saturating_sub(4),
+                Style::default().fg(Color::Red),
+            );
+            self.render_usage(area, buf);
+            return;
+        }
+
         for (row, &i) in rows.iter().enumerate().skip(self.top).take(listh) {
             let y = area.y + 2 + (row - self.top) as u16;
             let it = &self.items[i];
@@ -399,6 +431,94 @@ impl ImportsList {
             " j/k scroll · Enter/x opens full xrefs · p/q/Esc close ",
             (bw - 4) as usize,
             Style::default().add_modifier(Modifier::DIM),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::picker::tests::{ctrl, plain};
+
+    /// The stub ctx names a bn binary and instance that don't exist, so every
+    /// read through it fails — which is exactly the condition under test.
+    fn failing_ctx() -> Ctx {
+        Ctx::stub()
+    }
+
+    #[test]
+    fn a_failed_read_surfaces_an_error_instead_of_an_empty_table() {
+        let ctx = failing_ctx();
+        let list = ImportsList::new(&ctx);
+        assert!(list.items.is_empty());
+        let error = list.error.expect(
+            "a failed imports read must be surfaced — 0/0 reads as \
+             'this binary imports nothing'",
+        );
+        assert!(
+            !error.is_empty(),
+            "the error line must carry the backend's message"
+        );
+    }
+
+    #[test]
+    fn a_successful_read_carries_no_error() {
+        // Same shape via the build seam: an Ok read leaves `error` unset, so a
+        // genuinely empty import table still renders as an empty table.
+        let items = vec![ImpItem {
+            addr: "0x401020".into(),
+            name: "recv".into(),
+            raw_name: "recv".into(),
+        }];
+        let list = ImportsList {
+            items,
+            error: None,
+            awidth: 10,
+            filter: String::new(),
+            prev_filter: String::new(),
+            mode: Mode::Normal,
+            sel: 0,
+            top: 0,
+            pending_g: false,
+            usage: None,
+        };
+        assert!(list.error.is_none());
+        assert_eq!(list.filtered().len(), 1);
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_filter() {
+        let ctx = failing_ctx();
+        let mut list = ImportsList::new(&ctx);
+        list.on_key(plain('/'), &ctx);
+        for ch in "recv".chars() {
+            list.on_key(plain(ch), &ctx);
+        }
+        assert_eq!(list.filter, "recv");
+        for ch in ['a', 'e', 'u', 'w', 'r'] {
+            list.on_key(ctrl(ch), &ctx);
+        }
+        assert_eq!(
+            list.filter, "recv",
+            "a ctrl chord must not push its letter into the filter"
+        );
+    }
+
+    #[test]
+    fn refresh_closes_a_stale_usage_popup() {
+        let ctx = failing_ctx();
+        let mut list = ImportsList::new(&ctx);
+        list.usage = Some(Usage {
+            title: "callers of recv".into(),
+            addr: "0x401020".into(),
+            lines: vec!["0x401180  parse_frame".into()],
+            off: 0,
+        });
+        assert!(list.popup_open());
+        list.refresh(&ctx);
+        assert!(
+            !list.popup_open(),
+            "a refresh moves the list; the popup would describe the old selection"
         );
     }
 }

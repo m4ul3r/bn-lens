@@ -7,6 +7,48 @@ use crate::ctx::Ctx;
 use crate::herdr;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
+/// What the 2D CFG graph does with a key its own bindings don't claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CfgFallback {
+    /// Ask the agent about the selected block.
+    AskBlock,
+    /// Answer in the linear view, positioned on the selected block's head.
+    Linear,
+    /// Not a viewer binding at all — nothing to answer.
+    Unbound,
+}
+
+/// Route a key the graph itself doesn't bind. Every action the `?` overlay
+/// advertises for the VIEWER lands somewhere here: the graph has no cursor
+/// line, so peek/xrefs/rename/comment/tag/find/goto/stack are answered in the
+/// linear view at the selected block rather than silently dropped (#20).
+/// Pure so the mapping is unit-testable without a live backend.
+fn cfg_fallback(key: KeyEvent) -> CfgFallback {
+    // Ctrl chords belong to the graph's own history/scroll bindings.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return CfgFallback::Unbound;
+    }
+    match key.code {
+        KeyCode::Char('a') => CfgFallback::AskBlock,
+        KeyCode::Char('x' | 'p' | 'n' | 'y' | ';' | 't' | 's' | 'S' | '/' | ':') => {
+            CfgFallback::Linear
+        }
+        _ => CfgFallback::Unbound,
+    }
+}
+
+/// Collapse text into one bounded line for an ask prefix. An embedded newline
+/// is a submit to `herdr pane run`, so it must never survive into a message.
+fn ask_digest(text: &str) -> String {
+    let flat = text.replace(['\n', '\r'], " ");
+    let flat = flat.trim();
+    if flat.chars().count() > 700 {
+        flat.chars().take(699).collect::<String>() + "…"
+    } else {
+        flat.to_string()
+    }
+}
+
 impl Viewer {
     pub fn on_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
         self.status.clear();
@@ -48,6 +90,7 @@ impl Viewer {
     }
 
     fn rename_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let Popup::Rename {
             old,
             buf,
@@ -76,7 +119,11 @@ impl Viewer {
                 buf.pop();
                 err.clear();
             }
-            KeyCode::Char(ch) => {
+            // A ctrl chord is never part of a name. `App::capturing_text`
+            // suppresses the global `^R` while this popup is open, so without
+            // the guard `^R` pushes a literal `r` — and `valid_ident` accepts
+            // it, committing the rename with a stray character.
+            KeyCode::Char(ch) if !control => {
                 buf.push(ch);
                 err.clear();
             }
@@ -250,6 +297,7 @@ impl Viewer {
 
     fn comment_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
         let wrap = self.comment_wrap.get().max(1);
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let Popup::Comment {
             target,
             buf,
@@ -325,7 +373,10 @@ impl Viewer {
                     buf.remove(byte_at(buf, *cursor));
                 }
             }
-            KeyCode::Char(ch) => {
+            // A ctrl chord is never text — `^R`/`^U`/`^A` reflexes must not land
+            // literal letters in the comment (`App::capturing_text` suppresses
+            // the global `^R` while this popup owns input).
+            KeyCode::Char(ch) if !control => {
                 buf.insert(byte_at(buf, *cursor), ch);
                 *cursor += 1;
             }
@@ -335,6 +386,7 @@ impl Viewer {
     }
 
     fn tag_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let Popup::Tag { target, buf } = &mut self.popup else {
             return Exit::Stay;
         };
@@ -360,13 +412,15 @@ impl Viewer {
             KeyCode::Backspace => {
                 buf.pop();
             }
-            KeyCode::Char(ch) => buf.push(ch),
+            // A ctrl chord is never text (see `rename_key`).
+            KeyCode::Char(ch) if !control => buf.push(ch),
             _ => {}
         }
         Exit::Stay
     }
 
     fn search_key(&mut self, key: KeyEvent) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Enter => {
                 if let Some(input) = self.search_input.take() {
@@ -380,7 +434,8 @@ impl Viewer {
                     input.pop();
                 }
             }
-            KeyCode::Char(ch) => {
+            // A ctrl chord is never part of a query (see `rename_key`).
+            KeyCode::Char(ch) if !control => {
                 if let Some(input) = self.search_input.as_mut() {
                     input.push(ch);
                 }
@@ -392,6 +447,7 @@ impl Viewer {
     /// Address/symbol goto (`:`): edit the buffer, commit on Enter. On commit the
     /// input is resolved and navigated in `goto_address`.
     fn goto_key(&mut self, key: KeyEvent, ctx: &Ctx) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Enter => {
                 if let Some(input) = self.goto_input.take() {
@@ -404,7 +460,8 @@ impl Viewer {
                     input.pop();
                 }
             }
-            KeyCode::Char(ch) => {
+            // A ctrl chord is never part of an address (see `rename_key`).
+            KeyCode::Char(ch) if !control => {
                 if let Some(input) = self.goto_input.as_mut() {
                     input.push(ch);
                 }
@@ -628,7 +685,7 @@ impl Viewer {
         }
         // Remember where we are *before* changing the view, so the reload can
         // re-centre the new listing on the same address.
-        let anchor = self.current_code_addr(ctx);
+        let anchor = self.current_code_addr();
         if self.view != View::Xrefs {
             let order = [View::Decomp, View::Mlil, View::Disasm];
             let current = order
@@ -748,9 +805,83 @@ impl Viewer {
             KeyCode::Char('i') => self.cycle_il(ctx, 1),
             KeyCode::Char('I') => self.cycle_il(ctx, -1),
             KeyCode::Char('v') => self.toggle_cfg(ctx),
-            _ => {}
+            // Everything else the *viewer* advertises (peek, xrefs, rename,
+            // comment, find, goto, …) is answered on the selected block rather
+            // than dropped — see `cfg_fallback`.
+            _ => match cfg_fallback(key) {
+                CfgFallback::AskBlock => self.cfg_ask_block(ctx),
+                CfgFallback::Linear => return self.cfg_defer_to_linear(ctx, key),
+                CfgFallback::Unbound => {}
+            },
         }
         Exit::Stay
+    }
+
+    /// Hand a viewer key the graph can't answer to the linear view, positioned
+    /// on the **selected block's head address** — the same transition `v` makes,
+    /// anchored on the block instead of the function entry. This is a view
+    /// change, not a courtesy: the graph has no cursor line for those keys to
+    /// target, and `render_cfg_graph` draws neither the status row nor the popup
+    /// layer, so answering in place would be invisible either way.
+    fn cfg_defer_to_linear(&mut self, ctx: &Ctx, key: KeyEvent) -> Exit {
+        let head = self.cfg_block_head();
+        // One-shot anchor (same discipline as `cycle_il`): drive this reload's
+        // re-centering, then restore the prior focus so an unrelated later
+        // reload doesn't snap back here.
+        let prev_focus = self.focus_addr;
+        if head.is_some() {
+            self.focus_addr = head;
+        }
+        self.toggle_cfg(ctx);
+        self.focus_addr = prev_focus;
+        if let Some(addr) = head {
+            self.status = format!(" cfg block @ {addr:#x} · opened {}", self.view.label());
+        }
+        self.normal_key(key, ctx)
+    }
+
+    /// `a` in the graph: ask about the **whole selected block**, not a line.
+    /// Hands off to the linear view first (the popup layer doesn't render over
+    /// the canvas), then opens the normal composer, so the send path — and its
+    /// fail-closed delivery to the launching pane — is the shared one.
+    fn cfg_ask_block(&mut self, ctx: &Ctx) {
+        let Some((label, head, digest)) = self.cfg_block_digest() else {
+            return;
+        };
+        let prev_focus = self.focus_addr;
+        self.focus_addr = Some(head);
+        self.toggle_cfg(ctx);
+        self.focus_addr = prev_focus;
+        self.popup = Popup::Ask {
+            label: format!("{} · {label} @ {head:#x}", ctx.display_name(&self.name)),
+            preview: digest.clone(),
+            prefix: format!(
+                "{} · cfg block {label} @ {head:#x} · code: {digest} · [user] ",
+                self.locator(ctx)
+            ),
+            buf: String::new(),
+        };
+    }
+
+    /// The selected graph block's head address (a real location at every IL
+    /// level, unlike `GBlock::addr`, which is an IL index above asm).
+    fn cfg_block_head(&self) -> Option<u64> {
+        self.cfg_graph_view
+            .as_ref()
+            .and_then(|g| g.data.blocks.get(g.sel).map(|block| block.head))
+    }
+
+    /// `(label, head, one-line instruction digest)` for the selected block.
+    fn cfg_block_digest(&self) -> Option<(String, u64, String)> {
+        let g = self.cfg_graph_view.as_ref()?;
+        let block = g.data.blocks.get(g.sel)?;
+        let text = block
+            .insns
+            .iter()
+            .map(|(addr, text)| format!("{addr} {text}"))
+            .collect::<Vec<_>>()
+            .join(" ⏎ ");
+        Some((block.label.clone(), block.head, ask_digest(&text)))
     }
 
     fn move_cursor(&mut self, delta: i64) {
@@ -874,6 +1005,7 @@ impl Viewer {
     }
 
     fn ask_key(&mut self, key: KeyEvent, ctx: &Ctx) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let Popup::Ask { prefix, buf, .. } = &mut self.popup else {
             return;
         };
@@ -901,7 +1033,9 @@ impl Viewer {
             KeyCode::Backspace => {
                 buf.pop();
             }
-            KeyCode::Char(ch) => buf.push(ch),
+            // A ctrl chord is never text (see `rename_key`) — and this buffer
+            // ships to another agent's pane, so a stray letter is published.
+            KeyCode::Char(ch) if !control => buf.push(ch),
             _ => {}
         }
     }
@@ -1068,5 +1202,181 @@ impl Viewer {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::picker::tests::{ctrl, plain};
+
+    /// A viewer over the stub ctx: every backend read fails, so the buffer is
+    /// empty — which is all a key-handling test needs.
+    fn viewer(ctx: &Ctx) -> Viewer {
+        Viewer::new(ctx, "handle_request".into(), false)
+    }
+
+    /// Type each char through `on_key`, then each ctrl chord, and hand back the
+    /// viewer for inspection.
+    fn typed(ctx: &Ctx, mut v: Viewer, text: &str) -> Viewer {
+        for ch in text.chars() {
+            v.on_key(plain(ch), ctx);
+        }
+        // ^R is the worst of these: `App::capturing_text` suppresses the global
+        // refresh while a viewer field is open, so an unguarded arm inserts `r`.
+        for ch in ['r', 'a', 'e', 'u', 'w'] {
+            v.on_key(ctrl(ch), ctx);
+        }
+        v
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_rename_box() {
+        let ctx = Ctx::stub();
+        let mut v = viewer(&ctx);
+        v.popup = Popup::Rename {
+            old: "arg1".into(),
+            buf: String::new(),
+            err: String::new(),
+            scope: super::super::RenameScope::Local,
+        };
+        v = typed(&ctx, v, "frame_len");
+        let Popup::Rename { buf, .. } = &v.popup else {
+            panic!("the rename popup must still own input");
+        };
+        assert_eq!(
+            buf, "frame_len",
+            "^R in a rename box must not commit a stray character into the symbol"
+        );
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_comment_editor() {
+        let ctx = Ctx::stub();
+        let mut v = viewer(&ctx);
+        v.popup = Popup::Comment {
+            target: super::super::AnnTarget::Func("handle_request".into()),
+            buf: String::new(),
+            cursor: 0,
+            existing: false,
+        };
+        v = typed(&ctx, v, "bounds check");
+        let Popup::Comment { buf, cursor, .. } = &v.popup else {
+            panic!("the comment popup must still own input");
+        };
+        assert_eq!(buf, "bounds check");
+        assert_eq!(*cursor, "bounds check".chars().count());
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_tag_note() {
+        let ctx = Ctx::stub();
+        let mut v = viewer(&ctx);
+        v.popup = Popup::Tag {
+            target: super::super::AnnTarget::Func("handle_request".into()),
+            buf: String::new(),
+        };
+        v = typed(&ctx, v, "revisit");
+        let Popup::Tag { buf, .. } = &v.popup else {
+            panic!("the tag popup must still own input");
+        };
+        assert_eq!(buf, "revisit");
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_ask_composer() {
+        // This buffer ships to another agent's pane, so a stray letter is
+        // published, not just displayed.
+        let ctx = Ctx::stub();
+        let mut v = viewer(&ctx);
+        v.popup = Popup::Ask {
+            label: "ask".into(),
+            preview: String::new(),
+            prefix: "look at ".into(),
+            buf: String::new(),
+        };
+        v = typed(&ctx, v, "the length check");
+        let Popup::Ask { buf, .. } = &v.popup else {
+            panic!("the ask composer must still own input");
+        };
+        assert_eq!(buf, "the length check");
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_search_and_goto_prompts() {
+        let ctx = Ctx::stub();
+        let mut v = viewer(&ctx);
+        v.search_input = Some(String::new());
+        v = typed(&ctx, v, "memcpy");
+        assert_eq!(v.search_input.as_deref(), Some("memcpy"));
+
+        v.search_input = None;
+        v.goto_input = Some(String::new());
+        v = typed(&ctx, v, "0x401a20");
+        assert_eq!(v.goto_input.as_deref(), Some("0x401a20"));
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// `ctrl` for a `KeyCode` — distinct from `picker::tests::ctrl`, which takes
+    /// the char a control byte decodes into.
+    fn ctrl_code(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    /// #20: the `?` overlay advertises these for the VIEWER, and the graph used
+    /// to drop every one of them into `_ => {}` — no action, no status.
+    #[test]
+    fn cfg_graph_answers_every_advertised_viewer_key() {
+        for code in "xpnyts;S/:".chars() {
+            assert_eq!(
+                cfg_fallback(key(KeyCode::Char(code))),
+                CfgFallback::Linear,
+                "{code} is still silent in the cfg graph"
+            );
+        }
+        assert_eq!(cfg_fallback(key(KeyCode::Char('a'))), CfgFallback::AskBlock);
+    }
+
+    /// The fallback must not shadow a key the graph itself binds — those never
+    /// reach it, and a mistaken entry here would be dead but misleading.
+    #[test]
+    fn cfg_graph_keeps_its_own_bindings_out_of_the_fallback() {
+        for code in "qhjklHJKLzewbgiIv][ ".chars() {
+            assert_eq!(
+                cfg_fallback(key(KeyCode::Char(code))),
+                CfgFallback::Unbound,
+                "{code} is a graph binding and must not be re-routed"
+            );
+        }
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ] {
+            assert_eq!(cfg_fallback(key(code)), CfgFallback::Unbound);
+        }
+        // ^D/^U scroll the inspector and ^O/^F walk history — not `d`/`u`/`o`/`f`.
+        for code in "dufo".chars() {
+            assert_eq!(
+                cfg_fallback(ctrl_code(KeyCode::Char(code))),
+                CfgFallback::Unbound
+            );
+        }
+    }
+
+    /// Ask messages are a single line: an embedded newline submits the pane.
+    #[test]
+    fn ask_digest_is_one_bounded_line() {
+        let digest = ask_digest("0x1000 mov r0, r1\n0x1004 bl sub_2000\r\n");
+        assert!(!digest.contains('\n') && !digest.contains('\r'));
+        assert_eq!(digest, "0x1000 mov r0, r1 0x1004 bl sub_2000");
+
+        let long = ask_digest(&"0x1000 nop ⏎ ".repeat(200));
+        assert_eq!(long.chars().count(), 700);
+        assert!(long.ends_with('…'));
     }
 }

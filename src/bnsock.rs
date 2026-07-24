@@ -39,8 +39,51 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Matches bn's `DEFAULT_REQUEST_TIMEOUT` (`transport.py:40`). Generous because
-/// legitimate reads on a large binary genuinely run long.
+/// legitimate reads on a large binary genuinely run long — kept for exactly those
+/// ops (see [`ANALYSIS_OPS`]).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Budget for a read issued in direct response to a keypress.
+///
+/// Those run on the event thread, so the socket timeout *is* the freeze budget:
+/// at [`DEFAULT_TIMEOUT`] a wedged bridge locks the TUI for ten minutes with no
+/// banner and no cancel. 30 s is long enough for a first-touch decompile or CFG
+/// of a large function and short enough to stay a hiccup rather than a hang; the
+/// error names the op and the elapsed seconds, and the key can just be pressed
+/// again (a retry is a fresh connection — [`Self::request`] already fires
+/// `cancel_request` so the orphaned work is told to stop).
+pub const INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Which budget a read runs under. Chosen by the **caller**, not derived from the
+/// op name: the whole-database ops (`imports`, `exports`, `strings`, `types`,
+/// `data_vars`, `py_exec`, …) are issued from *both* contexts. `App::set_view`
+/// builds the Strings/Imports/Exports/Classes/Types/Marks lists synchronously on
+/// the event thread, `Viewer::load_data` reads `data_vars` there, and the CFG/data
+/// fallbacks run `py_exec` there — so an op-name table would hand exactly those
+/// paths the ten-minute budget and let a wedged bridge freeze the TUI.
+///
+/// A `Bn` handle carries one of these (`Bn::with_pace`); the pace is a property of
+/// the thread that owns the handle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pace {
+    /// Issued on the event thread, so the socket timeout *is* the freeze budget.
+    /// The default for a fresh handle: a read that overruns and says so beats one
+    /// that silently freezes the event loop.
+    Interactive,
+    /// Issued on a worker thread (a `Ctx` rebuild behind the refresh banner),
+    /// where the event loop keeps running and a genuinely long analysis read is
+    /// visible and cancellable.
+    Analysis,
+}
+
+impl Pace {
+    pub fn timeout(self) -> Duration {
+        match self {
+            Pace::Interactive => INTERACTIVE_TIMEOUT,
+            Pace::Analysis => DEFAULT_TIMEOUT,
+        }
+    }
+}
 
 /// Timeout for the best-effort cancel we fire after a request times out
 /// (`transport.py:47`). Deliberately tiny: a wedged bridge must not make the
@@ -233,8 +276,12 @@ impl Client {
     /// `target` is the `-t` selector; `None` lets the bridge use its active target.
     /// Errors are already human-facing (the bridge emits plain strings such as
     /// `Function not found: foo. Did you mean: fopen`).
+    /// Runs under [`Pace::Interactive`] — the safe default for the control reads
+    /// that call it directly (`list_targets`, liveness). Anything whose cost scales
+    /// with the binary goes through [`Self::request_timeout`] with the *caller's*
+    /// [`Pace`], because the op name alone cannot say which thread issued it.
     pub fn request(&self, op: &str, params: Value, target: Option<&str>) -> Result<Value, String> {
-        self.request_timeout(op, params, target, DEFAULT_TIMEOUT)
+        self.request_timeout(op, params, target, Pace::Interactive.timeout())
     }
 
     pub fn request_timeout(
@@ -446,6 +493,18 @@ mod tests {
         let b = next_request_id();
         assert_ne!(a, b, "cancellation addresses a request by id");
         assert!(a.starts_with("bn-lens-"));
+    }
+
+    #[test]
+    fn the_pace_and_not_the_op_picks_the_budget() {
+        // The long budget is reachable only by a caller that says it is on a worker
+        // thread. Op name is not a proxy for that: `imports`/`strings`/`data_vars`/
+        // `py_exec` are issued from the event thread too (`App::set_view`,
+        // `Viewer::load_data`, the CFG/data fallbacks), and there the socket timeout
+        // *is* the freeze budget.
+        assert_eq!(Pace::Interactive.timeout(), INTERACTIVE_TIMEOUT);
+        assert_eq!(Pace::Analysis.timeout(), DEFAULT_TIMEOUT);
+        assert!(INTERACTIVE_TIMEOUT < DEFAULT_TIMEOUT);
     }
 
     #[test]

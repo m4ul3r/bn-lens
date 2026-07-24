@@ -23,9 +23,13 @@ pub(super) fn ellipsize(text: &str, max_chars: usize) -> String {
 }
 
 /// How to read a pointer-sized word out of a raw dump row: the target's pointer
-/// width in bytes and its byte order. Mirrors `DATA_MAP_PROGRAM`'s
-/// `psz = bv.address_size`, so the raw peek and the typed data map cannot
-/// disagree about what counts as a pointer.
+/// width in bytes and its byte order.
+///
+/// The typed data map gets the same fact from BN directly (`DATA_MAP_PROGRAM`'s
+/// `psz = bv.address_size`, evaluated inside the bridge), so the two can only
+/// diverge in one direction: this side may decline to decode where the data map
+/// still resolves pointers. That is deliberate — the data map holds the
+/// authoritative value, and the raw peek would be *guessing* one.
 ///
 /// There is deliberately **no `Default`**. The old default (64-bit
 /// little-endian) is a guess about the target, and a misdecoded word does not

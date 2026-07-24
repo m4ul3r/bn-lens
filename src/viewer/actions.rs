@@ -193,7 +193,9 @@ impl Viewer {
             .iter()
             .map(|name| name.to_string())
             .collect();
-        types.extend(ctx.bn.types_list().into_iter().map(|item| item.name));
+        // Autocomplete only, so a partial read just offers fewer completions —
+        // nothing here decides whether a write is safe.
+        types.extend(ctx.bn.types_list().items.into_iter().map(|item| item.name));
         types.sort();
         types.dedup();
         self.popup = Popup::Retype {
@@ -242,31 +244,37 @@ impl Viewer {
         }
         let existing = ctx.bn.comment_get_func(&self.name);
         let entry = crate::ctx::parse_hex(&existing.entry_addr);
-        if let Some(addr) = self.decomp_line_addr(ctx) {
-            if entry.is_none() || crate::ctx::parse_hex(&addr) != entry {
+        match ann_addr(None, self.decomp_line_addr(), entry) {
+            Some(addr) => {
                 let text = ctx.bn.comment_get_addr(&addr).unwrap_or_default();
-                return (AnnTarget::Addr(addr), text);
+                (AnnTarget::Addr(addr), text)
             }
+            None => func_comment_target(&self.name, existing),
         }
-        func_comment_target(&self.name, existing)
     }
 
-    /// The decompile cursor line's *own* address (its `--addresses` JSON entry),
-    /// or `None` in another view or on a line carrying no address of its own (a
-    /// declaration, brace, or blank line). Unlike [`current_code_addr`], it does
+    /// The decompile cursor line's *own* address, read off the `code_addrs`
+    /// column cached at load (one `--addresses` read per load — see
+    /// [`crate::viewer::Viewer::code_addrs`]). `None` in another view, or on a
+    /// line carrying no address of its own (a declaration, brace, blank line, or
+    /// one of bn's own note/warning lines). Unlike [`current_code_addr`] it does
     /// **not** snap to a neighbouring line: an address-less line must fall
     /// through to the whole-function comment, not steal the next statement's
     /// address.
-    fn decomp_line_addr(&self, ctx: &Ctx) -> Option<String> {
+    fn decomp_line_addr(&self) -> Option<String> {
         if !matches!(self.view, View::Decomp) {
             return None;
         }
-        let (_, _, text) = ctx.bn.decompile_json(&self.name)?;
-        let dec = crate::decomp::dec_lines(&text);
-        dec.get(self.cline)?.addr.map(|a| format!("0x{a:x}"))
+        self.code_addrs
+            .get(self.cline)
+            .copied()
+            .flatten()
+            .map(|addr| format!("0x{addr:x}"))
     }
 
-    /// `t`: bookmark/tag. Same target resolution as [`open_comment`].
+    /// `t`: bookmark/tag. Same target resolution as [`open_comment`] — both go
+    /// through [`ann_addr`], so the two gestures can never disagree about which
+    /// line they annotate.
     pub(super) fn open_tag(&mut self) {
         if !self.view.is_code() {
             self.status = " ✗ tags apply in a code view".into();
@@ -279,10 +287,17 @@ impl Viewer {
     }
 
     /// Resolve where a comment/tag should land from the current selection/line.
+    ///
+    /// This used to consult only [`explicit_addr`], which is `None` on every
+    /// decompile line — so `t` silently tagged the whole function even where `;`
+    /// on the same line correctly targeted the statement (issue #24). It now
+    /// shares [`ann_addr`] with `;`.
     fn ann_target(&self) -> AnnTarget {
-        self.explicit_addr()
-            .map(AnnTarget::Addr)
-            .unwrap_or_else(|| AnnTarget::Func(self.name.clone()))
+        let entry = self.entry.as_deref().and_then(crate::ctx::parse_hex);
+        match ann_addr(self.explicit_addr(), self.decomp_line_addr(), entry) {
+            Some(addr) => AnnTarget::Addr(addr),
+            None => AnnTarget::Func(self.name.clone()),
+        }
     }
 
     /// The explicit address `;`/`t` should annotate: a *deliberately* selected
@@ -332,22 +347,17 @@ impl Viewer {
     /// cursor line through that JSON, snapping to the nearest addressed line
     /// at/below the cursor (a declaration or brace line has no address of its own).
     ///
-    /// Like the header's `cursor_addr`, this relies on the rendered decompile
-    /// lines staying index-aligned with `dec_lines(--addresses)` (the `code_addrs`
-    /// invariant on `Viewer`); it re-decompiles here rather than reading the cache
-    /// because an IL switch is a one-shot lookup, not a per-frame read.
-    pub(super) fn current_code_addr(&self, ctx: &Ctx) -> Option<u64> {
+    /// Decompile reads the address column cached at load (`cursor_addr`, which
+    /// snaps the same way) rather than re-decompiling: the addresses came from the
+    /// same `--addresses` payload the visible lines did, so they are aligned by
+    /// construction and a fourth full decompile per `i` press buys nothing
+    /// (issue #18).
+    pub(super) fn current_code_addr(&self) -> Option<u64> {
         match self.view {
             View::Mlil | View::Disasm => self
                 .explicit_addr()
                 .and_then(|addr| crate::ctx::parse_hex(&addr)),
-            View::Decomp => {
-                let (_, _, text) = ctx.bn.decompile_json(&self.name)?;
-                let dec = crate::decomp::dec_lines(&text);
-                dec.get(self.cline..)
-                    .and_then(|rest| rest.iter().find_map(|line| line.addr))
-                    .or_else(|| dec.iter().take(self.cline).rev().find_map(|line| line.addr))
-            }
+            View::Decomp => self.cursor_addr(),
             _ => None,
         }
     }
@@ -699,7 +709,16 @@ impl Viewer {
             }
             return;
         }
-        let tokens: Vec<String> = self.lines[self.cline]
+        // Indexed defensively: `render` clamps `cline` every frame, so a cursor
+        // past the end is not reachable today — but a load that shortens `lines`
+        // while this key is processed would panic here, and a panic mid-draw
+        // leaves the terminal corrupted. Fall into the same "nothing to peek"
+        // status instead (issue #30).
+        let Some(segments) = self.lines.get(self.cline) else {
+            self.status = " ✗ nothing to peek on this line".into();
+            return;
+        };
+        let tokens: Vec<String> = segments
             .iter()
             .filter(|segment| {
                 segment.kind == Tok::Name
@@ -896,6 +915,27 @@ impl Viewer {
     }
 }
 
+/// The address an annotation gesture (`;` or `t`) lands on, or `None` for "the
+/// whole function". Shared by both so they can never resolve differently for the
+/// same cursor position (issue #24).
+///
+/// `explicit` is a deliberately-chosen address (a selected `Addr` hotspot, or a
+/// disasm/MLIL line's leading address column) and always wins. Otherwise a
+/// *decompile* line's own address is used — **except** when it is the function
+/// entry: bn tags the signature, the doc line and the opening brace all with the
+/// entry address, so a line resolving there is the function header, not a
+/// statement, and the gesture is function-scoped.
+fn ann_addr(explicit: Option<String>, line: Option<String>, entry: Option<u64>) -> Option<String> {
+    if let Some(addr) = explicit {
+        return Some(addr);
+    }
+    let line = line?;
+    match entry {
+        Some(entry) if crate::ctx::parse_hex(&line) == Some(entry) => None,
+        _ => Some(line),
+    }
+}
+
 /// Where a bare `;` (no address selected) lands on the current function, and
 /// the existing text to edit. An existing `function_doc` keeps editing in place
 /// (it's the note already rendered atop the signature — though it never lists
@@ -987,8 +1027,96 @@ fn match_name_prefix<'a>(names: impl Iterator<Item = &'a str>, query: &str) -> N
 
 #[cfg(test)]
 mod tests {
-    use super::{func_comment_target, match_name_prefix, parse_xref_callsite, AnnTarget, NameMatch};
+    use super::{
+        ann_addr, func_comment_target, match_name_prefix, parse_xref_callsite, AnnTarget,
+        NameMatch, View, Viewer,
+    };
     use crate::bn::FuncComment;
+
+    /// A decompile view of an 8-line mock function whose cursor sits on an
+    /// interior statement with its own address.
+    fn decomp_viewer(cline: usize) -> Viewer {
+        let mut viewer = Viewer::test_blank("parse_hdr".into(), View::Decomp);
+        viewer.entry = Some("0x401200".into());
+        viewer.lines = vec![Vec::new(); 6];
+        // As `decomp_view_lines` builds it: signature/brace/close carry the entry
+        // address, the blank separator carries none.
+        viewer.code_addrs = vec![
+            Some(0x401200),
+            Some(0x401200),
+            Some(0x401214),
+            None,
+            Some(0x401234),
+            Some(0x401200),
+        ];
+        viewer.cline = cline;
+        viewer
+    }
+
+    /// #24: `t` used to ignore the decompile line's address entirely and always
+    /// fall through to `AnnTarget::Func`, while `;` on the same line targeted the
+    /// statement. Both now resolve through `ann_addr`, so they agree.
+    #[test]
+    fn comment_and_tag_resolve_the_same_decompile_line() {
+        let viewer = decomp_viewer(4);
+        let line = viewer.decomp_line_addr();
+        assert_eq!(line.as_deref(), Some("0x401234"));
+        // What `;` resolves (`comment_edit_target`'s non-explicit branch) …
+        let comment = ann_addr(None, line.clone(), Some(0x401200));
+        // … and what `t` resolves.
+        assert_eq!(viewer.ann_target(), AnnTarget::Addr("0x401234".into()));
+        assert_eq!(comment.map(AnnTarget::Addr), Some(viewer.ann_target()));
+    }
+
+    /// The function-header lines (signature, doc, opening brace, closing brace)
+    /// all report the entry address, so both gestures stay function-scoped there —
+    /// the behaviour `;` already had, now shared.
+    #[test]
+    fn an_entry_addressed_line_stays_function_scoped() {
+        for cline in [0, 1, 5] {
+            let viewer = decomp_viewer(cline);
+            assert_eq!(
+                viewer.ann_target(),
+                AnnTarget::Func("parse_hdr".into()),
+                "line {cline} is the function header"
+            );
+            assert_eq!(
+                ann_addr(None, viewer.decomp_line_addr(), Some(0x401200)),
+                None
+            );
+        }
+    }
+
+    /// An address-less line (a blank separator, or one of bn's note/warning
+    /// lines) must not steal a neighbour's address for either gesture.
+    #[test]
+    fn an_address_less_line_annotates_the_function() {
+        let viewer = decomp_viewer(3);
+        assert_eq!(viewer.decomp_line_addr(), None);
+        assert_eq!(viewer.ann_target(), AnnTarget::Func("parse_hdr".into()));
+        // `i`/`I`, by contrast, *does* snap to the nearest addressed line so an
+        // IL switch keeps your place.
+        assert_eq!(viewer.current_code_addr(), Some(0x401234));
+    }
+
+    /// A deliberately-selected address (a hotspot, or a disasm/MLIL address
+    /// column) still wins over the line's own address.
+    #[test]
+    fn an_explicit_selection_wins() {
+        assert_eq!(
+            ann_addr(
+                Some("0x4012f0".into()),
+                Some("0x401234".into()),
+                Some(0x401200)
+            ),
+            Some("0x4012f0".into())
+        );
+        // …even when it *is* the entry: choosing it is deliberate.
+        assert_eq!(
+            ann_addr(Some("0x401200".into()), None, Some(0x401200)),
+            Some("0x401200".into())
+        );
+    }
 
     fn func_comment(doc: &str, entry_addr: &str, entry_comment: Option<&str>) -> FuncComment {
         FuncComment {

@@ -16,6 +16,20 @@ const GUTTER_WIDTH: u16 = 7; // "NNNN │ "
 /// can't push real code off screen across several wrapped rows.
 const STR_DISPLAY_LIMIT: usize = 48;
 
+/// Narrowest body the CFG block inspector is worth drawing at. Below it the
+/// panel is dropped entirely (see [`cfg_expand_geometry`]).
+const CFG_EXPAND_MIN_W: usize = 24;
+
+/// Columns available for code text between `x` and `right` (the right edge of
+/// the code column), or `None` when there are none. The wrap guard resets `x` to
+/// the gutter edge (`area.x + GUTTER_WIDTH`), which sits *past* `right` on a
+/// pane whose code column is narrower than the 7-column gutter — `right - x`
+/// then underflowed, wrapping to a ~65535 width in release and panicking under
+/// `cargo test`.
+fn code_space(x: u16, right: u16) -> Option<usize> {
+    (right > x).then(|| (right - x) as usize)
+}
+
 /// Turn a tokenized pseudo-C line into coloured spans, dropping the first
 /// `hoff` characters (horizontal pan). Splits inside a segment when the pan
 /// lands mid-token so colours stay aligned to the panned text.
@@ -483,7 +497,11 @@ impl Viewer {
                         );
                         x = area.x + GUTTER_WIDTH;
                     }
-                    let space = (right - x) as usize;
+                    // No code column left of the gutter edge: there is nowhere to
+                    // draw this line, so stop instead of underflowing the width.
+                    let Some(space) = code_space(x, right) else {
+                        break 'segments;
+                    };
                     let chunk: String = chars[char_index..(char_index + space).min(chars.len())]
                         .iter()
                         .collect();
@@ -1140,6 +1158,36 @@ impl Viewer {
     }
 }
 
+/// Panel geometry for the CFG block inspector — `(inner_w, panel_w, panel_h)` —
+/// or `None` when the pane is too narrow to host it at all.
+///
+/// The body has a hard [`CFG_EXPAND_MIN_W`] minimum, so on a pane that can't
+/// spare `24 + 4` columns of box plus a 2-column right margin there is nothing
+/// useful to draw: a 24-column inspector laid over a graph is unreadable, and
+/// the box would be wider than the pane. Deriving the *upper* clamp bound from
+/// `area.width` without that check is what crashed the CFG view on a narrow
+/// split — `usize::clamp` panics (in release too) once its computed max falls
+/// below the 24 minimum.
+fn cfg_expand_geometry(
+    area_w: u16,
+    avail_h: usize,
+    line_count: usize,
+    widest_line: usize,
+) -> Option<(usize, u16, u16)> {
+    // 4 columns of box chrome + a 2-column margin so the panel never touches the
+    // right edge of the pane.
+    let max_inner = (area_w as usize).saturating_sub(6).min(96);
+    if max_inner < CFG_EXPAND_MIN_W {
+        return None;
+    }
+    let inner_w = widest_line.clamp(CFG_EXPAND_MIN_W, max_inner);
+    // Leave at least half the body for the graph so the panel never eats the
+    // whole canvas; still tall enough to show a useful window of insns.
+    let max_h = avail_h.max(4).min((avail_h / 2).max(8).min(20));
+    let panel_h = (line_count + 2).clamp(4, max_h) as u16;
+    Some((inner_w, (inner_w + 4) as u16, panel_h))
+}
+
 /// Render the block inspector: the selected block's instructions, tokenized
 /// with the disasm palette *and* layered with the same call/data/address/local
 /// hotspot colours the linear views use, in a content-sized box pinned to the
@@ -1156,18 +1204,21 @@ fn render_cfg_expand(
     locals: &std::collections::HashMap<String, String>,
 ) {
     let avail_h = bottom.saturating_sub(body_top) as usize;
-    // Leave at least half the body for the graph so the panel never eats the
-    // whole canvas; still tall enough to show a useful window of insns.
-    let max_h = avail_h.max(4).min((avail_h / 2).max(8).min(20));
-    let inner_w = exp
+    let widest = exp
         .lines
         .iter()
         .map(|l| l.iter().map(|s| s.text.chars().count()).sum::<usize>())
         .max()
-        .unwrap_or(24)
-        .clamp(24, (area.width as usize).saturating_sub(6).min(96));
-    let panel_w = (inner_w + 4) as u16;
-    let panel_h = (exp.lines.len() + 2).clamp(4, max_h) as u16;
+        .unwrap_or(CFG_EXPAND_MIN_W);
+    let Some((inner_w, panel_w, panel_h)) =
+        cfg_expand_geometry(area.width, avail_h, exp.lines.len(), widest)
+    else {
+        // Too narrow for an inspector: drop it (and its hit box) rather than draw
+        // a panel wider than the pane over the graph. `e` re-enables it once the
+        // split is wide enough again.
+        exp.hit = None;
+        return;
+    };
     let panel_x = area.x;
     let panel_y = body_top;
     exp.hit = Some((panel_x, panel_y, panel_w, panel_h));
@@ -1295,8 +1346,47 @@ fn cfg_cell_style(col: u8, selected: bool) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{pan_syntax_spans, tail_wrapped_lines, wrap_cursor};
+    use super::{
+        cfg_expand_geometry, code_space, pan_syntax_spans, tail_wrapped_lines, wrap_cursor,
+        CFG_EXPAND_MIN_W,
+    };
     use crate::syntax::{Seg, Tok};
+
+    #[test]
+    fn cfg_inspector_bails_out_on_a_narrow_pane_instead_of_panicking() {
+        // Below 30 columns the 24-column body plus chrome doesn't fit, so the
+        // panel is dropped. The old code computed `clamp(24, width - 6)` here,
+        // whose upper bound falls under the lower one at these widths —
+        // `usize::clamp`'s documented `min > max` panic, in release too.
+        for w in [0u16, 1, 3, 10, 17, 25, 29] {
+            assert_eq!(cfg_expand_geometry(w, 20, 4, 40), None, "width {w}");
+        }
+        // At exactly 30 the body is the bare minimum and the box fits the pane.
+        let (inner, panel_w, panel_h) = cfg_expand_geometry(30, 20, 4, 40).expect("fits at 30");
+        assert_eq!((inner, panel_w), (CFG_EXPAND_MIN_W, 28));
+        assert!(panel_w <= 30, "panel must fit the pane");
+        assert_eq!(panel_h, 6); // 4 insn lines + 2 borders
+
+        // A viable-but-narrow pane clips the body to the pane, never past it.
+        let (inner, panel_w, _) = cfg_expand_geometry(40, 20, 4, 400).unwrap();
+        assert_eq!((inner, panel_w), (34, 38));
+        assert!(panel_w <= 40);
+        // A wide pane sizes to content, capped at a 96-column body.
+        assert_eq!(cfg_expand_geometry(200, 20, 4, 400).unwrap().0, 96);
+        // Height is capped to half the body so the graph stays visible.
+        assert_eq!(cfg_expand_geometry(80, 20, 200, 40).unwrap().2, 10);
+    }
+
+    #[test]
+    fn code_space_bails_when_the_gutter_swallows_the_code_column() {
+        // A ~3-column pane: `right` (area.x + code_width) lands left of the
+        // gutter edge (area.x + GUTTER_WIDTH), so there is no code column at all
+        // and the old `right - x` underflowed.
+        assert_eq!(code_space(7, 3), None);
+        assert_eq!(code_space(7, 7), None);
+        assert_eq!(code_space(7, 8), Some(1));
+        assert_eq!(code_space(7, 80), Some(73));
+    }
 
     #[test]
     fn ask_composer_keeps_the_wrapped_tail() {
