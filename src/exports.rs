@@ -21,6 +21,26 @@ struct ExpItem {
     is_data: bool,
 }
 
+/// `bn exports --format json` can repeat the same item verbatim across result
+/// pages (upstream bn bridge issue), which doubled rows, header counts, and
+/// filter hits. Collapse exact full-row duplicates; the first occurrence wins
+/// so relative order is preserved, and rows differing in any field survive.
+fn dedupe(items: Vec<ExpItem>) -> Vec<ExpItem> {
+    let mut seen: std::collections::HashSet<(String, String, String, bool)> =
+        std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter(|it| {
+            seen.insert((
+                it.addr.clone(),
+                it.name.clone(),
+                it.display_name.clone(),
+                it.is_data,
+            ))
+        })
+        .collect()
+}
+
 enum Mode {
     Normal,
     Search,
@@ -88,24 +108,25 @@ impl ExportsList {
     /// Functions first, then data — both by address — so the callable public API
     /// leads and exported globals trail.
     fn build(ctx: &Ctx) -> Vec<ExpItem> {
-        let mut items: Vec<ExpItem> = ctx
-            .bn
-            .exports_list()
-            .into_iter()
-            .map(|e| {
-                // Cross-check bn's `(data)` tag against the known function set:
-                // an export that isn't a recovered function is data.
-                let is_data = e.is_data
-                    || (!ctx.func_names.contains(&e.name)
-                        && !ctx.func_names.contains(&e.display_name));
-                ExpItem {
-                    addr: e.addr,
-                    name: e.name,
-                    display_name: e.display_name,
-                    is_data,
-                }
-            })
-            .collect();
+        let mut items: Vec<ExpItem> = dedupe(
+            ctx.bn
+                .exports_list()
+                .into_iter()
+                .map(|e| {
+                    // Cross-check bn's `(data)` tag against the known function set:
+                    // an export that isn't a recovered function is data.
+                    let is_data = e.is_data
+                        || (!ctx.func_names.contains(&e.name)
+                            && !ctx.func_names.contains(&e.display_name));
+                    ExpItem {
+                        addr: e.addr,
+                        name: e.name,
+                        display_name: e.display_name,
+                        is_data,
+                    }
+                })
+                .collect(),
+        );
         items.sort_by(|a, b| {
             a.is_data.cmp(&b.is_data).then(
                 parse_hex(&a.addr)
@@ -441,5 +462,98 @@ impl ExportsList {
             (bw - 4) as usize,
             Style::default().add_modifier(Modifier::DIM),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(addr: &str, name: &str, is_data: bool) -> ExpItem {
+        ExpItem {
+            addr: addr.into(),
+            name: name.into(),
+            display_name: name.into(),
+            is_data,
+        }
+    }
+
+    fn keys(items: &[ExpItem]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|it| (it.addr.clone(), it.name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn exact_duplicates_collapse() {
+        let out = dedupe(vec![
+            item("0x401000", "mock_init", false),
+            item("0x401000", "mock_init", false),
+            item("0x401000", "mock_init", false),
+        ]);
+        assert_eq!(keys(&out), vec![("0x401000".into(), "mock_init".into())]);
+    }
+
+    #[test]
+    fn near_duplicates_survive() {
+        // Same name at a different address, and same address under a
+        // different name, are genuinely distinct exports.
+        let out = dedupe(vec![
+            item("0x401000", "mock_init", false),
+            item("0x402000", "mock_init", false),
+            item("0x401000", "mock_init_alias", false),
+        ]);
+        assert_eq!(
+            keys(&out),
+            vec![
+                ("0x401000".into(), "mock_init".into()),
+                ("0x402000".into(), "mock_init".into()),
+                ("0x401000".into(), "mock_init_alias".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn full_row_key_keeps_rows_differing_only_in_kind_or_display() {
+        let mut alias = item("0x403000", "mock_table", true);
+        alias.display_name = "mock_table_pretty".into();
+        let out = dedupe(vec![
+            item("0x403000", "mock_table", true),
+            // Same (addr, name) but function-kind: not an exact duplicate.
+            item("0x403000", "mock_table", false),
+            // Same (addr, name, is_data) but different display name.
+            alias,
+        ]);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn order_stable_first_occurrence_wins() {
+        let out = dedupe(vec![
+            item("0x404000", "mock_write", false),
+            item("0x401000", "mock_init", false),
+            item("0x404000", "mock_write", false),
+            item("0x405000", "mock_read", false),
+            item("0x401000", "mock_init", false),
+        ]);
+        assert_eq!(
+            keys(&out),
+            vec![
+                ("0x404000".into(), "mock_write".into()),
+                ("0x401000".into(), "mock_init".into()),
+                ("0x405000".into(), "mock_read".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_and_all_unique_pass_through() {
+        assert!(dedupe(Vec::new()).is_empty());
+        let out = dedupe(vec![
+            item("0x401000", "mock_init", false),
+            item("0x402000", "mock_fini", true),
+        ]);
+        assert_eq!(out.len(), 2);
     }
 }
