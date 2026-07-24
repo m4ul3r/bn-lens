@@ -226,19 +226,29 @@ impl Viewer {
     }
 
     /// Resolve where `;` comments *and* the current text to edit (empty for a
-    /// new comment). A concrete line address wins — a deliberately-selected Addr
-    /// hotspot, the disasm/MLIL line's leading address, or (the case that lets
-    /// `;` annotate a specific *decompile* line rather than the whole function)
-    /// that line's own address from the `--addresses` JSON. The comment then
-    /// renders inline on the line and, being address-scoped, shows in Marks.
-    /// Only an address-less line (signature, brace, blank) falls back to the
-    /// whole-function note — see [`func_comment_target`] for how it picks a slot.
+    /// new comment). A deliberately-selected Addr hotspot or a disasm/MLIL line's
+    /// leading address always wins. Otherwise a *decompile* line with its own
+    /// address gets an inline address comment — the case that lets `;` annotate a
+    /// specific line rather than the whole function — **except** the entry line:
+    /// bn tags the function's signature, its doc line, and the opening brace all
+    /// with the entry address, so a line resolving to the entry is the function
+    /// header, not a statement, and flows to [`func_comment_target`] (edit an
+    /// existing doc in place; else target the entry address so a new note shows
+    /// in Marks). Address-less lines (blank separators) fall there too.
     fn comment_edit_target(&self, ctx: &Ctx) -> (AnnTarget, String) {
-        if let Some(addr) = self.explicit_addr().or_else(|| self.decomp_line_addr(ctx)) {
+        if let Some(addr) = self.explicit_addr() {
             let text = ctx.bn.comment_get_addr(&addr).unwrap_or_default();
             return (AnnTarget::Addr(addr), text);
         }
-        func_comment_target(&self.name, ctx.bn.comment_get_func(&self.name))
+        let existing = ctx.bn.comment_get_func(&self.name);
+        let entry = crate::ctx::parse_hex(&existing.entry_addr);
+        if let Some(addr) = self.decomp_line_addr(ctx) {
+            if entry.is_none() || crate::ctx::parse_hex(&addr) != entry {
+                let text = ctx.bn.comment_get_addr(&addr).unwrap_or_default();
+                return (AnnTarget::Addr(addr), text);
+            }
+        }
+        func_comment_target(&self.name, existing)
     }
 
     /// The decompile cursor line's *own* address (its `--addresses` JSON entry),
