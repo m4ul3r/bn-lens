@@ -16,6 +16,13 @@ pub struct Ctx {
     pub instance_label: String,
     pub target: String, // the `-t` selector
     pub arch: String,
+    /// Target pointer width in bytes, as reported by BN (`bv.address_size`), when
+    /// this bn reports it. `None` means fall back to the architecture-name table —
+    /// never "assume 64-bit". See `viewer::hotspots::ptr_fmt`.
+    pub ptr_size: Option<usize>,
+    /// Target byte order, as reported by BN (`bv.endianness`), when this bn reports
+    /// it. Same `None` semantics as [`Self::ptr_size`].
+    pub big_endian: Option<bool>,
     /// Completeness is security provenance: only `Full` permits authoritative
     /// absence wording in usage/list views.
     pub analysis_state: AnalysisState,
@@ -335,6 +342,8 @@ impl Ctx {
         Ok(Ctx {
             instance_label: instance.unwrap_or_else(|| "(default)".into()),
             target: target_sel,
+            ptr_size: target_info.ptr_size,
+            big_endian: target_info.big_endian,
             arch: target_info.arch,
             analysis_state: target_info.analysis_state,
             bn: bn.with_pace(Pace::Interactive),
@@ -500,6 +509,11 @@ impl Ctx {
             instance_label: "test".into(),
             target: String::new(),
             arch: String::new(),
+            // No target, so no pointer format: with an empty `arch` the name table
+            // yields nothing either, and a peek annotates nothing rather than
+            // decoding at a guessed width.
+            ptr_size: None,
+            big_endian: None,
             analysis_state: AnalysisState::Full,
             funcs: Vec::new(),
             func_names: HashSet::new(),

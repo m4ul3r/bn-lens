@@ -148,11 +148,43 @@ struct TargetInfoJson {
     arch: String,
     #[serde(default)]
     analysis_state: String,
+    /// `bv.address_size` — the target's pointer width in bytes, straight from BN.
+    /// Authoritative for *any* architecture, where the `arch` name is a guess for
+    /// anything outside a fixed table. Optional because today's bn does not put it
+    /// on the `target_info` payload (verified against `bridge.py::_target_info`);
+    /// absent simply means "fall back to the name table", never "assume 64-bit".
+    #[serde(default)]
+    address_size: Option<u64>,
+    /// `bv.endianness`, as bn's own `_byteorder` renders it: `"big"` / `"little"`.
+    /// Same optionality as [`Self::address_size`].
+    #[serde(default)]
+    endianness: Option<String>,
 }
 
 pub struct TargetInfo {
     pub arch: String,
     pub analysis_state: AnalysisState,
+    /// Pointer width in bytes as reported by BN, when this bn reports one.
+    pub ptr_size: Option<usize>,
+    /// Byte order as reported by BN, when this bn reports one.
+    pub big_endian: Option<bool>,
+}
+
+impl TargetInfoJson {
+    fn ptr_size(&self) -> Option<usize> {
+        self.address_size
+            .filter(|size| (1..=8).contains(size))
+            .map(|size| size as usize)
+    }
+
+    /// Mirrors bn's own `_byteorder` test (`seam.py`), which stringifies the
+    /// `Endianness` enum and looks for "big" — so `BigEndian`,
+    /// `Endianness.BigEndian` and a plain `"big"` all read the same.
+    fn big_endian(&self) -> Option<bool> {
+        self.endianness
+            .as_deref()
+            .map(|order| order.to_ascii_lowercase().contains("big"))
+    }
 }
 
 #[derive(Deserialize)]
@@ -2264,6 +2296,8 @@ impl Bn {
                 message
             })?;
             return Ok(TargetInfo {
+                ptr_size: info.ptr_size(),
+                big_endian: info.big_endian(),
                 arch: info.arch,
                 analysis_state: AnalysisState::from_raw(&info.analysis_state),
             });
@@ -2275,6 +2309,8 @@ impl Bn {
             message
         })?;
         Ok(TargetInfo {
+            ptr_size: info.ptr_size(),
+            big_endian: info.big_endian(),
             arch: info.arch,
             analysis_state: AnalysisState::from_raw(&info.analysis_state),
         })
@@ -3599,6 +3635,7 @@ mod tests {
         render_class_show, render_disasm_linear, render_read, render_sections, render_type_info,
         render_xrefs, resolution_note, text_field, warning_lines, with_capture, AnalysisState, Bn,
         ClassItemJson, CommentListJson, DataSymsJson, Listing, StringsJson, TagListJson,
+        TargetInfoJson,
     };
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -4434,6 +4471,44 @@ mod tests {
         let value = serde_json::json!({"text": "void f()\n{\n}"});
         assert!(resolution_note(&value).is_empty());
         assert!(warning_lines(&value).is_empty());
+    }
+
+    #[test]
+    fn the_pointer_format_is_taken_only_when_bn_reports_it() {
+        // Today's `target_info` payload carries no `address_size`/`endianness`
+        // (verified against `bridge.py::_target_info`), so absence is the normal
+        // case and must read as "unknown" — the arch-name table then decides, and
+        // for a name it never enumerated nothing is annotated at all.
+        let absent: TargetInfoJson = serde_json::from_value(
+            serde_json::json!({"arch": "sparcv9", "analysis_state": "full"}),
+        )
+        .expect("today's payload still decodes");
+        assert_eq!(absent.ptr_size(), None);
+        assert_eq!(absent.big_endian(), None);
+
+        // When a bn does report them they are authoritative for any architecture.
+        // The endianness test mirrors bn's own `_byteorder`, which stringifies the
+        // `Endianness` enum, so the enum spelling has to work as well as "big".
+        let reported: TargetInfoJson = serde_json::from_value(serde_json::json!({
+            "arch": "sparcv9",
+            "analysis_state": "full",
+            "address_size": 4,
+            "endianness": "Endianness.BigEndian",
+        }))
+        .expect("a reported payload decodes");
+        assert_eq!(reported.ptr_size(), Some(4));
+        assert_eq!(reported.big_endian(), Some(true));
+
+        let little: TargetInfoJson =
+            serde_json::from_value(serde_json::json!({"endianness": "little"})).unwrap();
+        assert_eq!(little.big_endian(), Some(false));
+
+        // An out-of-range width is a payload surprise, not a target fact.
+        for size in [0, 9, 4096] {
+            let bogus: TargetInfoJson =
+                serde_json::from_value(serde_json::json!({"address_size": size})).unwrap();
+            assert_eq!(bogus.ptr_size(), None, "address_size {size}");
+        }
     }
 
     #[test]
