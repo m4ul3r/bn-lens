@@ -57,6 +57,14 @@ enum EditorResult {
 
 pub struct TypesList {
     items: Vec<TyItem>,
+    /// Backend read failure, including a *partial* paged read (page 1 decoded,
+    /// page 2 did not) — see [`crate::picker::list_error`]. A truncated type
+    /// inventory must not render with a normal count.
+    error: Option<String>,
+    /// Transient confirmation for the last write (a `^S` declare), shown on the
+    /// state line until the next keypress — the same affordance the viewer gives
+    /// renames and comments.
+    status: String,
     kwidth: usize,
     filter: String,
     prev_filter: String,
@@ -286,8 +294,16 @@ impl TypeEditor {
             return EditorResult::None;
         }
         // Re-list at commit time (not the possibly stale view snapshot) and
-        // refuse to overwrite a type that already exists.
-        let clash = collisions(&affected, &ctx.bn.types_list());
+        // refuse to overwrite a type that already exists. A partial re-list cannot
+        // clear this check: the type that would be replaced may be exactly the one
+        // in the page that failed, and `bn types declare` replaces silently.
+        let existing = ctx.bn.types_list();
+        if let Some(error) = existing.error {
+            self.ok = false;
+            self.status = format!("✗ could not verify the type list is complete: {error}");
+            return EditorResult::None;
+        }
+        let clash = collisions(&affected, &existing.items);
         if !clash.is_empty() {
             self.ok = false;
             self.status = format!(
@@ -332,7 +348,10 @@ impl TypeEditor {
             KeyCode::Down => self.move_v(1),
             KeyCode::Home => self.col = 0,
             KeyCode::End => self.col = self.cur_len(),
-            KeyCode::Char(ch) => self.insert_char(ch),
+            // Only `^S`/`^P` mean anything here, but a ctrl chord is never text:
+            // crossterm decodes ^A as `Char('a') + CONTROL`, so an unguarded arm
+            // silently drops a literal letter into the C declaration.
+            KeyCode::Char(ch) if !ctrl => self.insert_char(ch),
             _ => {}
         }
         EditorResult::None
@@ -341,7 +360,8 @@ impl TypeEditor {
 
 impl TypesList {
     pub fn new(ctx: &Ctx) -> Self {
-        let items = Self::build(ctx);
+        let (items, read_error) = Self::build(ctx);
+        let error = crate::picker::list_error(items.is_empty(), read_error, ctx.bn.last_error());
         let kwidth = items
             .iter()
             .map(|it| it.kind.chars().count())
@@ -350,6 +370,8 @@ impl TypesList {
             .clamp(6, 16);
         TypesList {
             items,
+            error,
+            status: String::new(),
             kwidth,
             filter: String::new(),
             prev_filter: String::new(),
@@ -363,7 +385,10 @@ impl TypesList {
     }
 
     pub fn refresh(&mut self, ctx: &Ctx) {
-        self.items = Self::build(ctx);
+        let (items, read_error) = Self::build(ctx);
+        self.items = items;
+        self.error =
+            crate::picker::list_error(self.items.is_empty(), read_error, ctx.bn.last_error());
         self.kwidth = self
             .items
             .iter()
@@ -373,12 +398,17 @@ impl TypesList {
             .clamp(6, 16);
         self.sel = self.sel.min(self.filtered().len().saturating_sub(1));
         self.top = self.top.min(self.sel);
+        // The list underneath moved; a surviving layout peek would describe the
+        // pre-refresh selection. (The editor is left alone on purpose — it holds
+        // text the user typed, and `App::capturing_text` blocks `^R` while it is
+        // open anyway.)
+        self.show = None;
     }
 
-    fn build(ctx: &Ctx) -> Vec<TyItem> {
-        let mut items: Vec<TyItem> = ctx
-            .bn
-            .types_list()
+    fn build(ctx: &Ctx) -> (Vec<TyItem>, Option<String>) {
+        let listing = ctx.bn.types_list();
+        let mut items: Vec<TyItem> = listing
+            .items
             .into_iter()
             .map(|t| TyItem {
                 name: t.name,
@@ -390,7 +420,7 @@ impl TypesList {
                 .cmp(&rank(&b.kind))
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
-        items
+        (items, listing.error)
     }
 
     pub fn is_searching(&self) -> bool {
@@ -458,7 +488,22 @@ impl TypesList {
         }
     }
 
+    /// Close the editor after a successful `^S`, re-list, and keep the message it
+    /// built. Without the message a successful declare closes the editor with no
+    /// confirmation anywhere — indistinguishable from an Esc.
+    fn finish_declare(&mut self, ctx: &Ctx, msg: String) {
+        self.editor = None;
+        let (items, read_error) = Self::build(ctx);
+        self.items = items;
+        self.error =
+            crate::picker::list_error(self.items.is_empty(), read_error, ctx.bn.last_error());
+        self.sel = 0;
+        self.top = 0;
+        self.status = msg;
+    }
+
     pub fn on_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Action {
+        self.status.clear();
         if self.editor.is_some() {
             let result = self
                 .editor
@@ -468,12 +513,7 @@ impl TypesList {
             match result {
                 EditorResult::None => {}
                 EditorResult::Cancel => self.editor = None,
-                EditorResult::Committed(_msg) => {
-                    self.editor = None;
-                    self.items = Self::build(ctx);
-                    self.sel = 0;
-                    self.top = 0;
-                }
+                EditorResult::Committed(msg) => self.finish_declare(ctx, msg),
             }
             return Action::None;
         }
@@ -499,7 +539,10 @@ impl TypesList {
                 }
                 KeyCode::Down => self.move_sel(1),
                 KeyCode::Up => self.move_sel(-1),
-                KeyCode::Char(c) => {
+                // A ctrl chord is never text: crossterm decodes ^U as
+                // `Char('u') + CONTROL`, so an unguarded arm turns a line-edit
+                // reflex into a literal letter in the filter.
+                KeyCode::Char(c) if !ctrl => {
                     self.filter.push(c);
                     self.sel = 0;
                 }
@@ -602,10 +645,18 @@ impl TypesList {
         ));
         crate::ui::render_bar(buf, x0, area.y, w, &bar);
 
+        // The write confirmation owns the state line while it is set — a declare
+        // is the one thing on this view the user needs told about.
         let state = match self.mode {
+            _ if !self.status.is_empty() => format!(" {}", self.status),
             Mode::Search => format!(" /{}", self.filter),
             Mode::Normal if !self.filter.is_empty() => format!(" filter: {}", self.filter),
             Mode::Normal => String::new(),
+        };
+        let state_style = if self.status.is_empty() {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(Color::Green)
         };
         let hint = match self.mode {
             Mode::Search => crate::ui::hint_bar(&[
@@ -620,15 +671,24 @@ impl TypesList {
                 &[("q", "quit")],
             ]),
         };
-        crate::ui::put_str(
-            buf,
-            x0,
-            area.y + 1,
-            state,
-            w,
-            Style::default().add_modifier(Modifier::DIM),
-        );
+        crate::ui::put_str(buf, x0, area.y + 1, state, w, state_style);
         crate::ui::render_bar(buf, x0, area.y + area.height.saturating_sub(1), w, &hint);
+
+        // A failed read must dominate the empty table: "no types" invites the
+        // reader to declare one, which is the wrong move against a wedged bridge.
+        if let Some(error) = &self.error {
+            crate::ui::put_str(
+                buf,
+                x0 + 2,
+                area.y + 3,
+                format!("✗ {error}"),
+                w.saturating_sub(4),
+                Style::default().fg(Color::Red),
+            );
+            self.render_show(area, buf);
+            self.render_editor(area, buf);
+            return;
+        }
 
         if rows.is_empty() {
             crate::ui::put_str(
@@ -797,8 +857,96 @@ impl TypesList {
 
 #[cfg(test)]
 mod tests {
-    use super::{collisions, follow_h, rank, TypeEditor};
+    use super::{collisions, follow_h, rank, Show, TypeEditor, TypesList};
     use crate::bn::{TypeItem, TypeLayout};
+    use crate::ctx::Ctx;
+    use crate::picker::tests::{ctrl, plain};
+
+    #[test]
+    fn a_failed_read_surfaces_an_error_instead_of_an_empty_table() {
+        // `Bn::types_list` swallows its error into the shared health cell; the
+        // empty-state copy ("press n to declare one") is the wrong instruction
+        // against a wedged bridge.
+        let ctx = Ctx::stub();
+        let list = TypesList::new(&ctx);
+        assert!(list.items.is_empty());
+        assert!(
+            list.error.is_some_and(|error| !error.is_empty()),
+            "an empty type list under a recorded read failure must show it"
+        );
+    }
+
+    #[test]
+    fn a_committed_declare_leaves_a_confirmation_on_the_view() {
+        // The editor builds the message; dropping it made a successful ^S look
+        // exactly like an Esc. `on_key` reaches this through the same call — a
+        // real commit needs a live instance, so drive the seam directly.
+        let ctx = Ctx::stub();
+        let mut list = TypesList::new(&ctx);
+        list.editor = Some(TypeEditor::new());
+        let confirmation = "✓ declared 1 type(s)   (live · `bn save` to persist)";
+        list.finish_declare(&ctx, confirmation.to_string());
+        assert!(list.editor.is_none(), "a commit closes the editor");
+        assert_eq!(list.status, confirmation);
+        // The confirmation survives until the next keypress, then clears.
+        list.on_key(plain('j'), &ctx);
+        assert!(list.status.is_empty());
+    }
+
+    #[test]
+    fn refresh_closes_a_stale_layout_peek() {
+        let ctx = Ctx::stub();
+        let mut list = TypesList::new(&ctx);
+        list.show = Some(Show {
+            title: "type widget_hdr".into(),
+            lines: vec!["struct widget_hdr // size=0x10".into()],
+            off: 0,
+        });
+        assert!(list.popup_open());
+        list.refresh(&ctx);
+        assert!(
+            !list.popup_open(),
+            "a refresh moves the list; the peek would describe the old selection"
+        );
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_filter() {
+        let ctx = Ctx::stub();
+        let mut list = TypesList::new(&ctx);
+        list.on_key(plain('/'), &ctx);
+        for ch in "widget".chars() {
+            list.on_key(plain(ch), &ctx);
+        }
+        assert_eq!(list.filter, "widget");
+        for ch in ['a', 'e', 'u', 'w', 'r'] {
+            list.on_key(ctrl(ch), &ctx);
+        }
+        assert_eq!(
+            list.filter, "widget",
+            "a ctrl chord must not push its letter into the filter"
+        );
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_declaration_editor() {
+        let ctx = Ctx::stub();
+        let mut editor = TypeEditor::new();
+        for ch in "struct widget {".chars() {
+            editor.on_key(plain(ch), &ctx);
+        }
+        assert_eq!(editor.text(), "struct widget {");
+        // ^A/^E/^U are cursor/line reflexes, not C. (^S and ^P are handled
+        // elsewhere in the same match and are excluded here on purpose.)
+        for ch in ['a', 'e', 'u', 'w', 'k'] {
+            editor.on_key(ctrl(ch), &ctx);
+        }
+        assert_eq!(
+            editor.text(),
+            "struct widget {",
+            "a ctrl chord must not land a literal letter in the declaration"
+        );
+    }
 
     fn typed(text: &str) -> TypeEditor {
         let mut e = TypeEditor::new();

@@ -2,6 +2,7 @@
 //! functions and data symbols, the address maps, and the launching pane.
 
 use crate::bn::{self, AnalysisState, Bn, Func};
+use crate::bnsock::Pace;
 use crate::herdr;
 use std::collections::{HashMap, HashSet};
 
@@ -141,7 +142,10 @@ impl Ctx {
     pub fn strings(&self) -> &HashMap<String, String> {
         self.strings_map.get_or_init(|| {
             let mut best: HashMap<String, (u8, String)> = HashMap::new();
-            for (content, addr) in self.bn.strings() {
+            // The hotspot map only needs whatever resolved; a failed/partial read
+            // is already recorded in `Bn`'s health cell, and the Strings view
+            // reports it from its own `Listing`.
+            for (content, addr) in self.bn.strings().items {
                 let rank = parse_hex(&addr)
                     .and_then(|v| self.section_of(v))
                     .map_or(2, |(_, _, n, _)| sec_rank(n));
@@ -169,7 +173,16 @@ impl Ctx {
         let instance = bn::resolve_instance(&bn_bin, &cwd);
         let mut failures = Vec::new();
         if let Some(inst) = &instance {
-            match Self::build(&bn_bin, &herdr_bin, &agent_pane, Some(inst.clone()), None) {
+            // Startup: there is no event loop to freeze yet, so a first build of a
+            // large binary is allowed to take the analysis budget.
+            match Self::build(
+                &bn_bin,
+                &herdr_bin,
+                &agent_pane,
+                Some(inst.clone()),
+                None,
+                Pace::Analysis,
+            ) {
                 Ok(ctx) => return Ok(ctx),
                 Err(error) => failures.push(format!("{inst}: {error}")),
             }
@@ -186,6 +199,7 @@ impl Ctx {
                 &agent_pane,
                 Some(alt.instance_id.clone()),
                 None,
+                Pace::Analysis,
             ) {
                 Ok(ctx) => return Ok(ctx),
                 Err(error) => failures.push(format!("{}: {error}", alt.instance_id)),
@@ -210,14 +224,26 @@ impl Ctx {
     /// Build the context for a specific instance + target (target = None picks
     /// the active target). Errs if the target has no functions (lets `load`
     /// self-heal, and the switcher reject a bad pick).
+    ///
+    /// `pace` bounds *this build's* whole-database reads and belongs to the caller,
+    /// because only the caller knows which thread it is on. Every build today runs
+    /// off the event thread — startup, or the rebuild worker behind the counting
+    /// banner — so all of them pass [`Pace::Analysis`]; a future synchronous build
+    /// would have to say [`Pace::Interactive`] rather than inherit a ten-minute
+    /// freeze budget by default.
+    ///
+    /// The handle stored in the returned `Ctx` is always re-paced to
+    /// [`Pace::Interactive`], because every later read through it (lazy strings, the
+    /// list views, the viewer) *is* issued from the event thread.
     pub fn build(
         bn_bin: &str,
         herdr_bin: &str,
         agent_pane: &str,
         instance: Option<String>,
         target: Option<String>,
+        pace: Pace,
     ) -> Result<Ctx, String> {
-        let mut bn = Bn::new(bn_bin.to_string(), instance.clone(), target.clone());
+        let mut bn = Bn::new(bn_bin.to_string(), instance.clone(), target.clone()).with_pace(pace);
         let target_sel = match target {
             Some(t) => {
                 bn.target = Some(t.clone());
@@ -311,7 +337,7 @@ impl Ctx {
             target: target_sel,
             arch: target_info.arch,
             analysis_state: target_info.analysis_state,
-            bn,
+            bn: bn.with_pace(Pace::Interactive),
             herdr: herdr_bin.to_string(),
             agent_pane: agent_pane.to_string(),
             agent_session: std::env::var("BN_LENS_AGENT_SESSION").unwrap_or_default(),
@@ -450,6 +476,43 @@ pub fn scan_recent(text: &str) -> Vec<String> {
     let mut v: Vec<(String, usize)> = last.into_iter().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1)); // most recent (largest position) first
     v.into_iter().map(|(t, _)| t).collect()
+}
+
+/// An empty `Ctx` for key-handling tests in the view modules.
+///
+/// The views take `&Ctx` even where they only read it on the paths a keypress
+/// test never reaches, and `Ctx` cannot be built outside this module (private
+/// `strings_map`). The `Bn` handle names an instance that does not exist, so it
+/// resolves no socket client: any read it is asked for fails instead of touching
+/// a live database.
+#[cfg(test)]
+impl Ctx {
+    pub fn stub() -> Ctx {
+        Ctx {
+            bn: Bn::new(
+                "bn-lens-test-no-such-binary".into(),
+                Some("bn-lens-test-no-such-instance".into()),
+                None,
+            ),
+            herdr: String::new(),
+            agent_pane: String::new(),
+            agent_session: String::new(),
+            instance_label: "test".into(),
+            target: String::new(),
+            arch: String::new(),
+            analysis_state: AnalysisState::Full,
+            funcs: Vec::new(),
+            func_names: HashSet::new(),
+            import_names: HashSet::new(),
+            data_names: HashSet::new(),
+            addr_by_name: HashMap::new(),
+            name_by_addr: HashMap::new(),
+            display_by_name: HashMap::new(),
+            sections_text: Vec::new(),
+            section_ranges: Vec::new(),
+            strings_map: std::cell::OnceCell::new(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -193,7 +193,9 @@ impl Viewer {
             .iter()
             .map(|name| name.to_string())
             .collect();
-        types.extend(ctx.bn.types_list().into_iter().map(|item| item.name));
+        // Autocomplete only, so a partial read just offers fewer completions —
+        // nothing here decides whether a write is safe.
+        types.extend(ctx.bn.types_list().items.into_iter().map(|item| item.name));
         types.sort();
         types.dedup();
         self.popup = Popup::Retype {

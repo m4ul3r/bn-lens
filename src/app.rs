@@ -382,7 +382,16 @@ impl App {
         let agent_pane = self.agent_pane.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(Ctx::build(&bn_bin, &herdr, &agent_pane, instance, target));
+            // Worker thread behind the counting banner: a long analysis read is
+            // visible and the event loop keeps running, so it keeps the long budget.
+            let _ = tx.send(Ctx::build(
+                &bn_bin,
+                &herdr,
+                &agent_pane,
+                instance,
+                target,
+                crate::bnsock::Pace::Analysis,
+            ));
         });
         self.refreshing = Some(Refreshing {
             started: Instant::now(),
