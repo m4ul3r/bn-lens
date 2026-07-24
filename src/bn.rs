@@ -59,13 +59,10 @@ fn expand_home(p: &str) -> String {
 /// 3. the live bridge is older than the op we want (`read_op` / `mutation_op`
 ///    detect that and only then re-run over the CLI).
 ///
-/// One read is deliberately CLI-only regardless of transport, and this list is the
-/// contract — do not read "whenever a socket exists" as "always": [`Bn::class_show`]
-/// (the `class_show` op exists, but its text form is a ~60-line renderer for a cold
-/// popup, so replicating it would trade a real divergence risk for ~127 ms on a
-/// keypress that already opens a modal). [`Bn::cfg`], [`Bn::data_vars`] and
-/// [`Bn::data_symbols`] name read-locked ops that no shipped bridge registers yet,
-/// so in practice they still run their legacy `py exec` program.
+/// Case 3 is not hypothetical: [`Bn::cfg`], [`Bn::data_vars`] and [`Bn::data_symbols`]
+/// name read-locked ops that the bridge does not register (checked against its
+/// `op_registry`), so in practice those three still run their legacy `py exec`
+/// program — which takes the bridge's *exclusive* lock (see [`Bn::py_json`]).
 #[derive(Clone)]
 pub struct Bn {
     pub bin: String,
@@ -1766,12 +1763,18 @@ impl Bn {
     }
 
     /// `bn class show <name>` -> the rendered class evidence.
-    ///
-    /// Deliberately CLI-only: the `class_show` op exists, but its text form is a
-    /// ~60-line renderer (vtable slots, secondary vtables, construction sites) feeding
-    /// a cold popup, so re-implementing it would trade a real divergence risk against
-    /// ~127 ms on a keypress that already opens a modal. See the note on [`Bn`].
     pub fn class_show(&self, name: &str) -> Vec<String> {
+        if let Some(result) = self.op_raw("class_show", serde_json::json!({"name": name})) {
+            return match result {
+                Ok(value) => match render_class_show(&value) {
+                    text if text.trim().is_empty() => {
+                        vec![format!("(no class evidence for {name})")]
+                    }
+                    text => text.lines().map(str::to_string).collect(),
+                },
+                Err(error) => vec![format!("✗ {error}")],
+            };
+        }
         match self.run_out_checked(&cli_argv(&["class", "show"], &[name])) {
             Ok(out) if !out.trim().is_empty() => out.lines().map(str::to_string).collect(),
             Ok(_) => vec![format!("(no class evidence for {name})")],
@@ -3127,6 +3130,264 @@ fn render_xrefs(value: &serde_json::Value) -> String {
     terminated(lines.join("\n"))
 }
 
+/// Render a JSON value the way a Python f-string's `str()` would, so a ported CLI
+/// renderer reproduces the same text for an integer, a string, or a missing field
+/// (which Python prints as `None`).
+fn py_str(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => "None".into(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Bool(true)) => "True".into(),
+        Some(serde_json::Value::Bool(false)) => "False".into(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// A string field that is present *and* non-empty. Python's renderers gate on
+/// truthiness (`x.get(k) or fallback`), so an empty string must fall through to the
+/// fallback rather than render as a blank.
+fn truthy_str(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+/// Label for one vtable slot (`formatters.py::_vtable_slot_label`): the demangled
+/// method, `__cxa_pure_virtual`, a named cross-module slot, `<null>`, or `<unnamed>`.
+fn vtable_slot_label(slot: &serde_json::Value) -> String {
+    let flag = |key: &str| slot.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+    if flag("pure_virtual") {
+        return "__cxa_pure_virtual".into();
+    }
+    if let Some(name) = slot
+        .get("method")
+        .filter(|method| method.is_object())
+        .and_then(|method| {
+            ["display_name", "name"]
+                .into_iter()
+                .find_map(|key| truthy_str(method, key))
+        })
+    {
+        return name;
+    }
+    if flag("external") {
+        return match truthy_str(slot, "external_name") {
+            Some(name) => format!("{name} [external]"),
+            None => "<external>".into(),
+        };
+    }
+    if flag("null") {
+        return "<null>".into();
+    }
+    "<unnamed>".into()
+}
+
+/// Render one recovered class the way `bn class show` printed it
+/// (`formatters.py::_render_one_class`): the header with size/vtable/bases, the
+/// confidence line, ctors/dtors, vtable slots, secondary (multiple-inheritance)
+/// vtables, non-virtual members, then instance evidence.
+fn render_one_class(rec: &serde_json::Value) -> String {
+    let size = rec
+        .get("size")
+        .filter(|size| size.is_object())
+        .and_then(|size| truthy_str(size, "value"));
+    let vtable = rec.get("vtable").filter(|vtable| vtable.is_object());
+    let vtable_addr = vtable.and_then(|vtable| truthy_str(vtable, "address"));
+    let bases: Vec<String> = rec
+        .get("bases")
+        .and_then(serde_json::Value::as_array)
+        .map(|bases| {
+            bases
+                .iter()
+                .map(|base| truthy_str(base, "name").unwrap_or_else(|| "?".into()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut head = format!(
+        "class {}",
+        rec.get("name")
+            .map(|name| py_str(Some(name)))
+            .unwrap_or_else(|| "<unknown>".into())
+    );
+    let mut bits = Vec::new();
+    if let Some(size) = size {
+        bits.push(format!("size {size}"));
+    }
+    if let Some(at) = &vtable_addr {
+        bits.push(format!("vtable @ {at}"));
+    }
+    if !bases.is_empty() {
+        bits.push(format!("base: {}", bases.join(", ")));
+    }
+    if !bits.is_empty() {
+        head += &format!("  ({})", bits.join(", "));
+    }
+    let mut lines = vec![
+        head,
+        format!(
+            "  [{}]",
+            rec.get("confidence")
+                .map(|c| py_str(Some(c)))
+                .unwrap_or_else(|| "?".into())
+        ),
+    ];
+
+    let no_methods = Vec::new();
+    let methods = rec
+        .get("methods")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&no_methods);
+    let slot_row = |indent: &str, slot: &serde_json::Value| {
+        format!(
+            "{indent}[{}] {}  {}",
+            py_str(slot.get("index")),
+            truthy_str(slot, "address").unwrap_or_else(|| "?".into()),
+            vtable_slot_label(slot)
+        )
+    };
+    for method in methods {
+        let kind = truthy_str(method, "kind").unwrap_or_default();
+        if kind == "ctor" || kind == "dtor" {
+            lines.push(format!(
+                "  {kind:<6} {}  {}",
+                truthy_str(method, "address").unwrap_or_else(|| "?".into()),
+                method
+                    .get("demangled")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    let slots = vtable
+        .and_then(|vtable| vtable.get("slots"))
+        .and_then(serde_json::Value::as_array)
+        .filter(|slots| !slots.is_empty());
+    match (slots, &vtable_addr) {
+        (Some(slots), _) => {
+            for slot in slots {
+                lines.push(slot_row("  vtable ", slot));
+            }
+        }
+        // A vtable symbol with no resolvable slots: say why rather than render an
+        // empty or invented set of virtuals.
+        (None, Some(_)) => lines.push(
+            "  vtable: symbol present but no slots resolved here (defined in another \
+             module, or applied at load time via relocations)"
+                .into(),
+        ),
+        (None, None) => {}
+    }
+    for secondary in rec
+        .get("secondary_vtables")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&no_methods)
+        .iter()
+        .filter(|secondary| secondary.is_object())
+    {
+        let offset = match secondary.get("offset_to_top") {
+            Some(offset) if !offset.is_null() => format!(" (offset-to-top {})", py_str(Some(offset))),
+            _ => String::new(),
+        };
+        lines.push(format!(
+            "  secondary vtable @ {}{offset}:",
+            truthy_str(secondary, "address").unwrap_or_else(|| "?".into())
+        ));
+        for slot in secondary
+            .get("slots")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&no_methods)
+        {
+            lines.push(slot_row("    ", slot));
+        }
+    }
+    // Non-virtual members: the virtual ones already appear as vtable slots, and
+    // listing the symbol side keeps `class show` useful for a class whose vtable is
+    // absent or empty.
+    let members: Vec<&serde_json::Value> = methods
+        .iter()
+        .filter(|method| truthy_str(method, "kind").as_deref() == Some("method"))
+        .collect();
+    if !members.is_empty() {
+        lines.push(format!("  methods ({}):", members.len()));
+        for method in members {
+            lines.push(format!(
+                "    {}  {}",
+                truthy_str(method, "address").unwrap_or_else(|| "?".into()),
+                method
+                    .get("demangled")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    let instances = rec.get("instances").filter(|inst| inst.is_object());
+    let mut parts: Vec<String> = Vec::new();
+    for site in instances
+        .and_then(|inst| inst.get("construction_sites"))
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&no_methods)
+    {
+        let size = match truthy_str(site, "size") {
+            Some(size) => format!(" (size {size})"),
+            None => String::new(),
+        };
+        let func = match truthy_str(site, "function") {
+            Some(func) => format!(" (in {func})"),
+            None => String::new(),
+        };
+        parts.push(format!(
+            "{} @ {}{size}{func}",
+            truthy_str(site, "kind").unwrap_or_else(|| "?".into()),
+            truthy_str(site, "address").unwrap_or_else(|| "?".into())
+        ));
+    }
+    for global in instances
+        .and_then(|inst| inst.get("stored_globals"))
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&no_methods)
+    {
+        parts.push(format!(
+            "stored -> {} @ {}",
+            truthy_str(global, "symbol").unwrap_or_else(|| "?".into()),
+            truthy_str(global, "address").unwrap_or_else(|| "?".into())
+        ));
+    }
+    if !parts.is_empty() {
+        lines.push(format!("  instances: {}", parts.join(" ; ")));
+    }
+    lines.join("\n")
+}
+
+/// Render a socket `class_show` result as `bn class show` printed it
+/// (`formatters.py::_render_class_show_text`), including the ambiguous-query form
+/// that lists every same-name match.
+fn render_class_show(value: &serde_json::Value) -> String {
+    if value.get("ambiguous").and_then(serde_json::Value::as_bool) != Some(true) {
+        return terminated(render_one_class(value));
+    }
+    let no_matches = Vec::new();
+    let matches = value
+        .get("matches")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&no_matches);
+    let mut lines = vec![format!(
+        // Python renders the query with `!r`, i.e. single-quoted.
+        "ambiguous class '{}': {} matches",
+        value
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        matches.len()
+    )];
+    for rec in matches {
+        lines.push(String::new());
+        lines.push(render_one_class(rec));
+    }
+    terminated(lines.join("\n"))
+}
+
 /// Resolve which bn instance to drive, from the launching pane's cwd.
 ///
 /// Order: `BN_LENS_INSTANCE` -> newest `.bn-<id>` marker in cwd -> single live
@@ -3178,8 +3439,8 @@ mod tests {
         capture_dir, cli_argv, decompile_render, flag_eq, is_unknown_op, json_escape_ascii,
         mutation_outcome, parse_local_list_json, parse_types_page, push_mark, recovered_class,
         recovered_data_syms, render_disasm_linear, render_read, render_sections, render_type_info,
-        render_xrefs, text_field, with_capture, AnalysisState, Bn, ClassItemJson, CommentListJson,
-        DataSymsJson, TagListJson,
+        render_class_show, render_xrefs, text_field, with_capture, AnalysisState, Bn, ClassItemJson,
+        CommentListJson, DataSymsJson, TagListJson,
     };
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -3683,6 +3944,104 @@ mod tests {
             "data_refs": [],
         });
         assert!(render_xrefs(&dual).contains("code refs: 1 site across 1 function"));
+    }
+
+    #[test]
+    fn issue21_render_class_show_reproduces_the_cli_listing() {
+        let value = serde_json::json!({
+            "name": "media::Demuxer",
+            "confidence": "rtti",
+            "size": {"value": "0x48", "source": "bn_type"},
+            "bases": [{"name": "media::Source"}, {}],
+            "vtable": {"address": "0x412340", "slots": [
+                {"index": 0, "address": "0x404100",
+                 "method": {"display_name": "media::Demuxer::~Demuxer()"}},
+                {"index": 1, "address": "0x404180", "pure_virtual": true},
+                {"index": 2, "address": "0x000000", "null": true},
+                {"index": 3, "address": "0x404200", "external": true,
+                 "external_name": "media::Source::seek"},
+                {"index": 4, "address": "0x404280", "external": true},
+                {"index": 5, "address": "0x404300"}
+            ]},
+            "secondary_vtables": [{"address": "0x412400", "offset_to_top": -16,
+                                   "slots": [{"index": 0, "address": "0x404380",
+                                              "method": {"name": "thunk_seek"}}]}],
+            "methods": [
+                {"kind": "ctor", "address": "0x404000", "demangled": "media::Demuxer::Demuxer()"},
+                {"kind": "dtor", "address": "0x404100", "demangled": "media::Demuxer::~Demuxer()"},
+                {"kind": "method", "address": "0x404400", "demangled": "media::Demuxer::probe()"}
+            ],
+            "instances": {
+                "construction_sites": [
+                    {"kind": "operator_new", "address": "0x405000", "size": "0x48",
+                     "function": "media::open_stream"},
+                    {"kind": "stack", "address": "0x405100"}
+                ],
+                "stored_globals": [{"symbol": "g_demuxer", "address": "0x415200"}]
+            }
+        });
+        let rendered = render_class_show(&value);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines[0],
+            "class media::Demuxer  (size 0x48, vtable @ 0x412340, base: media::Source, ?)"
+        );
+        assert_eq!(lines[1], "  [rtti]");
+        // ctor/dtor rows pad the kind to 6 columns, as the CLI did.
+        assert_eq!(lines[2], "  ctor   0x404000  media::Demuxer::Demuxer()");
+        assert_eq!(lines[3], "  dtor   0x404100  media::Demuxer::~Demuxer()");
+        // Every slot-label branch.
+        assert_eq!(lines[4], "  vtable [0] 0x404100  media::Demuxer::~Demuxer()");
+        assert_eq!(lines[5], "  vtable [1] 0x404180  __cxa_pure_virtual");
+        assert_eq!(lines[6], "  vtable [2] 0x000000  <null>");
+        assert_eq!(lines[7], "  vtable [3] 0x404200  media::Source::seek [external]");
+        assert_eq!(lines[8], "  vtable [4] 0x404280  <external>");
+        assert_eq!(lines[9], "  vtable [5] 0x404300  <unnamed>");
+        assert_eq!(lines[10], "  secondary vtable @ 0x412400 (offset-to-top -16):");
+        assert_eq!(lines[11], "    [0] 0x404380  thunk_seek");
+        assert_eq!(lines[12], "  methods (1):");
+        assert_eq!(lines[13], "    0x404400  media::Demuxer::probe()");
+        assert_eq!(
+            lines[14],
+            "  instances: operator_new @ 0x405000 (size 0x48) (in media::open_stream) ; \
+             stack @ 0x405100 ; stored -> g_demuxer @ 0x415200"
+        );
+    }
+
+    #[test]
+    fn issue21_render_class_show_never_invents_virtuals_or_drops_a_collision() {
+        // A vtable symbol with no resolvable slots must SAY so — rendering an empty
+        // virtual list would read as "this class has no virtuals".
+        let no_slots = serde_json::json!({
+            "name": "media::Controller", "confidence": "symbol",
+            "vtable": {"address": "0x412500", "slots": []},
+        });
+        let rendered = render_class_show(&no_slots);
+        assert!(rendered.contains("  vtable: symbol present but no slots resolved here"));
+        assert!(rendered.contains("applied at load time via relocations"));
+
+        // No vtable at all: no note, and the minimal record still renders.
+        let bare = serde_json::json!({"name": "media::Packet", "confidence": "name_only"});
+        assert_eq!(
+            render_class_show(&bare),
+            "class media::Packet\n  [name_only]\n"
+        );
+
+        // An ambiguous query lists every match rather than silently picking one.
+        let ambiguous = serde_json::json!({
+            "ambiguous": true, "query": "Parser",
+            "matches": [
+                {"name": "media::Parser", "confidence": "rtti"},
+                {"name": "net::Parser", "confidence": "symbol"}
+            ],
+        });
+        let rendered = render_class_show(&ambiguous);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "ambiguous class 'Parser': 2 matches");
+        assert_eq!(lines[1], "");
+        assert_eq!(lines[2], "class media::Parser");
+        assert_eq!(lines[4], "");
+        assert_eq!(lines[5], "class net::Parser");
     }
 
     #[test]
