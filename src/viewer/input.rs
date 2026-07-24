@@ -465,6 +465,10 @@ impl Viewer {
     fn normal_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let line_count = self.lines.len();
+        // Consume any pending `g` prefix up front: whatever this key is, the
+        // latch is spent. `gg` (a second `g` while pending) jumps to the top;
+        // any other key just proceeds, silently abandoning the prefix.
+        let g_pending = std::mem::take(&mut self.g_pending);
         match key.code {
             // `q` leaves the viewer now; Esc backs out one layer at a time
             // (search highlight → nav history → list) — never skips history.
@@ -480,7 +484,7 @@ impl Viewer {
                 self.cline = line_count.saturating_sub(1);
                 self.active = None;
             }
-            KeyCode::Char('H') | KeyCode::Home => {
+            KeyCode::Home => {
                 self.cline = 0;
                 self.active = None;
             }
@@ -498,7 +502,18 @@ impl Viewer {
                 self.go_forward(ctx);
                 return Exit::Stay;
             }
-            KeyCode::Char('g') | KeyCode::Enter => self.act_primary(ctx),
+            // `g` is a vim goto-prefix: `gg` (a second `g`) jumps to the top;
+            // a lone `g` just arms the latch (consumed next key). Enter is now
+            // the sole "go into / act on hotspot" key.
+            KeyCode::Char('g') => {
+                if g_pending {
+                    self.cline = 0;
+                    self.active = None;
+                } else {
+                    self.g_pending = true;
+                }
+            }
+            KeyCode::Enter => self.act_primary(ctx),
             KeyCode::Char('p') => self.peek_on_line(ctx),
             KeyCode::Char('s') => {
                 self.popup = Popup::Peek {

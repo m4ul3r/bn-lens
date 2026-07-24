@@ -426,7 +426,7 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "H/Home / G",
+        key: "gg / G",
         action: "first / last line",
     },
     HelpLine::Entry {
@@ -441,7 +441,7 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "g / Enter",
+        key: "Enter",
         action: "act on hotspot: goto fn/code · open data in the linear data view (header previews)",
     },
     HelpLine::Entry {
@@ -452,7 +452,7 @@ const LINES: &[HelpLine] = &[
     HelpLine::Entry {
         scope: "VIEWER",
         key: "(data view)",
-        action: "g on data opens a BN-style listing: addresses, data_ labels, hex+ascii, string decls; ^O returns",
+        action: "Enter on data opens a BN-style listing: addresses, data_ labels, hex+ascii, string decls; ^O returns",
     },
     HelpLine::Entry {
         scope: "VIEWER",

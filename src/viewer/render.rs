@@ -201,6 +201,12 @@ impl Viewer {
             self.view.label().to_string()
         };
         let dim = Style::default().add_modifier(Modifier::DIM);
+        // Reserve the right end of row 1 for the cursor-address readout, so the
+        // left content (location / hint / status / prompt) is clipped before it
+        // instead of being overwritten when the pane is narrow.
+        let cursor_addr_label = self.cursor_addr().map(|addr| format!("@ 0x{addr:x} "));
+        let row1_w = code_width
+            .saturating_sub(cursor_addr_label.as_ref().map_or(0, |l| l.chars().count() + 2));
         if let Some(query) = &self.goto_input {
             // Live completion: show the unique name Enter would jump to, or a
             // match count, replacing the static help once the user starts typing.
@@ -215,7 +221,7 @@ impl Viewer {
                 area.x,
                 area.y + 1,
                 format!(" :{query}▏   {tail}"),
-                code_width,
+                row1_w,
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -226,7 +232,7 @@ impl Viewer {
                 area.x,
                 area.y + 1,
                 format!(" /{query}"),
-                code_width,
+                row1_w,
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -237,7 +243,7 @@ impl Viewer {
                 area.x,
                 area.y + 1,
                 &self.status,
-                code_width,
+                row1_w,
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
@@ -251,7 +257,7 @@ impl Viewer {
                     " ● VISUAL · {} lines selected",
                     visual_high - visual_low + 1
                 ),
-                code_width,
+                row1_w,
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -264,7 +270,7 @@ impl Viewer {
                 area.x,
                 area.y + 1,
                 hint,
-                code_width,
+                row1_w,
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -292,15 +298,14 @@ impl Viewer {
                 format!("   {}/{}", self.cline + 1, self.lines.len()),
                 dim,
             ));
-            crate::ui::put_spans(buffer, area.x, area.y + 1, code_width, &location);
+            crate::ui::put_spans(buffer, area.x, area.y + 1, row1_w, &location);
         }
 
-        // The address the cursor is actually on, right-aligned so it stays put as
-        // you move and whatever occupies the left of row 1 (location, a hotspot
-        // hint, status, or a search/goto prompt). Code views only.
-        if let Some(addr) = self.cursor_addr() {
-            let label = format!("@ 0x{addr:x} ");
-            let x = area.x + (code_width.saturating_sub(label.chars().count())) as u16;
+        // The address the cursor is actually on, right-aligned into the zone
+        // reserved above so it stays put as you move and whatever occupies the
+        // left of row 1. Code views only (None elsewhere).
+        if let Some(label) = cursor_addr_label {
+            let x = area.x + code_width.saturating_sub(label.chars().count()) as u16;
             crate::ui::put_str(
                 buffer,
                 x,
@@ -331,8 +336,8 @@ impl Viewer {
             ])
         } else {
             crate::ui::hint_bar(&[
-                &[("j/k", ""), ("w/b", "hotspot"), ("W/B", "calls")],
-                &[("g", "act"), ("n/;/t", "edit"), ("a", "ask")],
+                &[("j/k", ""), ("gg/G", "ends"), ("w/b", "hotspot"), ("W/B", "calls")],
+                &[("⏎", "act"), ("n/;/t", "edit"), ("a", "ask")],
                 &[("/", "find"), (":", "goto")],
                 &[("i", "il"), ("v", "cfg")],
                 &[("^O/^F", "hist"), ("q", "back"), ("?", "help")],

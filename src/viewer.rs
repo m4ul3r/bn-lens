@@ -277,6 +277,10 @@ pub struct Viewer {
     search: String,               // committed query (for ]/[)
     search_input: Option<String>, // Some while typing after `/`
     goto_input: Option<String>,   // Some while typing an address/symbol after `:`
+    /// Vim `g`-prefix latch: set by a first `g`, consumed by the next key —
+    /// `gg` jumps to the top. Reset on every other key, so an abandoned prefix
+    /// never lingers.
+    g_pending: bool,
     stack: Vec<Frame>,
     /// Views popped by `b`, so `w` can walk forward again. Cleared whenever a
     /// *new* navigation (goto/xrefs) branches off the history.
@@ -333,6 +337,7 @@ impl Viewer {
             search: String::new(),
             search_input: None,
             goto_input: None,
+            g_pending: false,
             stack: Vec::new(),
             forward: Vec::new(),
             popup: Popup::None,
