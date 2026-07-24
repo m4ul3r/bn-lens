@@ -721,10 +721,7 @@ impl Viewer {
         let tokens: Vec<String> = segments
             .iter()
             .filter(|segment| {
-                segment.kind == Tok::Name
-                    || (segment.kind == Tok::Num
-                        && segment.text.starts_with("0x")
-                        && segment.text.len() >= 6)
+                segment.kind == Tok::Name || (segment.kind == Tok::Hex && segment.text.len() >= 6)
             })
             .map(|segment| segment.text.clone())
             .collect();
