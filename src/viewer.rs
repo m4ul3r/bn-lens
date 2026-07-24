@@ -443,6 +443,16 @@ impl Viewer {
         self.stack_view.is_open()
     }
 
+    /// Show `text` as the entire code pane, with no address column behind it and
+    /// **no second backend read**. Used when the one decompile read came back empty
+    /// or failed: the reader sees that answer, not a retry's.
+    fn show_note(&mut self, ctx: &Ctx, text: String) {
+        self.lines = syntax::tokenize_plain(&text);
+        self.code_addrs = Vec::new();
+        self.finish_linear_load(ctx);
+        self.apply_focus();
+    }
+
     fn load(&mut self, ctx: &Ctx) {
         // Keep the entry-address anchor current whenever the name resolves to a
         // known symbol (see `entry`), so a later reload can recover from a rename.
@@ -475,54 +485,61 @@ impl Viewer {
                 Some(focus) => format!("0x{focus:x}"),
                 None => self.name.clone(),
             };
-            if let Some(read) = ctx.bn.decompile_read(&identifier) {
-                if focus.is_some() {
-                    self.name = ctx
-                        .name_by_addr
-                        .get(&read.entry)
-                        .cloned()
-                        .unwrap_or(read.name);
-                    self.entry = (!read.entry.is_empty()).then_some(read.entry);
+            // Whatever that one read said is what the reader sees. Re-reading on a
+            // failure would pay a timed-out backend's budget twice and could resolve
+            // against different live state — and for an interior focus it would ask
+            // for `self.name` instead of the address that was requested.
+            let read = match ctx.bn.decompile_read(&identifier) {
+                Ok(Some(read)) => read,
+                Ok(None) => {
+                    self.show_note(ctx, format!("(no decompilation for {identifier})"));
+                    return;
                 }
-                let dec = decomp_view_lines(&read.text, read.note.as_deref(), &read.warnings);
-                let line = focus.and_then(|focus| {
-                    let resolved =
-                        crate::decomp::resolve_stmt_addr(&crate::decomp::line_addrs(&dec), focus);
-                    resolved.and_then(|addr| {
-                        dec.iter()
-                            .position(|candidate| candidate.addr == Some(addr))
-                    })
-                });
-                self.code_addrs = dec.iter().map(|candidate| candidate.addr).collect();
-                let plain = dec
-                    .iter()
-                    .map(|candidate| candidate.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.lines = syntax::tokenize_c(&plain);
-                self.finish_linear_load(ctx);
-                if let Some(line) = line {
-                    self.cline = line;
-                    self.top = line.saturating_sub(3);
+                Err(error) => {
+                    self.show_note(ctx, format!("✗ {error}"));
+                    return;
                 }
-                return;
+            };
+            if focus.is_some() {
+                self.name = ctx
+                    .name_by_addr
+                    .get(&read.entry)
+                    .cloned()
+                    .unwrap_or(read.name);
+                self.entry = (!read.entry.is_empty()).then_some(read.entry);
             }
-            // No decompile at all (missing function, analysis failure): fall
-            // through so `bn`'s own `✗ …`/`(no output)` text is what the reader
-            // sees, with no address column behind it.
+            let dec = decomp_view_lines(&read.text, read.note.as_deref(), &read.warnings);
+            let line = focus.and_then(|focus| {
+                let resolved =
+                    crate::decomp::resolve_stmt_addr(&crate::decomp::line_addrs(&dec), focus);
+                resolved.and_then(|addr| {
+                    dec.iter()
+                        .position(|candidate| candidate.addr == Some(addr))
+                })
+            });
+            self.code_addrs = dec.iter().map(|candidate| candidate.addr).collect();
+            let plain = dec
+                .iter()
+                .map(|candidate| candidate.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.lines = syntax::tokenize_c(&plain);
+            self.finish_linear_load(ctx);
+            if let Some(line) = line {
+                self.cline = line;
+                self.top = line.saturating_sub(3);
+            }
+            return;
         }
         let text = match self.view {
-            View::Decomp => ctx.bn.decompile(&self.name),
             View::Mlil => self.linear_annotated(ctx, View::Mlil.il_level()),
             View::Disasm => self.linear_annotated(ctx, View::Disasm.il_level()),
             View::Xrefs => ctx.bn.xrefs(&self.name),
-            View::Cfg | View::Data => unreachable!("handled above"),
+            // Decomp returns above, out of its single `--addresses` read; there is
+            // deliberately no second text-mode decompile to fall back to.
+            View::Decomp | View::Cfg | View::Data => unreachable!("handled above"),
         };
-        self.lines = if matches!(self.view, View::Decomp) {
-            syntax::tokenize_c(&text)
-        } else {
-            syntax::tokenize_plain(&text)
-        };
+        self.lines = syntax::tokenize_plain(&text);
         self.code_addrs = self.line_addr_column(&text);
         // Guards the `code_addrs`/`lines` alignment invariant (never longer than
         // the lines it indexes). Debug-only: a violation is a silent-wrong-address
