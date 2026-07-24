@@ -331,6 +331,11 @@ impl Viewer {
     /// only in its `--addresses` JSON, not in the rendered lines — re-maps the
     /// cursor line through that JSON, snapping to the nearest addressed line
     /// at/below the cursor (a declaration or brace line has no address of its own).
+    ///
+    /// Like the header's `cursor_addr`, this relies on the rendered decompile
+    /// lines staying index-aligned with `dec_lines(--addresses)` (the `code_addrs`
+    /// invariant on `Viewer`); it re-decompiles here rather than reading the cache
+    /// because an IL switch is a one-shot lookup, not a per-frame read.
     pub(super) fn current_code_addr(&self, ctx: &Ctx) -> Option<u64> {
         match self.view {
             View::Mlil | View::Disasm => self

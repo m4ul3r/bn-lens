@@ -256,6 +256,14 @@ pub struct Viewer {
     /// declaration, brace, or blank separator). Cached at load so the header can
     /// show where the cursor is without re-decompiling every frame; empty for
     /// non-code views.
+    ///
+    /// INVARIANT — index alignment with `lines` (load-bearing; see `load` and
+    /// `line_addr_column`): entry `i` describes `lines[i]`. It may be *shorter*
+    /// than `lines` (the decompile view appends address-less warning/note lines
+    /// to the rendered text that carry no entry), so it is never longer — but a
+    /// change that *prepends* a line to only one of the two would shift every
+    /// address silently. Consumers therefore index defensively (`.get`, clamp)
+    /// and must never assume `code_addrs.len() == lines.len()`.
     code_addrs: Vec<Option<u64>>,
     spans: Vec<Hotspot>,
     locals: std::collections::HashMap<String, String>, // name -> type (this fn)
@@ -432,6 +440,10 @@ impl Viewer {
                         dec.iter()
                             .position(|candidate| candidate.addr == Some(addr))
                     });
+                    // This path renders straight from `dec` (below), so addresses
+                    // and lines share one source and are aligned by construction —
+                    // unlike the by-name path, which reconciles two calls in
+                    // `line_addr_column`. See the `code_addrs` invariant.
                     self.code_addrs = dec.iter().map(|candidate| candidate.addr).collect();
                     let plain = dec
                         .into_iter()
@@ -461,16 +473,37 @@ impl Viewer {
             syntax::tokenize_plain(&text)
         };
         self.code_addrs = self.line_addr_column(ctx, &text);
+        // Guards the `code_addrs`/`lines` alignment invariant (never longer than
+        // the lines it indexes). Debug-only: a violation is a silent-wrong-address
+        // bug, not a crash, so we catch it in dev rather than defend in release.
+        debug_assert!(
+            self.code_addrs.len() <= self.lines.len(),
+            "code_addrs ({}) longer than lines ({}) in {} — alignment broken",
+            self.code_addrs.len(),
+            self.lines.len(),
+            self.view.label(),
+        );
         self.finish_linear_load(ctx);
         self.apply_focus();
     }
 
     /// Per-line addresses aligned to `self.lines`, for the header's cursor-address
-    /// readout. Decompile carries addresses only in its `--addresses` JSON (the
-    /// rendered text intentionally keeps warnings/notes, so it's fetched
-    /// separately and mapped by the same line index `current_code_addr` relies
-    /// on); MLIL/disasm print an 8-hex address column, so it's read straight off
-    /// the flattened listing that produced the lines.
+    /// readout. MLIL/disasm print an 8-hex address column, so it's read straight
+    /// off the same flattened listing that produced the lines — aligned by
+    /// construction.
+    ///
+    /// Decompile is the subtle case: the *rendered* text (`bn.decompile`)
+    /// intentionally keeps lens-added warnings/notes, while addresses live only
+    /// in the `--addresses` JSON, so the two come from independent calls. They
+    /// stay index-aligned because both enumerate the same function's HLIL source
+    /// lines: `--addresses` only prefixes each line with its address column, and
+    /// `dec_lines` strips that column back off. The rendered text can carry
+    /// *extra trailing* lines (warnings appended after the body), which is why
+    /// `code_addrs` may be shorter — never longer, never offset. The one thing
+    /// that would break this is a line *prepended* to just one side: the `// bn:`
+    /// resolution note is exactly such a prepend, and it appears only on the
+    /// interior-address load path (`focus_addr`), which is why that path builds
+    /// `code_addrs` from its own `dec` rather than calling here.
     fn line_addr_column(&self, ctx: &Ctx, linear_text: &str) -> Vec<Option<u64>> {
         match self.view {
             View::Decomp => ctx
