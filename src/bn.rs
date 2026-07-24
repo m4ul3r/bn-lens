@@ -248,6 +248,26 @@ struct DecompiledFn {
     function: FnRef,
 }
 
+/// One `bn decompile --addresses` result, split into the pieces a caller needs to
+/// render it *and* index it by address — see [`Bn::decompile_read`].
+pub struct DecompileRead {
+    /// The resolved function's name as bn reports it (an interior address
+    /// resolves to its containing function).
+    pub name: String,
+    /// The resolved function's entry address (`0x…`), possibly empty.
+    pub entry: String,
+    /// Address-prefixed pseudo-C: every real line led by its 8-hex address
+    /// column (parse with [`crate::decomp::dec_lines`]).
+    pub text: String,
+    /// The `// bn: …` interior-resolution note, without its trailing newline.
+    /// `None` for an exact-start or by-name read (the common case).
+    pub note: Option<String>,
+    /// `warning: …` lines the CLI's text mode appends below the body — the
+    /// thunk/veneer disclosure, the analysis-stub warning, the pseudo-C
+    /// degradation notice. Load-bearing on a live target; never dropped.
+    pub warnings: Vec<String>,
+}
+
 /// A function's existing comments, split by where BN stores them: its dedicated
 /// `function_doc` string and any comment at the entry `address`. Both render
 /// atop the function; `;` edits whichever is present.
@@ -1708,6 +1728,45 @@ impl Bn {
         }
     }
 
+    /// One `decompile --addresses` read carrying *everything* the CLI's text mode
+    /// reconstructs around the body — the interior-resolution note and the
+    /// `warnings[]` entries — alongside the address-prefixed pseudo-C.
+    ///
+    /// This exists so a caller can derive both the rendered lines and the
+    /// per-line address column from a **single** backend read: the viewer used to
+    /// issue one plain `decompile` for the text and a second `--addresses`
+    /// decompile for the addresses, and reconciled the two by index. On a live
+    /// instance a concurrent rename/retype between the two reads shifted the line
+    /// set and every address readout with it (issue #18).
+    pub fn decompile_read(&self, id: &str) -> Option<DecompileRead> {
+        let value = match self.call_local(
+            "decompile",
+            serde_json::json!({"identifier": id, "addresses": true}),
+        ) {
+            Some(result) => result.ok()?,
+            None => serde_json::from_str(&self.run_out(&[
+                "decompile",
+                id,
+                "--addresses",
+                "--format",
+                "json",
+            ]))
+            .ok()?,
+        };
+        let parsed: DecompiledFn = serde_json::from_value(value.clone()).ok()?;
+        if parsed.text.is_empty() {
+            return None;
+        }
+        let note = resolution_note(&value);
+        Some(DecompileRead {
+            name: parsed.function.name,
+            entry: parsed.function.address,
+            text: parsed.text,
+            note: (!note.is_empty()).then(|| note.trim_end().to_string()),
+            warnings: warning_lines(&value),
+        })
+    }
+
     /// `n` instructions in address-linear order starting *exactly* at `addr`
     /// (unlike `--count`, which slices from the containing function's start).
     /// Used to show the single instruction at an xref callsite.
@@ -2099,7 +2158,17 @@ fn text_field(value: &serde_json::Value) -> String {
 /// them rather than leave the reader with unexplained-looking output.
 fn decompile_render(value: &serde_json::Value) -> String {
     let mut body = text_field(value);
-    let warnings: Vec<String> = value
+    let warnings = warning_lines(value);
+    if !warnings.is_empty() {
+        body = format!("{body}\n\n{}", warnings.join("\n"));
+    }
+    format!("{}{body}", resolution_note(value))
+}
+
+/// The `warnings[]` entries of a `decompile` result as the `warning: …` lines the
+/// CLI's text mode appends below the body, in order. Empty when there are none.
+fn warning_lines(value: &serde_json::Value) -> Vec<String> {
+    value
         .get("warnings")
         .and_then(serde_json::Value::as_array)
         .map(|items| {
@@ -2109,11 +2178,7 @@ fn decompile_render(value: &serde_json::Value) -> String {
                 .map(|warning| format!("warning: {warning}"))
                 .collect()
         })
-        .unwrap_or_default();
-    if !warnings.is_empty() {
-        body = format!("{body}\n\n{}", warnings.join("\n"));
-    }
-    format!("{}{body}", resolution_note(value))
+        .unwrap_or_default()
 }
 
 /// The CLI's `_resolution_note` (`formatters.py:124-143`): a `// bn: …` line when a
