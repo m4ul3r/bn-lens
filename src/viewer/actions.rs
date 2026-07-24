@@ -225,23 +225,14 @@ impl Viewer {
 
     /// Resolve where `;` comments *and* the current text to edit (empty for a
     /// new comment). A deliberately-selected address (or the disasm/MLIL line
-    /// address) edits that address's comment; otherwise the function — preferring
-    /// its `function_doc`, then any comment at the entry address (what BN and the
-    /// agent render atop the function) — so `;` edits whichever note is shown.
+    /// address) edits that address's comment; otherwise the function — see
+    /// [`func_comment_target`] for how a bare `;` picks its slot.
     fn comment_edit_target(&self, ctx: &Ctx) -> (AnnTarget, String) {
         if let Some(addr) = self.explicit_addr() {
             let text = ctx.bn.comment_get_addr(&addr).unwrap_or_default();
             return (AnnTarget::Addr(addr), text);
         }
-        let existing = ctx.bn.comment_get_func(&self.name);
-        if !existing.doc.trim().is_empty() {
-            (AnnTarget::Func(self.name.clone()), existing.doc)
-        } else if let (Some(text), false) = (existing.entry_comment, existing.entry_addr.is_empty())
-        {
-            (AnnTarget::Addr(existing.entry_addr), text)
-        } else {
-            (AnnTarget::Func(self.name.clone()), String::new())
-        }
+        func_comment_target(&self.name, ctx.bn.comment_get_func(&self.name))
     }
 
     /// `t`: bookmark/tag. Same target resolution as [`open_comment`].
@@ -855,6 +846,28 @@ impl Viewer {
     }
 }
 
+/// Where a bare `;` (no address selected) lands on the current function, and
+/// the existing text to edit. An existing `function_doc` keeps editing in place
+/// (it's the note already rendered atop the signature — though it never lists
+/// in Marks, since `bn comment list` doesn't enumerate `fn.comment`). Otherwise
+/// a *new* comment targets the function's **entry address**: BN renders an
+/// entry comment atop the function just the same, and an address-scoped comment
+/// enumerates via `bn comment list`, so it shows in the Marks view (and to
+/// every other client) instead of vanishing into `fn.comment`. The doc slot
+/// remains only as a fallback when bn can't report an entry address.
+fn func_comment_target(name: &str, existing: crate::bn::FuncComment) -> (AnnTarget, String) {
+    if !existing.doc.trim().is_empty() {
+        (AnnTarget::Func(name.to_string()), existing.doc)
+    } else if !existing.entry_addr.is_empty() {
+        (
+            AnnTarget::Addr(existing.entry_addr),
+            existing.entry_comment.unwrap_or_default(),
+        )
+    } else {
+        (AnnTarget::Func(name.to_string()), String::new())
+    }
+}
+
 /// The first call-site address on an xrefs caller line
 /// (`0xENTRY  fn  (N sites: 0xSITE, …)`) — the reference itself, not the
 /// function-entry address that leads the line. `None` when the line has no
@@ -924,7 +937,72 @@ fn match_name_prefix<'a>(names: impl Iterator<Item = &'a str>, query: &str) -> N
 
 #[cfg(test)]
 mod tests {
-    use super::{match_name_prefix, parse_xref_callsite, NameMatch};
+    use super::{func_comment_target, match_name_prefix, parse_xref_callsite, AnnTarget, NameMatch};
+    use crate::bn::FuncComment;
+
+    fn func_comment(doc: &str, entry_addr: &str, entry_comment: Option<&str>) -> FuncComment {
+        FuncComment {
+            doc: doc.into(),
+            entry_addr: entry_addr.into(),
+            entry_comment: entry_comment.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn bare_comment_on_a_function_targets_its_entry_address() {
+        // No doc yet: a new function-level comment lands on the entry address so
+        // it enumerates in `bn comment list` and lists in Marks — a `fn.comment`
+        // doc would be invisible there (issue: function-doc comments missing
+        // from the Marks view).
+        assert_eq!(
+            func_comment_target("parse_hdr", func_comment("", "0x401200", None)),
+            (AnnTarget::Addr("0x401200".into()), String::new())
+        );
+        // A whitespace-only doc counts as absent.
+        assert_eq!(
+            func_comment_target("parse_hdr", func_comment("  \n", "0x401200", None)),
+            (AnnTarget::Addr("0x401200".into()), String::new())
+        );
+    }
+
+    #[test]
+    fn existing_entry_comment_edits_in_place() {
+        assert_eq!(
+            func_comment_target(
+                "copy_block",
+                func_comment("", "0x4015e0", Some("bounds check lives here"))
+            ),
+            (
+                AnnTarget::Addr("0x4015e0".into()),
+                "bounds check lives here".into()
+            )
+        );
+    }
+
+    #[test]
+    fn existing_function_doc_still_edits_the_doc() {
+        // A pre-existing fn.comment (set before the entry-address change, or by
+        // another client via `bn comment set --function`) keeps editing as a doc
+        // rather than forking a second note at the entry.
+        assert_eq!(
+            func_comment_target(
+                "vg_scan",
+                func_comment("walks the volume table", "0x402000", None)
+            ),
+            (
+                AnnTarget::Func("vg_scan".into()),
+                "walks the volume table".into()
+            )
+        );
+    }
+
+    #[test]
+    fn no_entry_address_falls_back_to_the_function_doc() {
+        assert_eq!(
+            func_comment_target("sub_403880", func_comment("", "", None)),
+            (AnnTarget::Func("sub_403880".into()), String::new())
+        );
+    }
 
     #[test]
     fn parses_the_first_site_not_the_entry() {

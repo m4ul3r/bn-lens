@@ -138,9 +138,9 @@ enum RenameScope {
     Symbol,
 }
 
-/// Where a comment/tag lands: a concrete address (a line/hotspot address) or
-/// the whole current function.
-#[derive(Clone)]
+/// Where a comment/tag lands: a concrete address (a line/hotspot address, or
+/// the current function's entry for a bare `;`) or the whole current function.
+#[derive(Clone, Debug, PartialEq)]
 enum AnnTarget {
     Addr(String),
     Func(String),

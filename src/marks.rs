@@ -4,10 +4,13 @@
 //! `Enter` jumps to the annotated function so you (and the agent) can move
 //! between marked spots. Your own marks (comments, Bookmarks) sort to the top.
 //!
-//! Caveat: a bare `;` on a *function* sets bn's function-documentation comment
-//! (`fn.comment`), which `bn comment list` does not enumerate — so those do NOT
-//! appear here (see TODO.md → "function-doc comments are invisible in Marks").
-//! Only address-scoped comments list.
+//! A bare `;` on a *function* writes a comment at the function's **entry
+//! address** (`viewer/actions.rs::func_comment_target`), so it enumerates via
+//! `bn comment list` and lists here like any other comment. Residual: a
+//! pre-existing function-*doc* (`fn.comment` — set before that change, or by
+//! another client via `bn comment set --function`) still does NOT list, since
+//! `bn comment list` has no doc enumeration (see TODO.md); `;` on such a
+//! function keeps editing the doc in place.
 
 use crate::bn::Mark;
 use crate::ctx::Ctx;
@@ -47,6 +50,30 @@ fn rank(kind: &str) -> u8 {
         "Bookmarks" | "Important" => 1,
         _ => 2,
     }
+}
+
+/// Shape raw marks for the list: a function-scoped tag has no address of its
+/// own, so fill it from the function's entry (it then sorts and displays with a
+/// real address), then order by [`rank`] and ascending address.
+fn normalize(
+    mut items: Vec<Mark>,
+    addr_by_name: &std::collections::HashMap<String, String>,
+) -> Vec<Mark> {
+    for m in &mut items {
+        if m.addr.is_empty() {
+            if let Some(addr) = addr_by_name.get(&m.func) {
+                m.addr = addr.clone();
+            }
+        }
+    }
+    items.sort_by(|a, b| {
+        rank(&a.kind).cmp(&rank(&b.kind)).then(
+            parse_hex(&a.addr)
+                .unwrap_or(0)
+                .cmp(&parse_hex(&b.addr).unwrap_or(0)),
+        )
+    });
+    items
 }
 
 impl MarksList {
@@ -98,24 +125,7 @@ impl MarksList {
     }
 
     fn build(ctx: &Ctx) -> Vec<Mark> {
-        let mut items = ctx.bn.marks();
-        // A function-scoped tag has no address of its own — fill it from the
-        // function's entry so it sorts and displays with a real address.
-        for m in &mut items {
-            if m.addr.is_empty() {
-                if let Some(addr) = ctx.addr_by_name.get(&m.func) {
-                    m.addr = addr.clone();
-                }
-            }
-        }
-        items.sort_by(|a, b| {
-            rank(&a.kind).cmp(&rank(&b.kind)).then(
-                parse_hex(&a.addr)
-                    .unwrap_or(0)
-                    .cmp(&parse_hex(&b.addr).unwrap_or(0)),
-            )
-        });
-        items
+        normalize(ctx.bn.marks(), &ctx.addr_by_name)
     }
 
     pub fn is_searching(&self) -> bool {
@@ -361,5 +371,64 @@ impl MarksList {
             ];
             crate::ui::put_spans(buf, x0, y, w, &spans);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize;
+    use crate::bn::Mark;
+    use std::collections::HashMap;
+
+    fn mark(addr: &str, kind: &str, text: &str, func: &str) -> Mark {
+        Mark {
+            addr: addr.into(),
+            kind: kind.into(),
+            text: text.into(),
+            func: func.into(),
+        }
+    }
+
+    #[test]
+    fn entry_address_comment_ranks_with_the_other_comments() {
+        // The bare-`;`-on-a-function path writes an entry-address comment; it
+        // must list as an ordinary comment — rank 0, ahead of Bookmarks and BN
+        // analysis tags, address-ascending within its rank.
+        let items = vec![
+            mark("0x401800", "Bookmarks", "revisit for the length arg", "vg_scan"),
+            mark("0x4015e0", "comment", "bounds check lives here", "copy_block"),
+            mark("0x401450", "Non-returning", "", "abort_path"),
+            mark("0x401200", "comment", "parses the header", "parse_hdr"),
+        ];
+        let sorted = normalize(items, &HashMap::new());
+        let order: Vec<(&str, &str)> = sorted
+            .iter()
+            .map(|m| (m.kind.as_str(), m.addr.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("comment", "0x401200"),
+                ("comment", "0x4015e0"),
+                ("Bookmarks", "0x401800"),
+                ("Non-returning", "0x401450"),
+            ]
+        );
+    }
+
+    #[test]
+    fn function_scoped_tag_fills_its_entry_address() {
+        // A function-scoped tag arrives with no address; it takes the entry
+        // from the name map and sorts by it among its rank peers.
+        let map: HashMap<String, String> =
+            [("vg_scan".to_string(), "0x402000".to_string())].into();
+        let items = vec![
+            mark("0x403000", "Bookmarks", "later", "lvm_run"),
+            mark("", "Bookmarks", "whole-fn bookmark", "vg_scan"),
+        ];
+        let sorted = normalize(items, &map);
+        assert_eq!(sorted[0].addr, "0x402000");
+        assert_eq!(sorted[0].text, "whole-fn bookmark");
+        assert_eq!(sorted[1].addr, "0x403000");
     }
 }
