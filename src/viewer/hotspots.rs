@@ -22,10 +22,90 @@ pub(super) fn ellipsize(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// Annotate a hex dump: any 8-byte little-endian value that matches a known
-/// symbol address gets a `+off→name` note — so a function-pointer table reads
-/// as names, not raw bytes.
-pub(super) fn symbolize_dump(dump: &str, reverse_symbols: &HashMap<String, String>) -> Vec<String> {
+/// How to read a pointer-sized word out of a raw dump row: the target's pointer
+/// width in bytes and its byte order. Mirrors `DATA_MAP_PROGRAM`'s
+/// `psz = bv.address_size`, so the raw peek and the typed data map cannot
+/// disagree about what counts as a pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PtrFmt {
+    pub width: usize,
+    pub big_endian: bool,
+}
+
+impl Default for PtrFmt {
+    /// 64-bit little-endian — the pre-fix hardcoded behaviour, and the fallback
+    /// for an architecture name we don't recognise.
+    fn default() -> Self {
+        Self {
+            width: 8,
+            big_endian: false,
+        }
+    }
+}
+
+/// The pointer format of a Binary Ninja architecture name (`Ctx::arch`, which is
+/// `str(bv.arch)`: `x86_64`, `armv7`, `mipsel32`, `ppc64_le`, …).
+///
+/// Width tracks `bv.address_size`, the same fact the typed data map keys its
+/// pointers off. Endianness comes from BN's own naming convention: the
+/// big-endian architectures are the unsuffixed MIPS/PPC names plus the explicit
+/// `eb` ARM variants, and every little-endian counterpart is spelled out
+/// (`mipsel32`, `ppc_le`). An unrecognised name falls back to 64-bit
+/// little-endian — a mis-decoded word simply fails to hit the symbol map, so a
+/// wrong guess costs a missing annotation, never a wrong name.
+pub(super) fn ptr_fmt(arch: &str) -> PtrFmt {
+    let name = arch.trim().to_ascii_lowercase();
+    let width = match name.as_str() {
+        "x86_64" | "aarch64" | "aarch64eb" | "arm64" | "mips64" | "mipsel64" | "cavium-mips64"
+        | "cavium-mipsel64" | "ppc64" | "ppc64_le" | "rv64gc" | "riscv64" => 8,
+        "x86" | "i386" | "armv7" | "armv7eb" | "thumb2" | "thumb2eb" | "mips32" | "mipsel32"
+        | "ppc" | "ppc_le" | "ppc_ps" | "ppc_qpx" | "rv32gc" | "rv32gc_wch" | "riscv32" => 4,
+        "x86_16" | "msp430" | "z80" | "6502" => 2,
+        _ => 8,
+    };
+    let big_endian = matches!(
+        name.as_str(),
+        "aarch64eb"
+            | "armv7eb"
+            | "thumb2eb"
+            | "mips32"
+            | "mips64"
+            | "cavium-mips64"
+            | "ppc"
+            | "ppc64"
+            | "ppc_ps"
+            | "ppc_qpx"
+    );
+    PtrFmt { width, big_endian }
+}
+
+/// Decode `bytes` as one word in `fmt`'s byte order.
+fn decode_word(bytes: &[u8], big_endian: bool) -> u64 {
+    let mut value: u64 = 0;
+    if big_endian {
+        for &byte in bytes {
+            value = (value << 8) | byte as u64;
+        }
+    } else {
+        for (index, &byte) in bytes.iter().enumerate() {
+            value |= (byte as u64) << (8 * index);
+        }
+    }
+    value
+}
+
+/// Annotate a hex dump: any pointer-sized word (per `fmt`, from the target's
+/// architecture — **not** a hardcoded 64-bit little-endian read) that matches a
+/// known symbol address gets a `+off→name` note, so a function-pointer table or
+/// vtable reads as names, not raw bytes. Each row is stepped at the pointer
+/// stride, so a 32-bit target annotates `+0x0`/`+0x4`/`+0x8`/`+0xc` where a
+/// 64-bit one annotates `+0x0`/`+0x8`.
+pub(super) fn symbolize_dump(
+    dump: &str,
+    reverse_symbols: &HashMap<String, String>,
+    fmt: PtrFmt,
+) -> Vec<String> {
+    let width = fmt.width.clamp(1, 8);
     dump.lines()
         .map(|line| {
             let after = line.split_once(':').map_or(line, |(_, bytes)| bytes);
@@ -41,19 +121,17 @@ pub(super) fn symbolize_dump(dump: &str, reverse_symbols: &HashMap<String, Strin
                 })
                 .collect();
             let mut annotation = String::new();
-            for offset in [0usize, 8usize] {
-                if bytes.len() >= offset + 8 {
-                    let mut value: u64 = 0;
-                    for i in 0..8 {
-                        value |= (bytes[offset + i] as u64) << (8 * i);
-                    }
-                    if value != 0 {
-                        if let Some(name) = reverse_symbols.get(&format!("0x{value:x}")) {
-                            if !annotation.is_empty() {
-                                annotation.push_str(" ·");
-                            }
-                            annotation.push_str(&format!(" +{offset:#x}→{name}"));
+            for offset in (0..bytes.len()).step_by(width) {
+                let Some(word) = bytes.get(offset..offset + width) else {
+                    break;
+                };
+                let value = decode_word(word, fmt.big_endian);
+                if value != 0 {
+                    if let Some(name) = reverse_symbols.get(&format!("0x{value:x}")) {
+                        if !annotation.is_empty() {
+                            annotation.push_str(" ·");
                         }
+                        annotation.push_str(&format!(" +{offset:#x}→{name}"));
                     }
                 }
             }
@@ -362,8 +440,8 @@ pub(super) fn build_spans(
 #[cfg(test)]
 mod tests {
     use super::{
-        call_stops, classify_name, covering_span, symbolize_dump, tab_stops, truncate_str_segment,
-        valid_ident, HotKind, Hotspot,
+        call_stops, classify_name, covering_span, ptr_fmt, symbolize_dump, tab_stops,
+        truncate_str_segment, valid_ident, HotKind, Hotspot, PtrFmt,
     };
     use std::collections::HashMap;
 
@@ -551,7 +629,7 @@ mod tests {
         let mut reverse_symbols = HashMap::new();
         reverse_symbols.insert("0x402760".to_string(), "handle_inbound_c2_msg".to_string());
         let dump = "00415258: 00 00 00 00 00 00 00 00 60 27 40 00 00 00 00 00  ........";
-        let output = symbolize_dump(dump, &reverse_symbols);
+        let output = symbolize_dump(dump, &reverse_symbols, PtrFmt::default());
         assert!(
             output[0].contains("+0x8→handle_inbound_c2_msg"),
             "got: {}",
@@ -563,7 +641,73 @@ mod tests {
     fn leaves_nonmatching_lines_untouched() {
         let reverse_symbols = HashMap::new();
         let dump = "00415258: 01 02 03 04 05 06 07 08 00 00 00 00 00 00 00 00  ........";
-        let output = symbolize_dump(dump, &reverse_symbols);
+        let output = symbolize_dump(dump, &reverse_symbols, PtrFmt::default());
         assert_eq!(output[0], dump);
+    }
+
+    #[test]
+    fn symbolizes_pointers_at_the_target_width() {
+        // A 32-bit handler table: two 4-byte little-endian entries, back to back.
+        let mut reverse_symbols = HashMap::new();
+        reverse_symbols.insert("0x11a30".to_string(), "handle_get".to_string());
+        reverse_symbols.insert("0x11b04".to_string(), "handle_set".to_string());
+        let dump = "0002b400: 30 1a 01 00 04 1b 01 00 00 00 00 00 00 00 00 00  0...............";
+        // Read as 64-bit (the old hardcoded behaviour) neither entry resolves.
+        assert_eq!(
+            symbolize_dump(dump, &reverse_symbols, PtrFmt::default())[0],
+            dump
+        );
+        // At the target's own pointer width both do, stepped at that stride.
+        let output = symbolize_dump(dump, &reverse_symbols, ptr_fmt("armv7"));
+        assert!(
+            output[0].contains("+0x0→handle_get") && output[0].contains("+0x4→handle_set"),
+            "got: {}",
+            output[0]
+        );
+    }
+
+    #[test]
+    fn symbolizes_a_big_endian_pointer() {
+        let mut reverse_symbols = HashMap::new();
+        reverse_symbols.insert("0x11a30".to_string(), "handle_get".to_string());
+        let dump = "0002b400: 00 01 1a 30 00 00 00 00 00 00 00 00 00 00 00 00  ...0............";
+        let output = symbolize_dump(dump, &reverse_symbols, ptr_fmt("mips32"));
+        assert!(output[0].contains("+0x0→handle_get"), "got: {}", output[0]);
+        // The same bytes on the little-endian sibling architecture are not a
+        // pointer, and must not be annotated.
+        assert_eq!(
+            symbolize_dump(dump, &reverse_symbols, ptr_fmt("mipsel32"))[0],
+            dump
+        );
+    }
+
+    #[test]
+    fn pointer_format_follows_the_architecture_name() {
+        let le = |width| PtrFmt {
+            width,
+            big_endian: false,
+        };
+        let be = |width| PtrFmt {
+            width,
+            big_endian: true,
+        };
+        assert_eq!(ptr_fmt("x86_64"), le(8));
+        assert_eq!(ptr_fmt("aarch64"), le(8));
+        assert_eq!(ptr_fmt("x86"), le(4));
+        assert_eq!(ptr_fmt("armv7"), le(4));
+        assert_eq!(ptr_fmt("thumb2"), le(4));
+        assert_eq!(ptr_fmt("armv7eb"), be(4));
+        assert_eq!(ptr_fmt("mips32"), be(4));
+        assert_eq!(ptr_fmt("mipsel32"), le(4));
+        assert_eq!(ptr_fmt("ppc"), be(4));
+        assert_eq!(ptr_fmt("ppc_le"), le(4));
+        assert_eq!(ptr_fmt("ppc64"), be(8));
+        assert_eq!(ptr_fmt("ppc64_le"), le(8));
+        assert_eq!(ptr_fmt("rv32gc"), le(4));
+        assert_eq!(ptr_fmt("x86_16"), le(2));
+        // Case/whitespace tolerated; anything unknown keeps the 64-bit LE default.
+        assert_eq!(ptr_fmt(" ARMv7 "), le(4));
+        assert_eq!(ptr_fmt("some-future-arch"), PtrFmt::default());
+        assert_eq!(ptr_fmt(""), PtrFmt::default());
     }
 }

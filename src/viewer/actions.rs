@@ -1,6 +1,6 @@
 //! Viewer actions that load data or change navigation state.
 
-use super::hotspots::{build_spans, data_symbol_addr, ellipsize, symbolize_dump};
+use super::hotspots::{build_spans, data_symbol_addr, ellipsize, ptr_fmt, symbolize_dump};
 use super::{AnnTarget, Exit, Frame, HotKind, Popup, RenameScope, View, Viewer};
 use crate::ctx::Ctx;
 use crate::syntax::Tok;
@@ -722,7 +722,10 @@ impl Viewer {
         let dump = ctx.bn.read(address, 256);
         self.popup = Popup::Peek {
             title: format!("peek {symbol} @ {address}"),
-            lines: symbolize_dump(&dump, &ctx.name_by_addr),
+            // Decode candidate pointers at the target's own width/endianness: a
+            // hardcoded 64-bit LE read annotates nothing on a 32-bit firmware
+            // target, which is exactly where the `→ name` matters most.
+            lines: symbolize_dump(&dump, &ctx.name_by_addr, ptr_fmt(&ctx.arch)),
             tokens: None,
             goto: None,
             off: 0,

@@ -167,7 +167,12 @@ fn printable(byte: u8) -> char {
 fn c_string(bytes: &[u8], base: u64, addr: u64, max_bytes: u64) -> String {
     let mut out = String::new();
     for i in 0..max_bytes {
-        match byte_at(bytes, base, addr + i) {
+        // A var near the top of the address space (a mapped/raw firmware view can
+        // sit at 0xffff_…) would wrap `addr + i`; the string simply ends there.
+        let Some(at) = addr.checked_add(i) else {
+            break;
+        };
+        match byte_at(bytes, base, at) {
             Some(0) | None => break,
             Some(b'"') => out.push_str("\\\""),
             Some(b'\\') => out.push_str("\\\\"),
@@ -206,6 +211,12 @@ fn value_segs(var: &DataVar) -> Vec<Seg> {
         return segs;
     }
     if let Some(value) = var.value {
+        // A width-0 var masks to 0, which would render as a confident `= 0
+        // (0x0)`. In an audit context a blank value is correct and a wrong one
+        // is not, so emit nothing.
+        if var.width == 0 {
+            return Vec::new();
+        }
         let bits = (var.width.min(8) * 8) as u32;
         let mask = if bits >= 64 {
             u64::MAX
@@ -354,7 +365,10 @@ fn emit_hex_rows(
     let mut rows: Vec<(u64, Vec<Option<u8>>)> = Vec::new();
     let mut addr = from;
     while addr < to {
-        let row_end = (addr + HEX_COLS as u64).min(to);
+        // Every row edge is clamped to `to`, so saturating at u64::MAX is exact —
+        // a window that reaches the top of the address space just ends there
+        // instead of wrapping into garbage rows (or panicking in a debug build).
+        let row_end = addr.saturating_add(HEX_COLS as u64).min(to);
         let row = (addr..row_end).map(|a| byte_at(bytes, base, a)).collect();
         rows.push((addr, row));
         addr = row_end;
@@ -381,17 +395,20 @@ fn emit_hex_rows(
             }
             if j - i >= COLLAPSE_MIN {
                 let start = rows[i].0;
-                let end = rows[j - 1].0 + HEX_COLS as u64;
+                let end = rows[j - 1].0.saturating_add(HEX_COLS as u64);
                 if focus.is_none() && start <= focus_addr && focus_addr < end {
                     *focus = Some(lines.len());
                 }
-                lines.push(fold_line(start, (end - start) as usize, value));
+                lines.push(fold_line(start, end.saturating_sub(start) as usize, value));
                 i = j;
                 continue;
             }
         }
         let (row_addr, row) = &rows[i];
-        if focus.is_none() && *row_addr <= focus_addr && focus_addr < row_addr + row.len() as u64 {
+        if focus.is_none()
+            && *row_addr <= focus_addr
+            && focus_addr < row_addr.saturating_add(row.len() as u64)
+        {
             *focus = Some(lines.len());
         }
         let mut segs = vec![
@@ -438,21 +455,30 @@ pub fn linear(
         // within its extent, not only exactly at its start: scalar and pointer
         // vars emit no per-byte rows, so an interior focus_addr would otherwise
         // never match and the view would open at the top of the window.
-        let extent = (addr + var.width.max(1)).min(end).max(addr + 1);
+        // Saturating throughout: `addr` is `< end` here, and every extent is
+        // clamped to `end`, so a var whose width would run off the top of the
+        // address space stops at the window edge rather than wrapping.
+        let extent = addr
+            .saturating_add(var.width.max(1))
+            .min(end)
+            .max(addr.saturating_add(1));
         if focus.is_none() && addr <= focus_addr && focus_addr < extent {
             focus = Some(lines.len());
         }
         if is_inline_string(var) {
             lines.push(string_decl_line(var, addr, base, bytes));
-            cursor = (addr + var.width).min(end);
+            cursor = addr.saturating_add(var.width).min(end);
         } else if var.ptr.is_some() || (var.value.is_some() && var.width > 0) {
             // Scalar/pointer: the label carries the value; no redundant hex.
             lines.push(label_line(var, addr));
-            cursor = (addr + var.width.max(1)).min(end);
+            cursor = addr.saturating_add(var.width.max(1)).min(end);
         } else {
             // Array/struct/unknown: label, then the raw bytes.
             lines.push(label_line(var, addr));
-            let var_end = (addr + var.width).min(end).max(addr + 1);
+            let var_end = addr
+                .saturating_add(var.width)
+                .min(end)
+                .max(addr.saturating_add(1));
             emit_hex_rows(
                 &mut lines, &mut focus, addr, var_end, base, bytes, focus_addr,
             );
@@ -674,6 +700,110 @@ mod tests {
         assert_eq!(
             parse_hexdump("00482040: 61 62 20 63 64  ab cd", 0x482040),
             vec![0x61, 0x62, 0x20, 0x63, 0x64]
+        );
+    }
+
+    /// The address column of a rendered line, if it starts with one.
+    fn row_addr(line: &Line) -> Option<u64> {
+        u64::from_str_radix(line.first()?.text.trim(), 16).ok()
+    }
+
+    #[test]
+    fn a_window_at_the_top_of_the_address_space_does_not_wrap() {
+        // A mapped/raw view can sit at the very top of the address space. The
+        // base is deliberately 0x18 (not a multiple of HEX_COLS) below the end,
+        // so the second row's `addr + HEX_COLS` is the edge that used to wrap:
+        // garbage rows in release, an overflow panic in debug.
+        let from = u64::MAX - 0x18;
+        let bytes = vec![0xa5u8; 0x18];
+        let out = linear(".data", from, u64::MAX, &[], &bytes, from);
+        let addrs: Vec<u64> = out.lines.iter().filter_map(row_addr).collect();
+        assert_eq!(addrs.len(), 2, "{addrs:x?}");
+        // Rows stay inside the window and ascend — nothing wrapped to a low
+        // address, and the trailing partial row is 8 bytes, not 16.
+        assert_eq!(addrs, vec![from, u64::MAX - 8]);
+        let last = text(out.lines.last().unwrap());
+        assert_eq!(last.matches("a5").count(), 8, "{last}");
+    }
+
+    #[test]
+    fn a_var_running_off_the_top_of_the_address_space_does_not_wrap() {
+        // A var whose declared width runs past the end of the address space: the
+        // extent/cursor arithmetic and the inline-string walk both used to wrap.
+        let from = u64::MAX - 0x18;
+        let banner = var(
+            &format!("{:#x}", u64::MAX - 8),
+            "banner",
+            "char const [0x40]",
+            0x40,
+            ".rodata",
+        );
+        // Buffer deliberately longer than the window, all printable, so the
+        // string walk keeps going past the top instead of stopping on a NUL.
+        let bytes = vec![b'A'; 0x40];
+        let out = linear(".rodata", from, u64::MAX, &[banner], &bytes, u64::MAX - 4);
+        let joined: Vec<String> = out.lines.iter().map(text).collect();
+        assert!(
+            joined.iter().any(|line| line.contains("char const banner")),
+            "{joined:?}"
+        );
+        // Every emitted row/label address is inside the window.
+        assert!(
+            out.lines
+                .iter()
+                .filter_map(row_addr)
+                .all(|addr| addr >= from),
+            "{joined:?}"
+        );
+        // The interior focus address still centres on the var's own line.
+        let focus = out.focus.expect("interior address focuses the var");
+        assert!(text(&out.lines[focus]).contains("banner"), "{joined:?}");
+
+        // Same for an aggregate var, which takes the label-then-hex branch and so
+        // computes its own extent/cursor.
+        let table = var(
+            &format!("{:#x}", u64::MAX - 8),
+            "handler_table",
+            "void* [0x8]",
+            0x40,
+            ".data",
+        );
+        let out = linear(".data", from, u64::MAX, &[table], &bytes, from);
+        let addrs: Vec<u64> = out.lines.iter().filter_map(row_addr).collect();
+        assert!(addrs.iter().all(|&addr| addr >= from), "{addrs:x?}");
+        assert!(
+            addrs.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{addrs:x?}"
+        );
+    }
+
+    #[test]
+    fn a_width_zero_var_renders_no_value() {
+        // BN reports width 0 for an unsized/void var; masking its value to 0
+        // bits used to render a confident `= 0 (0x0)`.
+        let mut unsized_var = var("0x2b400", "handler_table", "void", 0, ".data");
+        unsized_var.value = Some(7);
+        let map = render(&[unsized_var.clone()], None, ".data");
+        assert!(map.lines[1].contains("handler_table"), "{}", map.lines[1]);
+        assert!(!map.lines[1].contains('='), "{}", map.lines[1]);
+        assert!(!map.lines[1].contains("0x0"), "{}", map.lines[1]);
+        // Same through the linear view's label line.
+        let out = linear(
+            ".data",
+            0x2b400,
+            0x2b410,
+            &[unsized_var],
+            &[0u8; 0x10],
+            0x2b400,
+        );
+        let joined: Vec<String> = out.lines.iter().map(text).collect();
+        assert!(
+            joined.iter().any(|line| line.contains("handler_table")),
+            "{joined:?}"
+        );
+        assert!(
+            !joined.iter().any(|line| line.contains("= 0 (0x0)")),
+            "{joined:?}"
         );
     }
 
