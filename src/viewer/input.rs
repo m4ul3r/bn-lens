@@ -670,7 +670,7 @@ impl Viewer {
         }
         // Remember where we are *before* changing the view, so the reload can
         // re-centre the new listing on the same address.
-        let anchor = self.current_code_addr(ctx);
+        let anchor = self.current_code_addr();
         if self.view != View::Xrefs {
             let order = [View::Decomp, View::Mlil, View::Disasm];
             let current = order

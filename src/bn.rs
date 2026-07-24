@@ -266,6 +266,26 @@ struct DecompiledFn {
     function: FnRef,
 }
 
+/// One `bn decompile --addresses` result, split into the pieces a caller needs to
+/// render it *and* index it by address — see [`Bn::decompile_read`].
+pub struct DecompileRead {
+    /// The resolved function's name as bn reports it (an interior address
+    /// resolves to its containing function).
+    pub name: String,
+    /// The resolved function's entry address (`0x…`), possibly empty.
+    pub entry: String,
+    /// Address-prefixed pseudo-C: every real line led by its 8-hex address
+    /// column (parse with [`crate::decomp::dec_lines`]).
+    pub text: String,
+    /// The `// bn: …` interior-resolution note, without its trailing newline.
+    /// `None` for an exact-start or by-name read (the common case).
+    pub note: Option<String>,
+    /// `warning: …` lines the CLI's text mode appends below the body — the
+    /// thunk/veneer disclosure, the analysis-stub warning, the pseudo-C
+    /// degradation notice. Load-bearing on a live target; never dropped.
+    pub warnings: Vec<String>,
+}
+
 /// A function's existing comments, split by where BN stores them: its dedicated
 /// `function_doc` string and any comment at the entry `address`. Both render
 /// atop the function; `;` edits whichever is present.
@@ -2005,27 +2025,6 @@ impl Bn {
         Ok((addr, data))
     }
 
-    /// Decompile via `--out` (avoids the stdout spill envelope for big funcs).
-    pub fn decompile(&self, name: &str) -> String {
-        if let Some(result) =
-            self.call_local("decompile", serde_json::json!({"identifier": name}))
-        {
-            return match result {
-                Ok(value) => match decompile_render(&value) {
-                    text if text.trim().is_empty() => "(no output)".into(),
-                    text => text,
-                },
-                Err(error) => format!("✗ {error}"),
-            };
-        }
-        let out = self.run_out(&cli_argv(&["decompile"], &[name]));
-        if out.trim().is_empty() {
-            "(no output)".into()
-        } else {
-            out
-        }
-    }
-
     /// Decompile with each pseudo-C line prefixed by its 8-hex address column
     /// (`bn decompile --addresses`), via `--out`. Lets a caller map a use
     /// address back to the statement it belongs to.
@@ -2065,6 +2064,53 @@ impl Bn {
         } else {
             Some((parsed.function.name, parsed.function.address, parsed.text))
         }
+    }
+
+    /// One `decompile --addresses` read carrying *everything* the CLI's text mode
+    /// reconstructs around the body — the interior-resolution note and the
+    /// `warnings[]` entries — alongside the address-prefixed pseudo-C.
+    ///
+    /// This exists so a caller can derive both the rendered lines and the
+    /// per-line address column from a **single** backend read: the viewer used to
+    /// issue one plain `decompile` for the text and a second `--addresses`
+    /// decompile for the addresses, and reconciled the two by index. On a live
+    /// instance a concurrent rename/retype between the two reads shifted the line
+    /// set and every address readout with it (issue #18).
+    /// `Err` is the failure itself (bridge error, timeout, undecodable payload) and
+    /// `Ok(None)` is a backend answer with no body. Both are terminal on purpose:
+    /// flattening them to `None` let the caller retry with a *second* full
+    /// decompile, so a timed-out backend paid the budget twice, and the retry could
+    /// observe different live state — or, for an interior focus, ask for a name
+    /// instead of the address that was actually requested.
+    pub fn decompile_read(&self, id: &str) -> Result<Option<DecompileRead>, String> {
+        let value = match self.call_local(
+            "decompile",
+            serde_json::json!({"identifier": id, "addresses": true}),
+        ) {
+            Some(result) => result?,
+            None => {
+                // `id` is untrusted (a BN symbol name can lead with a dash), so it
+                // rides as an operand past `--` like every other CLI read.
+                let out = self.run_out_checked(&cli_argv(
+                    &["decompile", "--addresses", "--format", "json"],
+                    &[id],
+                ))?;
+                serde_json::from_str(&out)
+                    .map_err(|error| format!("bn decompile returned invalid JSON: {error}"))?
+            }
+        };
+        let parsed: DecompiledFn = self.decode(value.clone(), "decompile")?;
+        if parsed.text.is_empty() {
+            return Ok(None);
+        }
+        let note = resolution_note(&value);
+        Ok(Some(DecompileRead {
+            name: parsed.function.name,
+            entry: parsed.function.address,
+            text: parsed.text,
+            note: (!note.is_empty()).then(|| note.trim_end().to_string()),
+            warnings: warning_lines(&value),
+        }))
     }
 
     /// `n` instructions in address-linear order starting *exactly* at `addr`
@@ -2586,19 +2632,11 @@ fn text_field(value: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// Render a socket `decompile` result the way the CLI's text mode did
-/// (`function.py:246-257`): a leading resolution note, the pseudo-C, then any
-/// warnings.
-///
-/// Reading only `text` off the socket silently dropped both — the interior-address
-/// disclosure and every `warnings[]` entry: the #446 thunk/veneer "this is a
-/// PLT/GOT trampoline, not self-recursion" note, the analysis-stub warning, and
-/// the pseudo-C→wrapped-HLIL degradation notice (`read_decompile.py:144-162`).
-/// Those are load-bearing on a live target, so the socket path must reconstruct
-/// them rather than leave the reader with unexplained-looking output.
-fn decompile_render(value: &serde_json::Value) -> String {
-    let mut body = text_field(value);
-    let warnings: Vec<String> = value
+
+/// The `warnings[]` entries of a `decompile` result as the `warning: …` lines the
+/// CLI's text mode appends below the body, in order. Empty when there are none.
+fn warning_lines(value: &serde_json::Value) -> Vec<String> {
+    value
         .get("warnings")
         .and_then(serde_json::Value::as_array)
         .map(|items| {
@@ -2608,11 +2646,7 @@ fn decompile_render(value: &serde_json::Value) -> String {
                 .map(|warning| format!("warning: {warning}"))
                 .collect()
         })
-        .unwrap_or_default();
-    if !warnings.is_empty() {
-        body = format!("{body}\n\n{}", warnings.join("\n"));
-    }
-    format!("{}{body}", resolution_note(value))
+        .unwrap_or_default()
 }
 
 /// The CLI's `_resolution_note` (`formatters.py:124-143`): a `// bn: …` line when a
@@ -3459,11 +3493,11 @@ pub fn newest_live(bin: &str, exclude: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_dir, cli_argv, decompile_render, flag_eq, is_unknown_op, json_escape_ascii,
-        mutation_outcome, parse_local_list_json, parse_types_page, push_mark, recovered_class,
-        recovered_data_syms, render_disasm_linear, render_read, render_sections, render_type_info,
-        render_class_show, render_xrefs, text_field, with_capture, AnalysisState, Bn, ClassItemJson,
-        CommentListJson, DataSymsJson, TagListJson,
+        capture_dir, cli_argv, flag_eq, is_unknown_op, json_escape_ascii, mutation_outcome,
+        parse_local_list_json, parse_types_page, push_mark, recovered_class, recovered_data_syms,
+        render_class_show, render_disasm_linear, render_read, render_sections, render_type_info,
+        render_xrefs, resolution_note, text_field, warning_lines, with_capture, AnalysisState, Bn,
+        ClassItemJson, CommentListJson, DataSymsJson, TagListJson,
     };
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -3678,10 +3712,11 @@ mod tests {
         let dir = scratch_dir("argv-read");
         let (bn, recorded) = argv_recorder(&dir);
 
-        bn.decompile("--out");
+        // A function named `--out` collides with bn's own capture flag, which
+        // `with_capture` splices in ahead of the separator: the name must still
+        // arrive as an operand, and the real flag must survive.
+        let _ = bn.decompile_read("--out");
         let argv = recorded_argv(&recorded);
-        // bn's own `--out` capture flag is appended by `run_out` AFTER the operands,
-        // so the guard must not swallow it into the operand list.
         assert!(argv.contains(&"--out".to_string()));
         let at = argv.iter().position(|arg| arg == "--").expect("separator");
         assert_eq!(argv[at + 1], "--out", "the function name is an operand");
@@ -4254,10 +4289,12 @@ mod tests {
     }
 
     #[test]
-    fn decompile_render_appends_the_warnings_the_cli_text_mode_showed() {
+    fn warning_lines_recovers_the_warnings_the_cli_text_mode_showed() {
         // A #446 thunk/veneer decompile: the socket `text` reads like an infinite
         // self-recursion, and the warning is the only thing that says otherwise.
         // Dropping it (reading `text` alone) is the regression this guards.
+        // `decompile_read` carries these into `DecompileRead::warnings`, which
+        // `decomp_view_lines` renders below the body.
         let value = serde_json::json!({
             "text": "int32_t sub_401000()\n{\n    return sub_401000();\n}",
             "warnings": [
@@ -4265,13 +4302,16 @@ mod tests {
                  (a jump to the real body), not a self-recursive function.",
             ],
         });
-        let rendered = decompile_render(&value);
-        assert!(rendered.starts_with("int32_t sub_401000()"));
-        assert!(rendered.contains("\n\nwarning: thunk/veneer -> memcpy @ 0x402000:"));
+        let warnings = warning_lines(&value);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].starts_with("warning: thunk/veneer -> memcpy @ 0x402000:"),
+            "{warnings:?}"
+        );
     }
 
     #[test]
-    fn decompile_render_prefixes_the_interior_address_resolution_note() {
+    fn resolution_note_describes_an_interior_address_read() {
         // A goto/xref bounce to a mid-function address resolves to the container;
         // the leading note is what tells the reader the entry differs on purpose.
         let value = serde_json::json!({
@@ -4279,19 +4319,19 @@ mod tests {
             "function": {"name": "handler", "address": "0x401000"},
             "resolved_from": {"requested_address": "0x401014", "offset": "+0x14"},
         });
-        let rendered = decompile_render(&value);
         assert_eq!(
-            rendered.lines().next(),
+            resolution_note(&value).lines().next(),
             Some("// bn: 0x401014 is inside handler @ 0x401000 (+0x14); showing the containing function")
         );
     }
 
     #[test]
-    fn decompile_render_is_bare_text_when_there_is_nothing_to_annotate() {
-        // The common case — an exact-name decompile with no warnings — must be
-        // byte-identical to the plain `text`, no stray note or blank lines.
+    fn a_clean_decompile_carries_no_note_and_no_warnings() {
+        // The common case — an exact-name decompile with no warnings — must add
+        // nothing at all, so the body renders byte-identical to `text`.
         let value = serde_json::json!({"text": "void f()\n{\n}"});
-        assert_eq!(decompile_render(&value), "void f()\n{\n}");
+        assert!(resolution_note(&value).is_empty());
+        assert!(warning_lines(&value).is_empty());
     }
 
     #[test]
@@ -4300,6 +4340,24 @@ mod tests {
         assert!(!AnalysisState::from_raw("quick").is_complete());
         assert_eq!(AnalysisState::from_raw("").label(), "unknown");
         assert_eq!(AnalysisState::from_raw("partial").label(), "partial");
+    }
+
+    #[test]
+    fn a_failed_decompile_read_is_an_error_not_an_absence() {
+        // `Option` conflated "the backend answered, this function has no body" with
+        // "the read failed", and the viewer retried on the latter with a *second*
+        // full decompile: a timed-out backend paid the budget twice, and the retry
+        // could resolve against different live state. No client resolves for this
+        // instance, so the CLI fallback runs against a missing binary and fails.
+        let bn = Bn::new(
+            "/definitely/missing/bn-lens-test-binary".into(),
+            Some("bn-lens-test-no-such-instance".into()),
+            None,
+        );
+        match bn.decompile_read("main") {
+            Err(error) => assert!(!error.is_empty(), "the failure must carry a message"),
+            Ok(_) => panic!("a failed read must not be reported as an absence"),
+        }
     }
 
     #[test]

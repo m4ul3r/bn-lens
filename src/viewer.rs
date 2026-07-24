@@ -257,13 +257,15 @@ pub struct Viewer {
     /// show where the cursor is without re-decompiling every frame; empty for
     /// non-code views.
     ///
-    /// INVARIANT — index alignment with `lines` (load-bearing; see `load` and
-    /// `line_addr_column`): entry `i` describes `lines[i]`. It may be *shorter*
-    /// than `lines` (the decompile view appends address-less warning/note lines
-    /// to the rendered text that carry no entry), so it is never longer — but a
-    /// change that *prepends* a line to only one of the two would shift every
-    /// address silently. Consumers therefore index defensively (`.get`, clamp)
-    /// and must never assume `code_addrs.len() == lines.len()`.
+    /// INVARIANT — index alignment with `lines` (load-bearing; see `load`,
+    /// [`decomp_view_lines`] and `line_addr_column`): entry `i` describes
+    /// `lines[i]`. Both sides now come from **one** backend read per load — the
+    /// decompile view from a single `--addresses` payload, MLIL/disasm from the
+    /// one flattened listing — so alignment is by construction rather than by
+    /// reconciliation. It may still be *shorter* than `lines` (an empty column on
+    /// a view that has no addresses at all), so it is never longer. Consumers
+    /// index defensively (`.get`, clamp) and must never assume
+    /// `code_addrs.len() == lines.len()`.
     code_addrs: Vec<Option<u64>>,
     spans: Vec<Hotspot>,
     locals: std::collections::HashMap<String, String>, // name -> type (this fn)
@@ -317,7 +319,16 @@ pub struct Viewer {
 
 impl Viewer {
     pub fn new(ctx: &Ctx, name: String, is_code: bool) -> Self {
-        let mut viewer = Viewer {
+        let mut viewer = Viewer::blank(name, is_code);
+        viewer.load(ctx);
+        viewer
+    }
+
+    /// The viewer's initial state, before its first fetch. Split out of [`new`]
+    /// so the load-independent state machine (position keeping, target
+    /// resolution) is reachable from unit tests without a live `Ctx`.
+    fn blank(name: String, is_code: bool) -> Self {
+        Viewer {
             name,
             entry: None,
             focus_addr: None,
@@ -350,8 +361,17 @@ impl Viewer {
             cfg_drag: None,
             cfg_dragged: false,
             comment_wrap: std::cell::Cell::new(60),
-        };
-        viewer.load(ctx);
+        }
+    }
+
+    /// A viewer sitting in `view` with nothing loaded — lets the submodules' unit
+    /// tests drive the pure state machine (target resolution, position keeping)
+    /// with hand-built `lines`/`code_addrs` and no backend at all.
+    #[cfg(test)]
+    fn test_blank(name: String, view: View) -> Self {
+        let mut viewer = Viewer::blank(name, true);
+        viewer.view = view;
+        viewer.code_view = view;
         viewer
     }
 
@@ -377,17 +397,30 @@ impl Viewer {
                 }
             }
         }
-        // The data view recentres on its focus address every build, which is
-        // right on first entry but would discard the reading position on a
-        // reload (^R, or a rename of a pointer-target function from within it).
-        // Preserve the scroll position across the reload for that view.
-        let keep = (self.view == View::Data).then_some((self.cline, self.top));
+        // Every view recentres on its focus address as it builds, which is right
+        // on first entry and wrong on a *reload*: `reload` means "re-fetch what
+        // I'm looking at", and `focus_addr` still holds the address of whatever
+        // navigation first opened this function. Preserving the position keeps a
+        // comment/tag/retype redraw (`Exit::ReloadView`) — and a `^R` refresh —
+        // on the line being annotated instead of throwing the reader back to the
+        // goto's landing address (issue #23). Explicit navigation re-centres by
+        // calling `load` directly, not through here.
+        let keep = self.keep_position();
         self.load(ctx);
-        if let Some((cline, top)) = keep {
-            let max = self.lines.len().saturating_sub(1);
-            self.cline = cline.min(max);
-            self.top = top.min(self.cline);
-        }
+        self.restore_position(keep);
+    }
+
+    /// The cursor/scroll pair to carry across a reload.
+    fn keep_position(&self) -> (usize, usize) {
+        (self.cline, self.top)
+    }
+
+    /// Put the cursor and scroll back after a reload, clamped to the rebuilt
+    /// listing (the function may have shrunk under us).
+    fn restore_position(&mut self, (cline, top): (usize, usize)) {
+        let max = self.lines.len().saturating_sub(1);
+        self.cline = cline.min(max);
+        self.top = top.min(self.cline);
     }
 
     /// True while the viewer is capturing raw text — composing an ask, editing a
@@ -410,6 +443,16 @@ impl Viewer {
         self.stack_view.is_open()
     }
 
+    /// Show `text` as the entire code pane, with no address column behind it and
+    /// **no second backend read**. Used when the one decompile read came back empty
+    /// or failed: the reader sees that answer, not a retry's.
+    fn show_note(&mut self, ctx: &Ctx, text: String) {
+        self.lines = syntax::tokenize_plain(&text);
+        self.code_addrs = Vec::new();
+        self.finish_linear_load(ctx);
+        self.apply_focus();
+    }
+
     fn load(&mut self, ctx: &Ctx) {
         // Keep the entry-address anchor current whenever the name resolves to a
         // known symbol (see `entry`), so a later reload can recover from a rename.
@@ -427,57 +470,77 @@ impl Viewer {
         }
         // Rebuilt below for the code views; empty means "no address readout".
         self.code_addrs = Vec::new();
-        // Leave CFG state before loading a linear view. An interior-address
-        // navigation resolves to the containing function
-        // via JSON and uses the address-bearing decompile to retain the exact
-        // evidence location without making that address the function identity.
+        // Leave CFG state before loading a linear view.
         self.cfg_graph_view = None;
+        // The decompile view is fetched **once**, with `--addresses`, whether it
+        // was reached by name or by an interior address: `decomp_view_lines`
+        // derives the rendered lines and the address column from that one payload,
+        // so the `code_addrs` alignment invariant holds by construction instead of
+        // reconciling two independent backend reads (issue #18). An interior
+        // address additionally resolves to its containing function, which becomes
+        // the view's identity while `focus_addr` keeps the evidence site.
         if self.view == View::Decomp {
-            if let Some(focus) = self.focus_addr {
-                let identifier = format!("0x{focus:x}");
-                if let Some((name, entry, text)) = ctx.bn.decompile_json(&identifier) {
-                    self.name = ctx.name_by_addr.get(&entry).cloned().unwrap_or(name);
-                    self.entry = (!entry.is_empty()).then_some(entry);
-                    let dec = crate::decomp::dec_lines(&text);
-                    let resolved =
-                        crate::decomp::resolve_stmt_addr(&crate::decomp::line_addrs(&dec), focus);
-                    let line = resolved.and_then(|addr| {
-                        dec.iter()
-                            .position(|candidate| candidate.addr == Some(addr))
-                    });
-                    // This path renders straight from `dec` (below), so addresses
-                    // and lines share one source and are aligned by construction —
-                    // unlike the by-name path, which reconciles two calls in
-                    // `line_addr_column`. See the `code_addrs` invariant.
-                    self.code_addrs = dec.iter().map(|candidate| candidate.addr).collect();
-                    let plain = dec
-                        .into_iter()
-                        .map(|candidate| candidate.text)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    self.lines = syntax::tokenize_c(&plain);
-                    self.finish_linear_load(ctx);
-                    if let Some(line) = line {
-                        self.cline = line;
-                        self.top = line.saturating_sub(3);
-                    }
+            let focus = self.focus_addr;
+            let identifier = match focus {
+                Some(focus) => format!("0x{focus:x}"),
+                None => self.name.clone(),
+            };
+            // Whatever that one read said is what the reader sees. Re-reading on a
+            // failure would pay a timed-out backend's budget twice and could resolve
+            // against different live state — and for an interior focus it would ask
+            // for `self.name` instead of the address that was requested.
+            let read = match ctx.bn.decompile_read(&identifier) {
+                Ok(Some(read)) => read,
+                Ok(None) => {
+                    self.show_note(ctx, format!("(no decompilation for {identifier})"));
                     return;
                 }
+                Err(error) => {
+                    self.show_note(ctx, format!("✗ {error}"));
+                    return;
+                }
+            };
+            if focus.is_some() {
+                self.name = ctx
+                    .name_by_addr
+                    .get(&read.entry)
+                    .cloned()
+                    .unwrap_or(read.name);
+                self.entry = (!read.entry.is_empty()).then_some(read.entry);
             }
+            let dec = decomp_view_lines(&read.text, read.note.as_deref(), &read.warnings);
+            let line = focus.and_then(|focus| {
+                let resolved =
+                    crate::decomp::resolve_stmt_addr(&crate::decomp::line_addrs(&dec), focus);
+                resolved.and_then(|addr| {
+                    dec.iter()
+                        .position(|candidate| candidate.addr == Some(addr))
+                })
+            });
+            self.code_addrs = dec.iter().map(|candidate| candidate.addr).collect();
+            let plain = dec
+                .iter()
+                .map(|candidate| candidate.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.lines = syntax::tokenize_c(&plain);
+            self.finish_linear_load(ctx);
+            if let Some(line) = line {
+                self.cline = line;
+                self.top = line.saturating_sub(3);
+            }
+            return;
         }
         let text = match self.view {
-            View::Decomp => ctx.bn.decompile(&self.name),
             View::Mlil => self.linear_annotated(ctx, View::Mlil.il_level()),
             View::Disasm => self.linear_annotated(ctx, View::Disasm.il_level()),
             View::Xrefs => ctx.bn.xrefs(&self.name),
-            View::Cfg | View::Data => unreachable!("handled above"),
+            // Decomp returns above, out of its single `--addresses` read; there is
+            // deliberately no second text-mode decompile to fall back to.
+            View::Decomp | View::Cfg | View::Data => unreachable!("handled above"),
         };
-        self.lines = if matches!(self.view, View::Decomp) {
-            syntax::tokenize_c(&text)
-        } else {
-            syntax::tokenize_plain(&text)
-        };
-        self.code_addrs = self.line_addr_column(ctx, &text);
+        self.lines = syntax::tokenize_plain(&text);
+        self.code_addrs = self.line_addr_column(&text);
         // Guards the `code_addrs`/`lines` alignment invariant (never longer than
         // the lines it indexes). Debug-only: a violation is a silent-wrong-address
         // bug, not a crash, so we catch it in dev rather than defend in release.
@@ -497,30 +560,13 @@ impl Viewer {
     /// off the same flattened listing that produced the lines — aligned by
     /// construction.
     ///
-    /// Decompile is the subtle case: the *rendered* text (`bn.decompile`)
-    /// intentionally keeps lens-added warnings/notes, while addresses live only
-    /// in the `--addresses` JSON, so the two come from independent calls. They
-    /// stay index-aligned because both enumerate the same function's HLIL source
-    /// lines: `--addresses` only prefixes each line with its address column, and
-    /// `dec_lines` strips that column back off. The rendered text can carry
-    /// *extra trailing* lines (warnings appended after the body), which is why
-    /// `code_addrs` may be shorter — never longer, never offset. The one thing
-    /// that would break this is a line *prepended* to just one side: the `// bn:`
-    /// resolution note is exactly such a prepend, and it appears only on the
-    /// interior-address load path (`focus_addr`), which is why that path builds
-    /// `code_addrs` from its own `dec` rather than calling here.
-    fn line_addr_column(&self, ctx: &Ctx, linear_text: &str) -> Vec<Option<u64>> {
+    /// The decompile view does **not** come through here: it builds its lines and
+    /// its address column together in `load`, out of one `--addresses` read (see
+    /// [`decomp_view_lines`]). It used to be reconciled here from a *second*
+    /// decompile, which is what made the alignment invariant span two non-atomic
+    /// reads on a live instance (issue #18).
+    fn line_addr_column(&self, linear_text: &str) -> Vec<Option<u64>> {
         match self.view {
-            View::Decomp => ctx
-                .bn
-                .decompile_json(&self.name)
-                .map(|(_, _, addr_text)| {
-                    crate::decomp::dec_lines(&addr_text)
-                        .iter()
-                        .map(|line| line.addr)
-                        .collect()
-                })
-                .unwrap_or_default(),
             View::Mlil | View::Disasm => linear_text
                 .lines()
                 .map(|line| {
@@ -1005,4 +1051,153 @@ fn local_type_map(locals: &[LocalVariable]) -> std::collections::HashMap<String,
         .iter()
         .map(|local| (local.name.clone(), local.type_name.clone()))
         .collect()
+}
+
+/// Assemble the decompile view from **one** `bn decompile --addresses` read: the
+/// rendered line and its own address, together, per entry.
+///
+/// The three pieces the CLI's text mode shows are laid out in its order — the
+/// `// bn:` interior-resolution note first, then the pseudo-C body with its
+/// address column stripped ([`crate::decomp::dec_lines`]), then a blank separator
+/// and the `warning: …` lines. Note and warnings are bn's own commentary, not
+/// statements, so they carry no address (`addr: None`) — which is precisely why
+/// they must be added *around* `dec_lines` rather than fed through it: the note is
+/// a prepend, and a prepend applied to only one of the two sides is exactly the
+/// silent off-by-one that made the old two-read path fragile (issue #18).
+///
+/// The result is the single source for both `lines` and `code_addrs`, so the
+/// alignment invariant on [`Viewer::code_addrs`] holds by construction.
+fn decomp_view_lines(
+    addr_text: &str,
+    note: Option<&str>,
+    warnings: &[String],
+) -> Vec<crate::decomp::DecLine> {
+    use crate::decomp::DecLine;
+    let body = crate::decomp::dec_lines(addr_text);
+    let mut rows = Vec::with_capacity(body.len() + warnings.len() + 2);
+    if let Some(note) = note {
+        rows.push(DecLine {
+            addr: None,
+            text: note.to_string(),
+        });
+    }
+    rows.extend(body);
+    if !warnings.is_empty() {
+        rows.push(DecLine {
+            addr: None,
+            text: String::new(),
+        });
+        rows.extend(warnings.iter().map(|warning| DecLine {
+            addr: None,
+            text: warning.clone(),
+        }));
+    }
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decomp_view_lines, View, Viewer};
+
+    // A mock `bn decompile --addresses` body: 8-hex address column, an 8-space
+    // base gap, +4 per nesting level. Matches the shape `dec_lines` parses.
+    const DEC: &str = "\
+00401200        int32_t parse_hdr(void* buf, size_t len)
+00401200        {
+00401214            uint32_t magic = *(uint32_t*)buf;
+
+00401220            if (magic != 0x4d475a)
+00401228                return -1;
+00401234            memcpy(&hdr, buf, len);
+00401200        }";
+
+    /// #18: one payload in, aligned (lines, addresses) out — including the two
+    /// address-less shapes the old two-read path only survived by luck.
+    #[test]
+    fn one_addresses_payload_yields_aligned_lines_and_addrs() {
+        let warnings = vec!["warning: analysis stub — body may be incomplete".to_string()];
+        let note = "// bn: 0x401228 is inside parse_hdr @ 0x401200 (+0x28); showing the containing function";
+        let dec = decomp_view_lines(DEC, Some(note), &warnings);
+
+        // The note leads, address-less, and does not de-indent the body with it.
+        assert_eq!(dec[0].addr, None);
+        assert!(dec[0].text.starts_with("// bn:"));
+        assert_eq!(dec[1].text, "int32_t parse_hdr(void* buf, size_t len)");
+        assert_eq!(dec[1].addr, Some(0x401200));
+        assert_eq!(dec[6].text, "        return -1;");
+        assert_eq!(dec[6].addr, Some(0x401228));
+
+        // The warning block trails, address-less, after a blank separator.
+        assert_eq!(
+            dec[dec.len() - 2],
+            crate::decomp::DecLine {
+                addr: None,
+                text: String::new()
+            }
+        );
+        assert_eq!(dec.last().unwrap().addr, None);
+        assert_eq!(dec.last().unwrap().text, warnings[0]);
+
+        // The invariant: rendering and indexing the SAME list keeps every line's
+        // address on that line. `tokenize_c` splits on '\n' 1:1, so the two are
+        // equal length — not merely "addrs no longer than lines".
+        let plain = dec
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = crate::syntax::tokenize_c(&plain);
+        let addrs: Vec<Option<u64>> = dec.iter().map(|line| line.addr).collect();
+        assert_eq!(addrs.len(), lines.len());
+        // Spot-check the alignment end to end: the `memcpy` statement's address
+        // is the entry at the index that renders it.
+        let memcpy = lines
+            .iter()
+            .position(|segments| segments.iter().any(|s| s.text == "memcpy"))
+            .expect("the mock body has a memcpy line");
+        assert_eq!(addrs[memcpy], Some(0x401234));
+
+        // Sentinel for the shape that used to break: the old path rendered the
+        // note-prefixed text from one read and took its address column from a
+        // *separate* `dec_lines`, which drops the note — one line of silent
+        // offset, so every line reported the address of the statement *below* it.
+        // A `;` on `return -1;` would then have commented the memcpy.
+        let unnoted: Vec<Option<u64>> = crate::decomp::dec_lines(DEC)
+            .iter()
+            .map(|line| line.addr)
+            .collect();
+        let ret = memcpy - 1;
+        assert_eq!(addrs[ret], Some(0x401228));
+        assert_eq!(unnoted[ret], Some(0x401234));
+    }
+
+    /// The common case — a by-name read with nothing to annotate — must not gain
+    /// a leading or trailing line.
+    #[test]
+    fn a_bare_payload_gains_no_extra_lines() {
+        let dec = decomp_view_lines(DEC, None, &[]);
+        assert_eq!(dec.len(), DEC.lines().count());
+        assert_eq!(dec[0].addr, Some(0x401200));
+        assert_eq!(dec.last().unwrap().text, "}");
+    }
+
+    /// #23: a reload (comment/tag/retype redraw, `^R`) keeps the reading position
+    /// in a code view — it used to be preserved only for `View::Data`, so every
+    /// annotation snapped the cursor back to the goto's landing address.
+    #[test]
+    fn reload_keeps_the_cursor_position_in_a_code_view() {
+        let mut viewer = Viewer::blank("parse_hdr".into(), true);
+        viewer.view = View::Decomp;
+        viewer.lines = vec![Vec::new(); 82];
+        viewer.cline = 64;
+        viewer.top = 61;
+        let keep = viewer.keep_position();
+        assert_eq!(keep, (64, 61));
+
+        // A shorter listing after the reload clamps instead of pointing past the end.
+        viewer.lines = vec![Vec::new(); 12];
+        viewer.restore_position(keep);
+        assert_eq!(viewer.cline, 11);
+        assert_eq!(viewer.top, 11);
+    }
 }
