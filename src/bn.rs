@@ -49,9 +49,20 @@ fn expand_home(p: &str) -> String {
 /// Reads and writes go over the bridge socket ([`crate::bnsock`]) whenever one
 /// could be resolved, which removes the ~127 ms Python startup each CLI spawn
 /// costs (`DESIGN_BN_INTERFACE.md` §2). The `bn` CLI is retained as a fallback for
-/// the case where no live registry could be read — an unreadable cache dir or a
-/// bridge that registered after we resolved — so the lens degrades to its previous
-/// behavior instead of failing outright.
+/// three cases, so the lens degrades to its previous behavior instead of failing
+/// outright:
+///
+/// 1. no live registry could be read (an unreadable cache dir, or a bridge that
+///    registered after we resolved);
+/// 2. the resolution was ambiguous — several live bridges and no named instance
+///    (see `resolve_client`);
+/// 3. the live bridge is older than the op we want (`read_op` / `mutation_op`
+///    detect that and only then re-run over the CLI).
+///
+/// Case 3 is not hypothetical: [`Bn::cfg`], [`Bn::data_vars`] and [`Bn::data_symbols`]
+/// name read-locked ops that the bridge does not register (checked against its
+/// `op_registry`), so in practice those three still run their legacy `py exec`
+/// program — which takes the bridge's *exclusive* lock (see [`Bn::py_json`]).
 #[derive(Clone)]
 pub struct Bn {
     pub bin: String,
@@ -204,6 +215,13 @@ struct FunctionItemJson {
 pub struct LocalVariable {
     #[serde(default)]
     pub local_id: String,
+    // `#[serde(default)]` for the reason `TagItemJson` documents below: without it
+    // ONE element missing `name` aborts the whole `Vec`, and `local_list`
+    // `unwrap_or_default()`s that error into an empty locals list — no `Local`
+    // hotspots, `n` on a variable silently renaming the *function* instead, `S`
+    // claiming no stack variables were recovered, and nothing for the retype
+    // composer to target. `recovered_locals` drops the nameless element instead.
+    #[serde(default)]
     pub name: String,
     #[serde(rename = "type", default)]
     pub type_name: String,
@@ -249,6 +267,26 @@ struct DecompiledFn {
     text: String,
     #[serde(default)]
     function: FnRef,
+}
+
+/// One `bn decompile --addresses` result, split into the pieces a caller needs to
+/// render it *and* index it by address — see [`Bn::decompile_read`].
+pub struct DecompileRead {
+    /// The resolved function's name as bn reports it (an interior address
+    /// resolves to its containing function).
+    pub name: String,
+    /// The resolved function's entry address (`0x…`), possibly empty.
+    pub entry: String,
+    /// Address-prefixed pseudo-C: every real line led by its 8-hex address
+    /// column (parse with [`crate::decomp::dec_lines`]).
+    pub text: String,
+    /// The `// bn: …` interior-resolution note, without its trailing newline.
+    /// `None` for an exact-start or by-name read (the common case).
+    pub note: Option<String>,
+    /// `warning: …` lines the CLI's text mode appends below the body — the
+    /// thunk/veneer disclosure, the analysis-stub warning, the pseudo-C
+    /// degradation notice. Load-bearing on a live target; never dropped.
+    pub warnings: Vec<String>,
 }
 
 /// A function's existing comments, split by where BN stores them: its dedicated
@@ -494,9 +532,17 @@ struct DataMapJson {
     vars: Vec<DataVar>,
 }
 
+// Both fields carry `#[serde(default)]` for the same reason as `LocalVariable.name`:
+// one element short an address or a name would otherwise abort the whole `Vec`, and
+// `data_symbols` flattens that to an empty map — renamed globals stop being hotspots,
+// so `w`/`b` skip them and `p`/`x` can't target them, which is precisely the
+// regression this read exists to prevent (`ctx.rs`). `recovered_data_syms` drops the
+// incomplete element instead of the list.
 #[derive(Deserialize)]
 struct DataSym {
+    #[serde(default)]
     a: String,
+    #[serde(default)]
     n: String,
 }
 
@@ -694,6 +740,24 @@ struct PreviewResultJson {
     message: Option<String>,
 }
 
+/// The type layouts a `types declare --preview` would define. Shared by the socket
+/// and CLI paths so both read the same field off the same payload.
+fn preview_layouts(payload: PreviewPayload) -> Vec<TypeLayout> {
+    payload
+        .affected_types
+        .into_iter()
+        .map(|affected| TypeLayout {
+            name: affected.name,
+            layout: affected.after_layout,
+        })
+        .collect()
+}
+
+/// The first parser error a rejected `types declare --preview` reported.
+fn preview_error(payload: PreviewPayload) -> Option<String> {
+    payload.results.into_iter().find_map(|result| result.message)
+}
+
 /// A `--summary` mutation payload's fields we consume for `types declare`.
 #[derive(Deserialize)]
 struct MutationSummaryJson {
@@ -705,16 +769,83 @@ struct MutationSummaryJson {
     first_error: Option<String>,
 }
 
-/// A unique temp path for a `--out` capture (`bn-lens-<pid>-<seq>.out`), so
-/// concurrent/sequential captures never share a file (see [`Bn::run_out`]).
+/// 8 bytes of unguessable name material for the capture directory, so the path an
+/// attacker would have to pre-create (or symlink) cannot be derived from anything
+/// they can observe. The clock is only a fallback for a sandbox with no
+/// `/dev/urandom`; it still yields a fresh name per process.
+fn capture_nonce() -> u64 {
+    use std::io::Read;
+    let mut bytes = [0u8; 8];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut urandom| urandom.read_exact(&mut bytes))
+        .is_ok()
+    {
+        return u64::from_le_bytes(bytes);
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// The private per-process directory holding `--out` captures, or `None` if one
+/// could not be created.
+///
+/// A capture holds decompiled output of the target under audit — exactly the class
+/// this repo's disclosure policy covers — and the old scheme wrote it straight into
+/// the shared temp dir under a name derivable from `(pid, call ordinal)`, created by
+/// the *child* with no `O_EXCL`. A local attacker could pre-create or symlink that
+/// path and either read the capture or redirect the write.
+///
+/// Two properties close that off, and both matter:
+/// * `mode(0o700)` — nobody else can open a file inside, whatever its name;
+/// * `create` is **non-recursive**, so it fails with `AlreadyExists` rather than
+///   adopting a path that already exists. A success therefore *proves* this process
+///   made the directory and no one else holds a descriptor on it.
+///
+/// `TMPDIR` is still honoured, because `env::temp_dir()` reads it.
+fn capture_dir() -> Option<&'static PathBuf> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        use std::os::unix::fs::DirBuilderExt;
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        // Retry on a fresh nonce: the only realistic loser here is a collision, and
+        // re-deriving the name is cheaper than failing the read.
+        (0..8).find_map(|_| {
+            let candidate = base.join(format!("bn-lens-{pid}-{:016x}", capture_nonce()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&candidate)
+                .ok()
+                .map(|()| candidate)
+            })
+    })
+    .as_ref()
+}
+
+/// A unique temp path for a `--out` capture, so concurrent/sequential captures never
+/// share a file (see [`Bn::run_out`]).
+///
+/// Normally `<capture dir>/<seq>.out` inside the 0700 directory above. If that
+/// directory could not be created at all we fall back to the shared temp dir, but
+/// with the nonce moved into the *file* name — an unguessable name still denies the
+/// pre-creation/symlink race, which is the attack; it just can't also deny a reader
+/// who already knows the name.
 fn unique_tmp() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir()
-        .join(format!("bn-lens-{}-{seq}.out", std::process::id()))
-        .to_string_lossy()
-        .into_owned()
+    match capture_dir() {
+        Some(dir) => dir.join(format!("{seq}.out")),
+        None => std::env::temp_dir().join(format!(
+            "bn-lens-{}-{:016x}-{seq}.out",
+            std::process::id(),
+            capture_nonce()
+        )),
+    }
+    .to_string_lossy()
+    .into_owned()
 }
 
 /// Whether a `--summary` mutation payload reports success. The summary is a JSON
@@ -771,10 +902,167 @@ fn types_page(page: TypesJson) -> (Vec<TypeItem>, bool) {
     (items, page.has_more)
 }
 
+/// Locals from one `list_locals` / `local list` payload, dropping any element that
+/// came back without a name.
+///
+/// A nameless local is unusable — every consumer keys on the name or the stable id —
+/// but it must cost only *itself*. Before `LocalVariable.name` carried
+/// `#[serde(default)]` it cost the entire list; keeping the filter here means the
+/// default can never quietly promote a junk element into a rename target.
+fn recovered_locals(listing: LocalListJson) -> Vec<LocalVariable> {
+    listing
+        .locals
+        .into_iter()
+        .filter(|local| !local.name.is_empty())
+        .collect()
+}
+
 fn parse_local_list_json(text: &str) -> Vec<LocalVariable> {
     serde_json::from_str::<LocalListJson>(text)
-        .map(|listing| listing.locals)
+        .map(recovered_locals)
         .unwrap_or_default()
+}
+
+/// `(address, name)` pairs from one `data_symbols` payload, dropping any element
+/// missing either half — see the note on [`DataSym`].
+fn recovered_data_syms(payload: DataSymsJson) -> Vec<(String, String)> {
+    payload
+        .syms
+        .into_iter()
+        .filter(|sym| !sym.a.is_empty() && !sym.n.is_empty())
+        .map(|sym| (sym.a, sym.n))
+        .collect()
+}
+
+/// Build a `bn` subcommand argv with an explicit `--` end-of-options separator.
+///
+/// `verb` is the trusted subcommand plus any flags; `positionals` are **untrusted** —
+/// anything derived from the binary (function/type/class names, addresses) *and*
+/// anything the user typed (comment bodies, tag notes, type declarations). Without
+/// the separator `bn`'s argparse reads a dash-leading operand as a flag: `bn comment
+/// set 0x401000 -wip` dies with "the following arguments are required: text" and
+/// [`mutation_ok`] reports a bare failure with no hint why. A comment opening with a
+/// dash is ordinary prose, so this is a correctness bug long before it is a security
+/// one — and it is only correctness: there is no shell (`Command::new` + `args`).
+///
+/// Flags therefore go in `verb`, **before** the separator: after `--`, argparse would
+/// take `--summary` as a positional too.
+///
+/// A dash-leading *flag value* is a different argparse failure ("expected one
+/// argument") that `--` cannot fix; use [`flag_eq`] for those.
+fn cli_argv<'a>(verb: &[&'a str], positionals: &[&'a str]) -> Vec<&'a str> {
+    let mut argv = verb.to_vec();
+    if !positionals.is_empty() {
+        argv.push("--");
+        argv.extend_from_slice(positionals);
+    }
+    argv
+}
+
+/// `--flag=value`, the only form argparse accepts for a value that starts with a
+/// dash (a tag note like `-> see parse_hdr` is rejected as `--data <note>`).
+fn flag_eq(flag: &str, value: &str) -> String {
+    format!("{flag}={value}")
+}
+
+/// Splice bn's own `--out <path>` capture flag into `args` **ahead of** any `--`
+/// separator [`cli_argv`] inserted.
+///
+/// Appending it is what the code did before there was a separator, and doing so now
+/// would be silently wrong: argparse stops parsing options at `--`, so bn's own
+/// `--out` and the path would arrive as two stray positionals and every large read
+/// would fail. Nothing to splice past when there is no separator — the flag lands at
+/// the end, exactly as before.
+fn with_capture(args: &[&str], out: &str) -> Vec<String> {
+    let at = args.iter().position(|arg| *arg == "--").unwrap_or(args.len());
+    let mut argv: Vec<String> = args[..at].iter().map(|arg| (*arg).to_string()).collect();
+    argv.push("--out".into());
+    argv.push(out.to_string());
+    argv.extend(args[at..].iter().map(|arg| (*arg).to_string()));
+    argv
+}
+
+/// Statuses `bn`'s CLI counts as a failed mutation row (`formatters.py:14`).
+const FAILED_MUTATION_STATUSES: [&str; 5] = [
+    "unsupported",
+    "verification_failed",
+    "invalid_request",
+    "rollback_failed",
+    "internal_error",
+];
+
+/// The `--summary` fields the lens consumes, recomputed from a **raw** socket
+/// mutation result.
+///
+/// `--summary` is a pure CLI-side collapse (`formatters.py::_mutation_summary`) — the
+/// bridge always returns the full result — so a write that goes over the socket has
+/// to derive the same verdict here or it would read a different outcome than the same
+/// write through the CLI.
+///
+/// `success` is deliberately verification-aware, matching the CLI exactly: the
+/// bridge's own `success` **and** no row in [`FAILED_MUTATION_STATUSES`]. Reading
+/// `success` alone would report a rolled-back, verification-failed write as a
+/// successful one — the lens would then retext a rename that never landed.
+#[derive(Default)]
+struct MutationOutcome {
+    success: bool,
+    /// Rows that changed state *and* verified — the CLI's `changed_count`.
+    changed_count: u64,
+    first_error: Option<String>,
+}
+
+fn mutation_outcome(value: &serde_json::Value) -> MutationOutcome {
+    let no_rows = Vec::new();
+    let rows = value
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&no_rows);
+    let status = |row: &serde_json::Value| {
+        row.get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let failed = rows
+        .iter()
+        .find(|row| FAILED_MUTATION_STATUSES.contains(&status(row).as_str()));
+    // Fail closed on a missing or non-boolean `success`. The CLI defaults it to true
+    // for *presentation*, but as a write acknowledgement that default is unsafe: a
+    // schema change or a malformed empty result would be promoted to a committed
+    // write, and the lens would report — and locally retext — a rename that no field
+    // says landed. Verification-awareness still applies on top (the CLI's rule).
+    let reported = value.get("success").and_then(serde_json::Value::as_bool);
+    let success = reported == Some(true) && failed.is_none();
+    let changed_count = rows.iter().filter(|row| status(row) == "verified").count() as u64;
+    let first_error = (!success).then(|| {
+        failed
+            .and_then(|row| {
+                row.get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| Some(status(row)).filter(|s| !s.is_empty()))
+            })
+            // A failure can carry its only explanation top-level — e.g. a revert that
+            // failed *after* every op verified, so no row is in the failed set.
+            .or_else(|| {
+                value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| match reported {
+                // Nothing in the payload says the write committed. Naming that
+                // specifically matters: it is a bridge/schema problem, not a
+                // rejected mutation, and retrying the same write will not fix it.
+                None => "bn did not report whether the write committed".into(),
+                Some(_) => "mutation failed".into(),
+            })
+    });
+    MutationOutcome {
+        success,
+        changed_count,
+        first_error,
+    }
 }
 
 /// Push a [`Mark`] from optional JSON fields, keeping it if it has *either* an
@@ -1031,8 +1319,7 @@ impl Bn {
         let tmp = unique_tmp();
         let output = self
             .cmd()
-            .args(args)
-            .args(["--out", &tmp])
+            .args(with_capture(args, &tmp))
             .output()
             .map_err(|error| {
                 let message = format!("could not start bn: {error}");
@@ -1468,7 +1755,11 @@ impl Bn {
 
     /// `bn types show <name>` -> the rendered layout (struct fields + offsets).
     pub fn type_show(&self, name: &str) -> Vec<String> {
-        let out = self.run_out(&["types", "show", name]);
+        let out = match self.op_raw("type_info", serde_json::json!({"type_name": name})) {
+            Some(Ok(value)) => render_type_info(&value).unwrap_or_default(),
+            Some(Err(error)) => format!("✗ {error}"),
+            None => self.run_out(&cli_argv(&["types", "show"], &[name])),
+        };
         let lines: Vec<String> = out.lines().map(str::to_string).collect();
         if lines.is_empty() {
             vec![format!("(no layout for {name})")]
@@ -1480,24 +1771,39 @@ impl Bn {
     /// Validate a C declaration without committing (`types declare --preview`):
     /// the resulting type layouts, or the parser error.
     pub fn type_declare_check(&self, decl: &str) -> TypeCheck {
-        let out = self.run_out(&["types", "declare", "--preview", "--format", "json", decl]);
+        if let Some(result) = self.op_raw(
+            "types_declare",
+            serde_json::json!({"declaration": decl, "preview": true}),
+        ) {
+            // `types_declare` is write-locked even under `preview: true` — the bridge
+            // applies, diffs, then reverts — so this deliberately goes through the
+            // same op, not a read.
+            return match result {
+                Err(error) => TypeCheck::Err(clean_err(&error)),
+                Ok(value) => {
+                    let outcome = mutation_outcome(&value);
+                    // `ok` is added by the CLI, not the bridge (`_add_mutation_ok`), so
+                    // recompute it rather than reading a field that is never present.
+                    match serde_json::from_value::<PreviewPayload>(value) {
+                        Ok(payload) if outcome.success => TypeCheck::Ok(preview_layouts(payload)),
+                        Ok(payload) => TypeCheck::Err(clean_err(
+                            &preview_error(payload)
+                                .or(outcome.first_error)
+                                .unwrap_or_else(|| "declaration rejected".into()),
+                        )),
+                        Err(_) => TypeCheck::Err("no response from bn".into()),
+                    }
+                }
+            };
+        }
+        let out = self.run_out(&cli_argv(
+            &["types", "declare", "--preview", "--format", "json"],
+            &[decl],
+        ));
         match serde_json::from_str::<PreviewPayload>(out.trim()) {
-            Ok(payload) if payload.ok => TypeCheck::Ok(
-                payload
-                    .affected_types
-                    .into_iter()
-                    .map(|a| TypeLayout {
-                        name: a.name,
-                        layout: a.after_layout,
-                    })
-                    .collect(),
-            ),
+            Ok(payload) if payload.ok => TypeCheck::Ok(preview_layouts(payload)),
             Ok(payload) => TypeCheck::Err(clean_err(
-                &payload
-                    .results
-                    .into_iter()
-                    .find_map(|r| r.message)
-                    .unwrap_or_else(|| "declaration rejected".into()),
+                &preview_error(payload).unwrap_or_else(|| "declaration rejected".into()),
             )),
             Err(_) => TypeCheck::Err("no response from bn".into()),
         }
@@ -1507,7 +1813,22 @@ impl Bn {
     /// instance, like every other write — not persisted until an explicit
     /// `bn save`. Returns the count of defined types, or the parser error.
     pub fn type_declare(&self, decl: &str) -> Result<u64, String> {
-        let out = self.run_out(&["types", "declare", "--summary", "--format", "json", decl]);
+        if let Some(result) =
+            self.mutation_op("types_declare", serde_json::json!({"declaration": decl}))
+        {
+            return match result {
+                Ok(outcome) if outcome.success => Ok(outcome.changed_count),
+                Ok(outcome) => Err(outcome
+                    .first_error
+                    .map(|error| clean_err(&error))
+                    .unwrap_or_else(|| "declaration failed".into())),
+                Err(error) => Err(clean_err(&error)),
+            };
+        }
+        let out = self.run_out(&cli_argv(
+            &["types", "declare", "--summary", "--format", "json"],
+            &[decl],
+        ));
         match serde_json::from_str::<MutationSummaryJson>(out.trim()) {
             Ok(summary) if summary.success => Ok(summary.changed_count),
             Ok(summary) => Err(summary
@@ -1564,8 +1885,20 @@ impl Bn {
         Ok(all)
     }
 
+    /// `bn class show <name>` -> the rendered class evidence.
     pub fn class_show(&self, name: &str) -> Vec<String> {
-        match self.run_out_checked(&["class", "show", name]) {
+        if let Some(result) = self.op_raw("class_show", serde_json::json!({"name": name})) {
+            return match result {
+                Ok(value) => match render_class_show(&value) {
+                    text if text.trim().is_empty() => {
+                        vec![format!("(no class evidence for {name})")]
+                    }
+                    text => text.lines().map(str::to_string).collect(),
+                },
+                Err(error) => vec![format!("✗ {error}")],
+            };
+        }
+        match self.run_out_checked(&cli_argv(&["class", "show"], &[name])) {
             Ok(out) if !out.trim().is_empty() => out.lines().map(str::to_string).collect(),
             Ok(_) => vec![format!("(no class evidence for {name})")],
             Err(error) => vec![format!("✗ {error}")],
@@ -1676,6 +2009,51 @@ impl Bn {
         }
     }
 
+    /// [`Self::read_op`] returning the raw `result` value instead of a deserialized
+    /// struct — for the calls the lens re-renders into the CLI's text form, and for
+    /// `types_declare --preview`, whose payload it reads field-by-field.
+    ///
+    /// Keeps `read_op`'s contract: `None` only for "this bridge does not register the
+    /// op", never for a call that ran and failed.
+    fn op_raw(
+        &self,
+        op: &str,
+        params: serde_json::Value,
+    ) -> Option<Result<serde_json::Value, String>> {
+        match self.call_local(op, params)? {
+            Err(error) if is_unknown_op(&error) => None,
+            other => Some(other),
+        }
+    }
+
+    /// [`Self::read_op`] for a **write**-locked mutation op: `None` means this bridge
+    /// does not register the op (fall back to the CLI), `Some` means it ran.
+    ///
+    /// The unknown-op distinction matters more here than on a read. Falling back after
+    /// a *genuine* failure would re-issue the write over the CLI, and a mutation that
+    /// partially applied before failing would then be applied twice — so only the
+    /// "this bridge never had the op" answer may retry.
+    fn mutation_op(
+        &self,
+        op: &str,
+        params: serde_json::Value,
+    ) -> Option<Result<MutationOutcome, String>> {
+        match self.call_local(op, params)? {
+            Ok(value) => Some(Ok(mutation_outcome(&value))),
+            Err(error) if is_unknown_op(&error) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+
+    /// A write whose only caller-visible result is "did it commit". `None` when there
+    /// is no socket path for it and the caller must spawn the CLI.
+    fn wrote(&self, op: &str, params: serde_json::Value) -> Option<bool> {
+        Some(match self.mutation_op(op, params)? {
+            Ok(outcome) => outcome.success,
+            Err(_) => false,
+        })
+    }
+
     /// Run a legacy `py exec` program and parse the JSON it printed.
     ///
     /// WARNING: `py_exec` is registered `lock="write"`, so this takes the bridge's
@@ -1717,12 +2095,10 @@ impl Bn {
     /// the lens degrades to exports + `data_<hex>` recognition.
     pub fn data_symbols(&self) -> Vec<(String, String)> {
         if let Some(syms) = self.read_op::<DataSymsJson>("data_symbols", serde_json::json!({})) {
-            return syms
-                .map(|d| d.syms.into_iter().map(|s| (s.a, s.n)).collect())
-                .unwrap_or_default();
+            return syms.map(recovered_data_syms).unwrap_or_default();
         }
         self.py_json::<DataSymsJson>(DATA_SYMBOLS_PROGRAM)
-            .map(|d| d.syms.into_iter().map(|s| (s.a, s.n)).collect())
+            .map(recovered_data_syms)
             .unwrap_or_default()
     }
 
@@ -1742,27 +2118,6 @@ impl Bn {
         Ok((addr, data))
     }
 
-    /// Decompile via `--out` (avoids the stdout spill envelope for big funcs).
-    pub fn decompile(&self, name: &str) -> String {
-        if let Some(result) =
-            self.call_local("decompile", serde_json::json!({"identifier": name}))
-        {
-            return match result {
-                Ok(value) => match decompile_render(&value) {
-                    text if text.trim().is_empty() => "(no output)".into(),
-                    text => text,
-                },
-                Err(error) => format!("✗ {error}"),
-            };
-        }
-        let out = self.run_out(&["decompile", name]);
-        if out.trim().is_empty() {
-            "(no output)".into()
-        } else {
-            out
-        }
-    }
-
     /// Decompile with each pseudo-C line prefixed by its 8-hex address column
     /// (`bn decompile --addresses`), via `--out`. Lets a caller map a use
     /// address back to the statement it belongs to.
@@ -1776,7 +2131,7 @@ impl Bn {
                 Err(error) => format!("✗ {error}"),
             };
         }
-        self.run_out(&["decompile", name, "--addresses"])
+        self.run_out(&cli_argv(&["decompile", "--addresses"], &[name]))
     }
 
     /// Decompile `id` — a function name or any *interior* address (bn resolves
@@ -1792,7 +2147,10 @@ impl Bn {
             return (!parsed.text.is_empty())
                 .then(|| (parsed.function.name, parsed.function.address, parsed.text));
         }
-        let out = self.run_out(&["decompile", id, "--addresses", "--format", "json"]);
+        let out = self.run_out(&cli_argv(
+            &["decompile", "--addresses", "--format", "json"],
+            &[id],
+        ));
         let parsed: DecompiledFn = serde_json::from_str(&out).ok()?;
         if parsed.text.is_empty() {
             None
@@ -1801,12 +2159,68 @@ impl Bn {
         }
     }
 
+    /// One `decompile --addresses` read carrying *everything* the CLI's text mode
+    /// reconstructs around the body — the interior-resolution note and the
+    /// `warnings[]` entries — alongside the address-prefixed pseudo-C.
+    ///
+    /// This exists so a caller can derive both the rendered lines and the
+    /// per-line address column from a **single** backend read: the viewer used to
+    /// issue one plain `decompile` for the text and a second `--addresses`
+    /// decompile for the addresses, and reconciled the two by index. On a live
+    /// instance a concurrent rename/retype between the two reads shifted the line
+    /// set and every address readout with it (issue #18).
+    /// `Err` is the failure itself (bridge error, timeout, undecodable payload) and
+    /// `Ok(None)` is a backend answer with no body. Both are terminal on purpose:
+    /// flattening them to `None` let the caller retry with a *second* full
+    /// decompile, so a timed-out backend paid the budget twice, and the retry could
+    /// observe different live state — or, for an interior focus, ask for a name
+    /// instead of the address that was actually requested.
+    pub fn decompile_read(&self, id: &str) -> Result<Option<DecompileRead>, String> {
+        let value = match self.call_local(
+            "decompile",
+            serde_json::json!({"identifier": id, "addresses": true}),
+        ) {
+            Some(result) => result?,
+            None => {
+                // `id` is untrusted (a BN symbol name can lead with a dash), so it
+                // rides as an operand past `--` like every other CLI read.
+                let out = self.run_out_checked(&cli_argv(
+                    &["decompile", "--addresses", "--format", "json"],
+                    &[id],
+                ))?;
+                serde_json::from_str(&out)
+                    .map_err(|error| format!("bn decompile returned invalid JSON: {error}"))?
+            }
+        };
+        let parsed: DecompiledFn = self.decode(value.clone(), "decompile")?;
+        if parsed.text.is_empty() {
+            return Ok(None);
+        }
+        let note = resolution_note(&value);
+        Ok(Some(DecompileRead {
+            name: parsed.function.name,
+            entry: parsed.function.address,
+            text: parsed.text,
+            note: (!note.is_empty()).then(|| note.trim_end().to_string()),
+            warnings: warning_lines(&value),
+        }))
+    }
+
     /// `n` instructions in address-linear order starting *exactly* at `addr`
     /// (unlike `--count`, which slices from the containing function's start).
     /// Used to show the single instruction at an xref callsite.
     pub fn disasm_linear(&self, addr: &str, n: usize) -> String {
+        if let Some(result) = self.op_raw(
+            "disasm",
+            serde_json::json!({"identifier": addr, "linear": n}),
+        ) {
+            return match result {
+                Ok(value) => render_disasm_linear(&value),
+                Err(error) => format!("✗ {error}"),
+            };
+        }
         let count = n.to_string();
-        self.run(&["disasm", addr, "--linear", &count])
+        self.run(&cli_argv(&["disasm", "--linear", &count], &[addr]))
     }
 
     /// Xrefs (small; stdout is fine).
@@ -1816,7 +2230,13 @@ impl Bn {
     }
 
     pub fn xrefs_checked(&self, name: &str) -> Result<String, String> {
-        let s = self.run_out_checked(&["xrefs", name])?;
+        // The hottest read in the lens: `usage::report` pairs one of these with up to
+        // MAX_SITES `disasm_linear` calls, so on the CLI a single `p` peek paid over a
+        // second in interpreter startup alone.
+        let s = match self.op_raw("xrefs", serde_json::json!({"identifier": name})) {
+            Some(result) => render_xrefs(&result?),
+            None => self.run_out_checked(&cli_argv(&["xrefs"], &[name]))?,
+        };
         if s.trim().is_empty() {
             Ok("(no xrefs)".into())
         } else {
@@ -1946,10 +2366,10 @@ impl Bn {
             return result
                 .ok()
                 .and_then(|value| serde_json::from_value::<LocalListJson>(value).ok())
-                .map(|listing| listing.locals)
+                .map(recovered_locals)
                 .unwrap_or_default();
         }
-        let out = self.run_out(&["local", "list", func, "--format", "json"]);
+        let out = self.run_out(&cli_argv(&["local", "list", "--format", "json"], &[func]));
         parse_local_list_json(&out)
     }
 
@@ -1957,14 +2377,32 @@ impl Bn {
     /// write. Mutates the live instance in-memory; persistence to the on-disk
     /// `.bndb` is a separate, deliberate `bn save` (not done per-rename).
     pub fn local_rename(&self, func: &str, old: &str, new: &str) -> bool {
-        let out = self.run(&["local", "rename", func, old, new, "--summary"]);
+        if let Some(committed) = self.wrote(
+            "local_rename",
+            serde_json::json!({"function": func, "variable": old, "new_name": new}),
+        ) {
+            return committed;
+        }
+        let out = self.run(&cli_argv(
+            &["local", "rename", "--summary"],
+            &[func, old, new],
+        ));
         mutation_ok(&out)
     }
 
     /// Retype a local (`bn local retype`). Live in-memory; not persisted until a
     /// deliberate `bn save`. Returns whether it committed.
     pub fn local_retype(&self, func: &str, var: &str, new_type: &str) -> bool {
-        let out = self.run(&["local", "retype", func, var, new_type, "--summary"]);
+        if let Some(committed) = self.wrote(
+            "local_retype",
+            serde_json::json!({"function": func, "variable": var, "new_type": new_type}),
+        ) {
+            return committed;
+        }
+        let out = self.run(&cli_argv(
+            &["local", "retype", "--summary"],
+            &[func, var, new_type],
+        ));
         mutation_ok(&out)
     }
 
@@ -1972,17 +2410,26 @@ impl Bn {
     /// `Ok(())` if the type parses and applies cleanly, else the parser error —
     /// so the composer can confirm a change before it touches the instance.
     pub fn local_retype_check(&self, func: &str, var: &str, new_type: &str) -> Result<(), String> {
+        if let Some(result) = self.mutation_op(
+            "local_retype",
+            serde_json::json!({
+                "function": func, "variable": var, "new_type": new_type, "preview": true
+            }),
+        ) {
+            return match result {
+                Ok(outcome) if outcome.success => Ok(()),
+                Ok(outcome) => Err(clean_err(
+                    &outcome.first_error.unwrap_or_else(|| "type rejected".into()),
+                )),
+                Err(error) => Err(clean_err(&error)),
+            };
+        }
         // stdout carries the `--summary` JSON (with `first_error`) even when a
         // bad type makes bn exit non-zero, so read it regardless of exit status.
-        let out = self.run_stdout(&[
-            "local",
-            "retype",
-            func,
-            var,
-            new_type,
-            "--preview",
-            "--summary",
-        ]);
+        let out = self.run_stdout(&cli_argv(
+            &["local", "retype", "--preview", "--summary"],
+            &[func, var, new_type],
+        ));
         for line in out.lines() {
             if let Ok(summary) = serde_json::from_str::<MutationSummaryJson>(line.trim()) {
                 return if summary.success {
@@ -2002,21 +2449,46 @@ impl Bn {
     /// Rename a function symbol (`ident` = name or address). Live in-memory,
     /// like [`local_rename`]; not persisted until a deliberate `bn save`.
     pub fn symbol_rename(&self, ident: &str, new: &str) -> bool {
-        let out = self.run(&["rename", ident, new, "--kind", "function", "--summary"]);
+        if let Some(committed) = self.wrote(
+            "rename_symbol",
+            serde_json::json!({"identifier": ident, "new_name": new, "kind": "function"}),
+        ) {
+            return committed;
+        }
+        let out = self.run(&cli_argv(
+            &["rename", "--kind", "function", "--summary"],
+            &[ident, new],
+        ));
         mutation_ok(&out)
     }
 
     /// Set an address comment (the note shown on that line).
     pub fn comment_set_addr(&self, addr: &str, text: &str) -> bool {
-        let out = self.run(&["comment", "set", addr, text, "--summary"]);
+        if let Some(committed) = self.wrote(
+            "set_comment",
+            serde_json::json!({"address": addr, "comment": text}),
+        ) {
+            return committed;
+        }
+        let out = self.run(&cli_argv(&["comment", "set", "--summary"], &[addr, text]));
         mutation_ok(&out)
     }
 
     /// The comment currently at `addr` (`comment get`), for edit-in-place.
     /// `None` when there is none (or on failure).
     pub fn comment_get_addr(&self, addr: &str) -> Option<String> {
-        let out = self.run_stdout(&["comment", "get", addr, "--format", "json"]);
-        let value: serde_json::Value = serde_json::from_str(out.trim()).ok()?;
+        let value = match self.op_raw("get_comment", serde_json::json!({"address": addr})) {
+            // A read that genuinely failed (an unmapped address) has no comment to
+            // report — same answer the CLI path gives by failing to parse.
+            Some(result) => result.ok()?,
+            None => {
+                let out = self.run_stdout(&cli_argv(
+                    &["comment", "get", "--format", "json"],
+                    &[addr],
+                ));
+                serde_json::from_str(out.trim()).ok()?
+            }
+        };
         if value
             .get("has_comment")
             .and_then(serde_json::Value::as_bool)
@@ -2037,9 +2509,19 @@ impl Bn {
     /// function — e.g. one added with `bn comment set <entry>`). Lets `;` edit
     /// whichever note is actually shown, in place.
     pub fn comment_get_func(&self, func: &str) -> FuncComment {
-        let out = self.run_stdout(&["comment", "get", "--function", func, "--format", "json"]);
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(out.trim()) else {
-            return FuncComment::default();
+        let value = match self.op_raw("get_comment", serde_json::json!({"function": func})) {
+            Some(Ok(value)) => value,
+            Some(Err(_)) => return FuncComment::default(),
+            None => {
+                // `--function` takes a value, so a dash-leading function name needs
+                // the `=` form rather than the `--` separator.
+                let function = flag_eq("--function", func);
+                let out = self.run_stdout(&["comment", "get", &function, "--format", "json"]);
+                match serde_json::from_str::<serde_json::Value>(out.trim()) {
+                    Ok(value) => value,
+                    Err(_) => return FuncComment::default(),
+                }
+            }
         };
         let doc = value
             .get("function_doc")
@@ -2072,57 +2554,85 @@ impl Bn {
 
     /// Set a function's documentation comment (shown atop the function).
     pub fn comment_set_func(&self, func: &str, text: &str) -> bool {
-        let out = self.run(&["comment", "set", "--function", func, text, "--summary"]);
+        if let Some(committed) = self.wrote(
+            "set_comment",
+            serde_json::json!({"function": func, "comment": text}),
+        ) {
+            return committed;
+        }
+        let function = flag_eq("--function", func);
+        let out = self.run(&cli_argv(
+            &["comment", "set", &function, "--summary"],
+            &[text],
+        ));
         mutation_ok(&out)
     }
 
     /// Delete the comment at `addr` (clearing a comment edited down to empty).
     pub fn comment_delete_addr(&self, addr: &str) -> bool {
-        let out = self.run(&["comment", "delete", addr, "--summary"]);
+        if let Some(committed) =
+            self.wrote("delete_comment", serde_json::json!({"address": addr}))
+        {
+            return committed;
+        }
+        let out = self.run(&cli_argv(&["comment", "delete", "--summary"], &[addr]));
         mutation_ok(&out)
     }
 
     /// Delete a function's documentation comment.
     pub fn comment_delete_func(&self, func: &str) -> bool {
-        let out = self.run(&["comment", "delete", "--function", func, "--summary"]);
+        if let Some(committed) =
+            self.wrote("delete_comment", serde_json::json!({"function": func}))
+        {
+            return committed;
+        }
+        let function = flag_eq("--function", func);
+        let out = self.run(&["comment", "delete", &function, "--summary"]);
         mutation_ok(&out)
     }
 
     /// Add a tag of `ty` (e.g. `Bookmarks`) at an address, with optional note.
     pub fn tag_add_addr(&self, addr: &str, ty: &str, data: &str) -> bool {
-        let out = self.run(&[
-            "tag",
-            "add",
-            addr,
-            "--type",
-            ty,
-            "--data",
-            data,
-            "--summary",
-        ]);
+        if let Some(committed) = self.wrote(
+            "tag_add",
+            serde_json::json!({"address": addr, "type": ty, "data": data}),
+        ) {
+            return committed;
+        }
+        // The note and the tag type are flag VALUES: a user note like `-> see
+        // parse_hdr` is rejected outright as `--data <note>`, and `--` cannot fix a
+        // flag value.
+        let (ty, data) = (flag_eq("--type", ty), flag_eq("--data", data));
+        let out = self.run(&cli_argv(&["tag", "add", &ty, &data, "--summary"], &[addr]));
         mutation_ok(&out)
     }
 
     /// Add a tag of `ty` on a whole function, with optional note.
     pub fn tag_add_func(&self, func: &str, ty: &str, data: &str) -> bool {
-        let out = self.run(&[
-            "tag",
-            "add",
-            "--function",
-            func,
-            "--type",
-            ty,
-            "--data",
-            data,
-            "--summary",
-        ]);
+        if let Some(committed) = self.wrote(
+            "tag_add",
+            serde_json::json!({"function": func, "type": ty, "data": data}),
+        ) {
+            return committed;
+        }
+        let (function, ty, data) = (
+            flag_eq("--function", func),
+            flag_eq("--type", ty),
+            flag_eq("--data", data),
+        );
+        let out = self.run(&["tag", "add", &function, &ty, &data, "--summary"]);
         mutation_ok(&out)
     }
 
     /// Hex+ASCII dump of `length` bytes at `addr`.
     pub fn read(&self, addr: &str, length: usize) -> String {
-        let len = length.to_string();
-        let s = self.run(&["read", addr, "--length", &len]);
+        let s = match self.read_bytes(addr, length) {
+            Some(result) => result.unwrap_or_else(|error| format!("✗ {error}")),
+            None => {
+                let len = length.to_string();
+                self.run(&cli_argv(&["read", "--length", &len], &[addr]))
+            }
+        };
         if s.trim().is_empty() {
             "(no data)".into()
         } else {
@@ -2130,16 +2640,51 @@ impl Bn {
         }
     }
 
+    /// The `read` op rendered as the CLI's hexdump, or `None` when there is no socket
+    /// path for it. Shared by [`Self::read`] and [`Self::read_dump`], which differ only
+    /// in how they report a failure.
+    fn read_bytes(&self, addr: &str, length: usize) -> Option<Result<String, String>> {
+        Some(
+            match self.op_raw(
+                "read",
+                serde_json::json!({"address": addr, "length": length}),
+            )? {
+                // `render_read` returns `None` only for a missing or undecodable
+                // `hex` field, and it documents that as the fall-back signal — but a
+                // socket path *did* exist here, so neither caller falls back.
+                // Defaulting it to `Ok("")` therefore reported an unexpected payload
+                // as an absence: `read` claimed `(no data)` for the window and the
+                // data view rendered a region of unknown bytes.
+                Ok(value) => render_read(&value).ok_or_else(|| {
+                    let bridge = match self.bridge_version() {
+                        Some(version) => format!(" (bridge {version})"),
+                        None => String::new(),
+                    };
+                    format!(
+                        "bn read returned no decodable hex for {length} bytes at {addr}{bridge}"
+                    )
+                }),
+                Err(error) => Err(error),
+            },
+        )
+    }
+
     /// Like [`Self::read`] but via `--out`, so a large window (the linear data
     /// view can request several KB) doesn't trip bn's stdout spill envelope.
-    /// Empty on failure.
-    pub fn read_dump(&self, addr: &str, length: usize) -> String {
+    ///
+    /// `Err` rather than an empty dump: the data view lays out whatever bytes it is
+    /// given, so "the read failed" and "these bytes are all unknown" have to stay
+    /// distinguishable at the call site.
+    pub fn read_dump(&self, addr: &str, length: usize) -> Result<String, String> {
+        if let Some(result) = self.read_bytes(addr, length) {
+            return result;
+        }
         let len = length.to_string();
-        let out = self.run_out(&["read", addr, "--length", &len]);
+        let out = self.run_out_checked(&cli_argv(&["read", "--length", &len], &[addr]))?;
         if out.trim_start().starts_with('✗') {
-            String::new()
+            Err(clean_err(&out))
         } else {
-            out
+            Ok(out)
         }
     }
 }
@@ -2188,19 +2733,11 @@ fn text_field(value: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// Render a socket `decompile` result the way the CLI's text mode did
-/// (`function.py:246-257`): a leading resolution note, the pseudo-C, then any
-/// warnings.
-///
-/// Reading only `text` off the socket silently dropped both — the interior-address
-/// disclosure and every `warnings[]` entry: the #446 thunk/veneer "this is a
-/// PLT/GOT trampoline, not self-recursion" note, the analysis-stub warning, and
-/// the pseudo-C→wrapped-HLIL degradation notice (`read_decompile.py:144-162`).
-/// Those are load-bearing on a live target, so the socket path must reconstruct
-/// them rather than leave the reader with unexplained-looking output.
-fn decompile_render(value: &serde_json::Value) -> String {
-    let mut body = text_field(value);
-    let warnings: Vec<String> = value
+
+/// The `warnings[]` entries of a `decompile` result as the `warning: …` lines the
+/// CLI's text mode appends below the body, in order. Empty when there are none.
+fn warning_lines(value: &serde_json::Value) -> Vec<String> {
+    value
         .get("warnings")
         .and_then(serde_json::Value::as_array)
         .map(|items| {
@@ -2210,11 +2747,7 @@ fn decompile_render(value: &serde_json::Value) -> String {
                 .map(|warning| format!("warning: {warning}"))
                 .collect()
         })
-        .unwrap_or_default();
-    if !warnings.is_empty() {
-        body = format!("{body}\n\n{}", warnings.join("\n"));
-    }
-    format!("{}{body}", resolution_note(value))
+        .unwrap_or_default()
 }
 
 /// The CLI's `_resolution_note` (`formatters.py:124-143`): a `// bn: …` line when a
@@ -2380,6 +2913,639 @@ fn render_sections(value: &serde_json::Value) -> Vec<String> {
     lines
 }
 
+/// Parse a bn-rendered address (`0x…`, else decimal), the way the CLI's own
+/// renderers do (`int(s, 16) if s.startswith("0x") else int(s)`).
+fn parse_render_addr(text: &str) -> Option<u64> {
+    let text = text.trim();
+    match text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+    {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => text.parse().ok(),
+    }
+}
+
+fn decode_hex(hex: &str) -> Option<Vec<u8>> {
+    // Byte-indexed slicing below would panic mid-codepoint on non-ASCII input.
+    if !hex.is_ascii() || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).ok())
+        .collect()
+}
+
+/// Render a socket `read` result as the hexdump the CLI printed
+/// (`formatters.py::_render_read_text`): `<addr>: <16 hex bytes>  <ascii>`, 16 bytes
+/// per row, then any short-read note.
+///
+/// The column layout is a contract, not decoration — the linear data view scrapes
+/// these rows — so the hex field keeps the CLI's `width * 3 - 1` padding. `None` when
+/// the payload carries no decodable `hex`, so the caller can fall back.
+fn render_read(value: &serde_json::Value) -> Option<String> {
+    const WIDTH: usize = 16;
+    let data = decode_hex(value.get("hex").and_then(serde_json::Value::as_str)?)?;
+    let base = parse_render_addr(
+        value
+            .get("address")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("0x0"),
+    )
+    .unwrap_or(0);
+    let mut lines: Vec<String> = data
+        .chunks(WIDTH)
+        .enumerate()
+        .map(|(row, chunk)| {
+            let hex_bytes = chunk
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ascii: String = chunk
+                .iter()
+                .map(|&byte| {
+                    if (0x20..0x7f).contains(&byte) {
+                        byte as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            // saturating: a window at the very top of the address space must clamp,
+            // not wrap in release and panic in a debug test.
+            let at = base.saturating_add((row * WIDTH) as u64);
+            format!("{at:08x}: {hex_bytes:<width$}  {ascii}", width = WIDTH * 3 - 1)
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push(format!("{base:08x}: (no bytes)"));
+    }
+    if let Some(note) = value
+        .get("note")
+        .and_then(serde_json::Value::as_str)
+        .filter(|note| !note.is_empty())
+    {
+        lines.push(String::new());
+        lines.push(format!("note: {note}"));
+    }
+    Some(terminated(lines.join("\n")))
+}
+
+/// Give a socket render the trailing newline the CLI path carried.
+///
+/// This is not cosmetic. What the CLI handed the lens was a *printed* body, so it
+/// always ended in `\n`, and `syntax::tokenize_plain` splits on `'\n'` — meaning that
+/// newline contributes a final empty line. A render without it is one line shorter
+/// than the same read through the CLI, which showed up in dogfooding as a `1/7`
+/// footer where the CLI path said `1/8`. Reproduce the byte the consumer saw.
+fn terminated(mut text: String) -> String {
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// Render a socket `disasm --linear` result the way the CLI did
+/// (`formatters.py::_render_disasm_linear_text`): the `// bn:` note, then the
+/// address/bytes/mnemonic lines. The leading `//` is load-bearing — `usage::disasm_line`
+/// skips comment lines to find the instruction.
+fn render_disasm_linear(value: &serde_json::Value) -> String {
+    let body = text_field(value);
+    terminated(
+        match value
+            .get("note")
+            .and_then(serde_json::Value::as_str)
+            .filter(|note| !note.is_empty())
+        {
+            Some(note) if body.is_empty() => format!("// bn: {note}"),
+            Some(note) => format!("// bn: {note}\n{body}"),
+            None => body,
+        },
+    )
+}
+
+/// Render a socket `type_info` result as `types show` printed it
+/// (`formatters.py::_render_type_info_text`): the rendered layout, else the bare
+/// declaration. `None` when neither is present, so the caller can fall back.
+///
+/// Deliberately NOT run through [`terminated`]: `type_show` splits with `.lines()`,
+/// which discards a trailing newline, and an empty render must stay empty so the
+/// `(no layout for …)` placeholder still fires.
+fn render_type_info(value: &serde_json::Value) -> Option<String> {
+    ["layout", "decl"].into_iter().find_map(|key| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// One caller group in an xrefs listing: the referencing function (or, for a ref with
+/// no containing function, its resolved symbol/section label) and every site under it.
+struct XrefGroup {
+    /// `None` for a ref with no containing function — which is what tells the header
+    /// to say "locations" rather than miscounting them as functions.
+    caller_address: Option<String>,
+    caller_name: Option<String>,
+    context: Option<serde_json::Value>,
+    sites: Vec<String>,
+}
+
+/// A concise fallback label (symbol name, else section name) for a ref with no
+/// containing function, so it doesn't render as a bare `<unknown>`
+/// (`formatters.py::_unknown_ref_label`).
+fn unknown_ref_label(context: Option<&serde_json::Value>) -> Option<String> {
+    let context = context?;
+    if let Some(name) = context
+        .get("symbol")
+        .and_then(|symbol| symbol.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+    {
+        return Some(name.to_string());
+    }
+    context
+        .get("sections")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find_map(|section| {
+            section
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
+}
+
+/// Group refs by referencing caller, preserving first-seen order
+/// (`formatters.py::_group_refs_by_caller`).
+///
+/// Refs with no containing function key on their own resolved label so refs under
+/// *different* symbols/sections don't collapse into one group stamped with the first
+/// ref's label; a label-less ref keys on its own address, so each renders as its own
+/// `<unknown>` line rather than being coalesced.
+fn group_refs_by_caller(refs: &[serde_json::Value]) -> Vec<XrefGroup> {
+    let mut groups: Vec<XrefGroup> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let field = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    for reference in refs {
+        if !reference.is_object() {
+            continue;
+        }
+        let context = reference.get("context").cloned().filter(|c| !c.is_null());
+        let site = field(reference, "address").unwrap_or_else(|| "<unknown>".into());
+        let caller = reference
+            .get("caller_function")
+            .filter(|caller| caller.is_object());
+        let (key, caller_address, caller_name) = match caller {
+            Some(caller) => {
+                let address = field(caller, "address");
+                let name = field(caller, "name");
+                (
+                    format!(
+                        "fn\u{1}{}\u{1}{}",
+                        address.as_deref().unwrap_or(""),
+                        name.as_deref().unwrap_or("")
+                    ),
+                    address,
+                    name,
+                )
+            }
+            None => {
+                let label =
+                    unknown_ref_label(context.as_ref()).or_else(|| field(reference, "function"));
+                let key = match &label {
+                    Some(label) => format!("label\u{1}{label}"),
+                    None => format!("site\u{1}{site}"),
+                };
+                (key, None, label)
+            }
+        };
+        match index.get(&key) {
+            Some(&at) => groups[at].sites.push(site),
+            None => {
+                index.insert(key, groups.len());
+                groups.push(XrefGroup {
+                    caller_address,
+                    caller_name,
+                    context,
+                    sites: vec![site],
+                });
+            }
+        }
+    }
+    groups
+}
+
+/// Render a socket `xrefs` result as the text the CLI printed
+/// (`formatters.py::_render_xrefs_text`).
+///
+/// `usage::parse_xrefs` scrapes this — the `code refs`/`data refs` section headers,
+/// the `- none` sentinel and the `<caller addr>  <name>  (N sites: …)` row shape are
+/// all contract. No display cap is applied because the CLI path this replaces passes
+/// `--out`, and `--out` means an uncapped body (`cli.py::_effective_limit`).
+fn render_xrefs(value: &serde_json::Value) -> String {
+    let no_refs = Vec::new();
+    let items = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&no_refs);
+    let bucket = |kind: &str| -> Vec<serde_json::Value> {
+        // The op ships one `items` list tagged by `kind`; the deprecated dual-array
+        // shape is still emitted elsewhere, so honour it when present.
+        value
+            .get(if kind == "code" { "code_refs" } else { "data_refs" })
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| {
+                items
+                    .iter()
+                    .filter(|item| {
+                        item.get("kind").and_then(serde_json::Value::as_str) == Some(kind)
+                    })
+                    .cloned()
+                    .collect()
+            })
+    };
+    let code_refs = bucket("code");
+    let data_refs = bucket("data");
+    // Totals come from the full-set summary counts when present, so the header stays
+    // honest even though a page may carry fewer refs than it counts.
+    let total = |key: &str, refs: &[serde_json::Value]| -> u64 {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(refs.len() as u64)
+    };
+    let total_code = total("code_ref_count", &code_refs);
+    let total_data = total("data_ref_count", &data_refs);
+
+    let render_group = |refs: &[serde_json::Value], total: u64, label: &str| -> Vec<String> {
+        let groups = group_refs_by_caller(refs);
+        if groups.is_empty() {
+            return vec![format!("{label}:"), "- none".into()];
+        }
+        let site_word = if total == 1 { "site" } else { "sites" };
+        // Only call the groups "functions" when every one really is one; a
+        // function-less bucket must not be miscounted as a function.
+        let all_functions = groups
+            .iter()
+            .all(|group| group.caller_address.is_some());
+        let group_word = match (all_functions, groups.len() == 1) {
+            (true, true) => "function",
+            (true, false) => "functions",
+            (false, true) => "location",
+            (false, false) => "locations",
+        };
+        let mut lines = vec![format!(
+            "{label}: {total} {site_word} across {} {group_word}",
+            groups.len()
+        )];
+        for group in &groups {
+            let caller_address = group.caller_address.as_deref().unwrap_or("<unknown>");
+            let caller_name = group
+                .caller_name
+                .clone()
+                .or_else(|| unknown_ref_label(group.context.as_ref()))
+                .unwrap_or_else(|| "<unknown>".into());
+            let suffix = if group.sites.len() == 1 {
+                format!("(1 site: {})", group.sites[0])
+            } else {
+                format!("({} sites: {})", group.sites.len(), group.sites.join(", "))
+            };
+            lines.push(format!("  {caller_address}  {caller_name}  {suffix}"));
+        }
+        lines
+    };
+
+    let address = value
+        .get("address")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    let mut lines = vec![
+        format!("xrefs to {address} ({total_code} code, {total_data} data)"),
+        String::new(),
+    ];
+    if value
+        .get("import_resolved")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        let scanned = if value
+            .get("code_refs_scanned")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            " (scanned)"
+        } else {
+            ""
+        };
+        let name = value
+            .get("import_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unknown>");
+        lines.insert(0, format!("import: {name}{scanned}"));
+        lines.insert(1, String::new());
+    }
+    // An ambiguous same-name collision (thunk vs real): surface the note so a
+    // zero-caller member is never mistaken for dead code.
+    if let Some(note) = value
+        .get("ambiguous_symbol")
+        .filter(|amb| amb.is_object())
+        .and_then(|amb| amb.get("note"))
+        .and_then(serde_json::Value::as_str)
+    {
+        lines.insert(0, format!("note: {note}"));
+        lines.insert(1, String::new());
+    }
+    if let Some(resolved) = value
+        .get("resolved_symbol")
+        .filter(|sym| sym.get("kind").and_then(serde_json::Value::as_str) == Some("data"))
+    {
+        let name = resolved
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let at = resolved
+            .get("address")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        lines.insert(0, format!("note: resolved '{name}' as a data symbol @ {at}"));
+        lines.insert(1, String::new());
+    }
+    lines.extend(render_group(&code_refs, total_code, "code refs"));
+    lines.push(String::new());
+    lines.extend(render_group(&data_refs, total_data, "data refs"));
+    terminated(lines.join("\n"))
+}
+
+/// Render a JSON value the way a Python f-string's `str()` would, so a ported CLI
+/// renderer reproduces the same text for an integer, a string, or a missing field
+/// (which Python prints as `None`).
+fn py_str(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => "None".into(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Bool(true)) => "True".into(),
+        Some(serde_json::Value::Bool(false)) => "False".into(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// A string field that is present *and* non-empty. Python's renderers gate on
+/// truthiness (`x.get(k) or fallback`), so an empty string must fall through to the
+/// fallback rather than render as a blank.
+fn truthy_str(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+/// Label for one vtable slot (`formatters.py::_vtable_slot_label`): the demangled
+/// method, `__cxa_pure_virtual`, a named cross-module slot, `<null>`, or `<unnamed>`.
+fn vtable_slot_label(slot: &serde_json::Value) -> String {
+    let flag = |key: &str| slot.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+    if flag("pure_virtual") {
+        return "__cxa_pure_virtual".into();
+    }
+    if let Some(name) = slot
+        .get("method")
+        .filter(|method| method.is_object())
+        .and_then(|method| {
+            ["display_name", "name"]
+                .into_iter()
+                .find_map(|key| truthy_str(method, key))
+        })
+    {
+        return name;
+    }
+    if flag("external") {
+        return match truthy_str(slot, "external_name") {
+            Some(name) => format!("{name} [external]"),
+            None => "<external>".into(),
+        };
+    }
+    if flag("null") {
+        return "<null>".into();
+    }
+    "<unnamed>".into()
+}
+
+/// Render one recovered class the way `bn class show` printed it
+/// (`formatters.py::_render_one_class`): the header with size/vtable/bases, the
+/// confidence line, ctors/dtors, vtable slots, secondary (multiple-inheritance)
+/// vtables, non-virtual members, then instance evidence.
+fn render_one_class(rec: &serde_json::Value) -> String {
+    let size = rec
+        .get("size")
+        .filter(|size| size.is_object())
+        .and_then(|size| truthy_str(size, "value"));
+    let vtable = rec.get("vtable").filter(|vtable| vtable.is_object());
+    let vtable_addr = vtable.and_then(|vtable| truthy_str(vtable, "address"));
+    let bases: Vec<String> = rec
+        .get("bases")
+        .and_then(serde_json::Value::as_array)
+        .map(|bases| {
+            bases
+                .iter()
+                .map(|base| truthy_str(base, "name").unwrap_or_else(|| "?".into()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut head = format!(
+        "class {}",
+        rec.get("name")
+            .map(|name| py_str(Some(name)))
+            .unwrap_or_else(|| "<unknown>".into())
+    );
+    let mut bits = Vec::new();
+    if let Some(size) = size {
+        bits.push(format!("size {size}"));
+    }
+    if let Some(at) = &vtable_addr {
+        bits.push(format!("vtable @ {at}"));
+    }
+    if !bases.is_empty() {
+        bits.push(format!("base: {}", bases.join(", ")));
+    }
+    if !bits.is_empty() {
+        head += &format!("  ({})", bits.join(", "));
+    }
+    let mut lines = vec![
+        head,
+        format!(
+            "  [{}]",
+            rec.get("confidence")
+                .map(|c| py_str(Some(c)))
+                .unwrap_or_else(|| "?".into())
+        ),
+    ];
+
+    let no_methods = Vec::new();
+    let methods = rec
+        .get("methods")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&no_methods);
+    let slot_row = |indent: &str, slot: &serde_json::Value| {
+        format!(
+            "{indent}[{}] {}  {}",
+            py_str(slot.get("index")),
+            truthy_str(slot, "address").unwrap_or_else(|| "?".into()),
+            vtable_slot_label(slot)
+        )
+    };
+    for method in methods {
+        let kind = truthy_str(method, "kind").unwrap_or_default();
+        if kind == "ctor" || kind == "dtor" {
+            lines.push(format!(
+                "  {kind:<6} {}  {}",
+                truthy_str(method, "address").unwrap_or_else(|| "?".into()),
+                method
+                    .get("demangled")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    let slots = vtable
+        .and_then(|vtable| vtable.get("slots"))
+        .and_then(serde_json::Value::as_array)
+        .filter(|slots| !slots.is_empty());
+    match (slots, &vtable_addr) {
+        (Some(slots), _) => {
+            for slot in slots {
+                lines.push(slot_row("  vtable ", slot));
+            }
+        }
+        // A vtable symbol with no resolvable slots: say why rather than render an
+        // empty or invented set of virtuals.
+        (None, Some(_)) => lines.push(
+            "  vtable: symbol present but no slots resolved here (defined in another \
+             module, or applied at load time via relocations)"
+                .into(),
+        ),
+        (None, None) => {}
+    }
+    for secondary in rec
+        .get("secondary_vtables")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&no_methods)
+        .iter()
+        .filter(|secondary| secondary.is_object())
+    {
+        let offset = match secondary.get("offset_to_top") {
+            Some(offset) if !offset.is_null() => format!(" (offset-to-top {})", py_str(Some(offset))),
+            _ => String::new(),
+        };
+        lines.push(format!(
+            "  secondary vtable @ {}{offset}:",
+            truthy_str(secondary, "address").unwrap_or_else(|| "?".into())
+        ));
+        for slot in secondary
+            .get("slots")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&no_methods)
+        {
+            lines.push(slot_row("    ", slot));
+        }
+    }
+    // Non-virtual members: the virtual ones already appear as vtable slots, and
+    // listing the symbol side keeps `class show` useful for a class whose vtable is
+    // absent or empty.
+    let members: Vec<&serde_json::Value> = methods
+        .iter()
+        .filter(|method| truthy_str(method, "kind").as_deref() == Some("method"))
+        .collect();
+    if !members.is_empty() {
+        lines.push(format!("  methods ({}):", members.len()));
+        for method in members {
+            lines.push(format!(
+                "    {}  {}",
+                truthy_str(method, "address").unwrap_or_else(|| "?".into()),
+                method
+                    .get("demangled")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    let instances = rec.get("instances").filter(|inst| inst.is_object());
+    let mut parts: Vec<String> = Vec::new();
+    for site in instances
+        .and_then(|inst| inst.get("construction_sites"))
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&no_methods)
+    {
+        let size = match truthy_str(site, "size") {
+            Some(size) => format!(" (size {size})"),
+            None => String::new(),
+        };
+        let func = match truthy_str(site, "function") {
+            Some(func) => format!(" (in {func})"),
+            None => String::new(),
+        };
+        parts.push(format!(
+            "{} @ {}{size}{func}",
+            truthy_str(site, "kind").unwrap_or_else(|| "?".into()),
+            truthy_str(site, "address").unwrap_or_else(|| "?".into())
+        ));
+    }
+    for global in instances
+        .and_then(|inst| inst.get("stored_globals"))
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&no_methods)
+    {
+        parts.push(format!(
+            "stored -> {} @ {}",
+            truthy_str(global, "symbol").unwrap_or_else(|| "?".into()),
+            truthy_str(global, "address").unwrap_or_else(|| "?".into())
+        ));
+    }
+    if !parts.is_empty() {
+        lines.push(format!("  instances: {}", parts.join(" ; ")));
+    }
+    lines.join("\n")
+}
+
+/// Render a socket `class_show` result as `bn class show` printed it
+/// (`formatters.py::_render_class_show_text`), including the ambiguous-query form
+/// that lists every same-name match.
+fn render_class_show(value: &serde_json::Value) -> String {
+    if value.get("ambiguous").and_then(serde_json::Value::as_bool) != Some(true) {
+        return terminated(render_one_class(value));
+    }
+    let no_matches = Vec::new();
+    let matches = value
+        .get("matches")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&no_matches);
+    let mut lines = vec![format!(
+        // Python renders the query with `!r`, i.e. single-quoted.
+        "ambiguous class '{}': {} matches",
+        value
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        matches.len()
+    )];
+    for rec in matches {
+        lines.push(String::new());
+        lines.push(render_one_class(rec));
+    }
+    terminated(lines.join("\n"))
+}
+
 /// Resolve which bn instance to drive, from the launching pane's cwd.
 ///
 /// Order: `BN_LENS_INSTANCE` -> newest `.bn-<id>` marker in cwd -> single live
@@ -2428,10 +3594,713 @@ pub fn newest_live(bin: &str, exclude: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decompile_render, is_unknown_op, json_escape_ascii, parse_local_list_json,
-        parse_types_page, push_mark, recovered_class, render_sections, text_field, AnalysisState,
-        Bn, ClassItemJson, CommentListJson, Listing, StringsJson, TagListJson,
+        capture_dir, cli_argv, flag_eq, is_unknown_op, json_escape_ascii, mutation_outcome,
+        parse_local_list_json, parse_types_page, push_mark, recovered_class, recovered_data_syms,
+        render_class_show, render_disasm_linear, render_read, render_sections, render_type_info,
+        render_xrefs, resolution_note, text_field, warning_lines, with_capture, AnalysisState, Bn,
+        ClassItemJson, CommentListJson, DataSymsJson, Listing, StringsJson, TagListJson,
     };
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    // ---- #26: one malformed element must not drop the whole list ----
+
+    #[test]
+    fn issue26_locals_survive_one_element_missing_a_name() {
+        // Before `LocalVariable.name` carried `#[serde(default)]`, serde aborted the
+        // entire `Vec` here and `local_list` flattened the error to an empty list —
+        // no Local hotspots, and `n` on a variable silently renaming the FUNCTION.
+        let json = r#"{
+            "function": {"address": "0x401000", "name": "parse_header"},
+            "locals": [
+                {"local_id": "0x401000:local:stack:-32:0:1", "name": "header_len",
+                 "type": "uint32_t", "source_type": "StackVariableSourceType",
+                 "storage": -32, "is_parameter": false},
+                {"local_id": "0x401000:local:stack:-24:0:2",
+                 "type": "void*", "source_type": "StackVariableSourceType",
+                 "storage": -24, "is_parameter": false},
+                {"local_id": "0x401000:param:reg:0:0:3", "name": "buf",
+                 "type": "uint8_t*", "source_type": "RegisterVariableSourceType",
+                 "storage": 0, "is_parameter": true}
+            ]
+        }"#;
+        let locals = parse_local_list_json(json);
+        // The nameless element costs only itself.
+        let names: Vec<&str> = locals.iter().map(|local| local.name.as_str()).collect();
+        assert_eq!(names, ["header_len", "buf"]);
+        assert_eq!(locals[0].storage, -32);
+        assert!(locals[1].is_parameter);
+    }
+
+    #[test]
+    fn issue26_data_symbols_survive_one_element_missing_a_field() {
+        // An empty data-symbol map is the regression this read exists to prevent:
+        // renamed globals stop being hotspots, so `w`/`b` skip them and `p`/`x`
+        // cannot target them.
+        let payload = serde_json::from_str::<DataSymsJson>(
+            r#"{"syms":[
+                {"a":"0x415200","n":"g_config"},
+                {"n":"g_missing_address"},
+                {"a":"0x415280"},
+                {"a":"0x4152c0","n":"g_session_table"}
+            ]}"#,
+        )
+        .expect("a short element must not abort the list");
+        assert_eq!(
+            recovered_data_syms(payload),
+            [
+                ("0x415200".to_string(), "g_config".to_string()),
+                ("0x4152c0".to_string(), "g_session_table".to_string()),
+            ],
+            "elements missing either half are dropped; the rest survive"
+        );
+    }
+
+    // ---- #13: `--` before the first untrusted positional ----
+
+    /// Assert an argv is option-injection safe: every flag precedes `--`, nothing
+    /// after `--` is parsed as one, and the untrusted operands are exactly `expected`.
+    fn assert_guarded(argv: &[impl AsRef<str> + std::fmt::Debug], expected: &[&str]) {
+        let at = argv
+            .iter()
+            .position(|arg| arg.as_ref() == "--")
+            .unwrap_or_else(|| panic!("no `--` separator in {argv:?}"));
+        let operands: Vec<&str> = argv[at + 1..].iter().map(AsRef::as_ref).collect();
+        assert_eq!(
+            operands, expected,
+            "everything after `--` must be exactly the untrusted operands"
+        );
+        // A `--` placed before the flags would make argparse read `--summary` as a
+        // positional, so the separator has to come LAST among the trusted tokens.
+        assert!(
+            !argv[at + 1..].is_empty(),
+            "a bare trailing `--` is pointless"
+        );
+    }
+
+    #[test]
+    fn issue13_cli_argv_puts_the_separator_before_untrusted_positionals() {
+        // A comment body opening with a dash is ordinary prose. Without `--`,
+        // argparse takes it as a flag and the write fails with "the following
+        // arguments are required: text" — reported as a bare mutation failure.
+        let argv = cli_argv(&["comment", "set", "--summary"], &["0x401000", "-wip"]);
+        assert_eq!(argv, ["comment", "set", "--summary", "--", "0x401000", "-wip"]);
+        assert_guarded(&argv, &["0x401000", "-wip"]);
+
+        // A function named `--out` must not be able to steer bn's own `--out`.
+        assert_eq!(
+            cli_argv(&["decompile", "--addresses"], &["--out"]),
+            ["decompile", "--addresses", "--", "--out"]
+        );
+
+        // No operands, no separator: a bare `--` would be noise.
+        assert_eq!(cli_argv(&["xrefs"], &[]), ["xrefs"]);
+
+        // The health key still names the command, not the separator.
+        assert_eq!(Bn::command_key(&cli_argv(&["xrefs"], &["parse"])), "xrefs");
+        assert_eq!(
+            Bn::command_key(&cli_argv(&["comment", "set", "--summary"], &["0x1000", "x"])),
+            "comment set"
+        );
+    }
+
+    #[test]
+    fn issue13_the_capture_flag_stays_on_the_option_side_of_the_separator() {
+        // Caught by `issue13_real_read_paths_emit_a_guarded_argv`: `run_out` used to
+        // APPEND `--out <path>`, which after a `--` separator arrives as two stray
+        // positionals instead of bn's own flag — breaking every large read.
+        let guarded = cli_argv(&["decompile", "--addresses"], &["parse_header"]);
+        assert_eq!(
+            with_capture(&guarded, "/tmp/cap/0.out"),
+            [
+                "decompile",
+                "--addresses",
+                "--out",
+                "/tmp/cap/0.out",
+                "--",
+                "parse_header"
+            ]
+        );
+        // Nothing to splice past when there is no separator.
+        assert_eq!(
+            with_capture(&["py", "exec", "--format", "json"], "/tmp/cap/1.out"),
+            ["py", "exec", "--format", "json", "--out", "/tmp/cap/1.out"]
+        );
+    }
+
+    #[test]
+    fn issue13_dash_leading_flag_values_use_the_equals_form() {
+        // `--` cannot rescue a flag VALUE: argparse fails with "expected one
+        // argument" before it ever reaches the separator. `--flag=value` is the only
+        // form that accepts a dash-leading value.
+        assert_eq!(flag_eq("--data", "-> see parse_hdr"), "--data=-> see parse_hdr");
+        assert_eq!(flag_eq("--function", "--weird"), "--function=--weird");
+        assert!(!flag_eq("--type", "Bookmarks").contains(' '));
+    }
+
+    /// A `Bn` pinned to the CLI path — `client: None`, so the socket branch is skipped
+    /// regardless of how many bridges happen to be live on this host — whose binary is
+    /// a script that records the argv it was handed.
+    fn argv_recorder(dir: &Path) -> (Bn, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let recorded = dir.join("argv");
+        let script = dir.join("fake-bn");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 1\n",
+                recorded.display()
+            ),
+        )
+        .expect("write recorder script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod recorder script");
+        let bn = Bn {
+            bin: script.to_string_lossy().into_owned(),
+            instance: None,
+            target: None,
+            client: None,
+            pace: crate::bnsock::Pace::Interactive,
+            health: Arc::new(Mutex::new(None)),
+        };
+        (bn, recorded)
+    }
+
+    fn recorded_argv(at: &Path) -> Vec<String> {
+        std::fs::read_to_string(at)
+            .expect("the recorder script ran")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn issue13_real_write_paths_emit_a_guarded_argv() {
+        // The pure builder is only half the fix — this pins the actual call sites, so
+        // a future edit that hand-rolls an argv again fails here.
+        let dir = scratch_dir("argv");
+        let (bn, recorded) = argv_recorder(&dir);
+
+        bn.comment_set_addr("0x401000", "-- checked, bounds fine");
+        assert_guarded(
+            &recorded_argv(&recorded),
+            &["0x401000", "-- checked, bounds fine"],
+        );
+
+        bn.symbol_rename("-t", "parse_header");
+        assert_guarded(&recorded_argv(&recorded), &["-t", "parse_header"]);
+
+        // A dash-leading tag note rides as `--data=<note>`, never as a bare value.
+        bn.tag_add_addr("0x401000", "Bookmarks", "-> see parse_hdr");
+        let argv = recorded_argv(&recorded);
+        assert!(
+            argv.contains(&"--data=-> see parse_hdr".to_string()),
+            "tag note must use the `=` form: {argv:?}"
+        );
+        assert_guarded(&argv, &["0x401000"]);
+
+        // A function-scoped comment has NO untrusted positional but two untrusted
+        // values, so it must carry both in `=` form.
+        bn.comment_set_func("--weird", "-wip");
+        let argv = recorded_argv(&recorded);
+        assert!(argv.contains(&"--function=--weird".to_string()), "{argv:?}");
+        assert_guarded(&argv, &["-wip"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn issue13_real_read_paths_emit_a_guarded_argv() {
+        let dir = scratch_dir("argv-read");
+        let (bn, recorded) = argv_recorder(&dir);
+
+        // A function named `--out` collides with bn's own capture flag, which
+        // `with_capture` splices in ahead of the separator: the name must still
+        // arrive as an operand, and the real flag must survive.
+        let _ = bn.decompile_read("--out");
+        let argv = recorded_argv(&recorded);
+        assert!(argv.contains(&"--out".to_string()));
+        let at = argv.iter().position(|arg| arg == "--").expect("separator");
+        assert_eq!(argv[at + 1], "--out", "the function name is an operand");
+
+        bn.type_show("-2");
+        assert_guarded(&recorded_argv(&recorded), &["-2"]);
+
+        bn.read("-1", 16);
+        assert_guarded(&recorded_argv(&recorded), &["-1"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- #27: captures live in a private per-process directory ----
+
+    /// A fresh scratch directory for a test, alongside the capture dir so it inherits
+    /// the same `TMPDIR` honouring.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bn-lens-test-{}-{tag}-{:016x}",
+            std::process::id(),
+            super::capture_nonce()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn issue27_capture_paths_live_in_a_private_per_process_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = capture_dir().expect("a private capture directory must be creatable");
+
+        // 0700: a capture holds decompiled output of the target under audit, so no
+        // other local user may open it whatever its name.
+        let mode = std::fs::metadata(dir)
+            .expect("capture dir exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "capture dir must be 0700, got {mode:o}");
+
+        // Per process, and under the honoured temp root.
+        assert!(dir.starts_with(std::env::temp_dir()));
+        let name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("dir name");
+        let prefix = format!("bn-lens-{}-", std::process::id());
+        assert!(name.starts_with(&prefix), "{name} lacks the pid prefix");
+        // The nonce is what defeats pre-creation: the old scheme's name was fully
+        // derivable from (pid, call ordinal).
+        assert_eq!(
+            name.len(),
+            prefix.len() + 16,
+            "{name} must carry a 64-bit nonce"
+        );
+
+        // Every capture path is inside it, and no two collide.
+        let first = super::unique_tmp();
+        let second = super::unique_tmp();
+        assert_ne!(first, second);
+        for path in [&first, &second] {
+            assert_eq!(
+                Path::new(path).parent(),
+                Some(dir.as_path()),
+                "{path} escaped the private directory"
+            );
+        }
+    }
+
+    // ---- #21: socket writes and hot reads must read the same as the CLI's ----
+
+    #[test]
+    fn issue21_mutation_outcome_matches_the_clis_summary_collapse() {
+        // `--summary` is a CLI-side transform, so a socket write has to derive the
+        // same verdict from the raw result or it would disagree with the CLI.
+        let committed = serde_json::json!({
+            "preview": false, "success": true, "committed": true,
+            "results": [{"op": "set_comment", "status": "verified"}],
+        });
+        let outcome = mutation_outcome(&committed);
+        assert!(outcome.success);
+        assert_eq!(outcome.changed_count, 1);
+        assert_eq!(outcome.first_error, None);
+
+        // A no-op verifies nothing but is still a success (nothing to change).
+        let noop = serde_json::json!({
+            "success": true, "committed": true,
+            "results": [{"op": "rename_symbol", "status": "noop"}],
+        });
+        assert!(mutation_outcome(&noop).success);
+        assert_eq!(mutation_outcome(&noop).changed_count, 0);
+
+        // The load-bearing case: `success` alone reads TRUE here, but a
+        // verification_failed row means the write did not land. Trusting `success`
+        // would make the lens retext a rename that never happened.
+        let unverified = serde_json::json!({
+            "success": true, "committed": false, "rolled_back": true,
+            "results": [{
+                "op": "local_rename", "status": "verification_failed",
+                "message": "variable still named var_18 after rename",
+            }],
+        });
+        let outcome = mutation_outcome(&unverified);
+        assert!(!outcome.success);
+        assert_eq!(
+            outcome.first_error.as_deref(),
+            Some("variable still named var_18 after rename")
+        );
+
+        // A failure whose only explanation is top-level (a revert that failed after
+        // every op verified, so no row is in the failed set).
+        let top_level = serde_json::json!({
+            "success": false, "committed": false,
+            "message": "rollback failed: the view may be left modified",
+            "results": [{"op": "types_declare", "status": "verified"}],
+        });
+        assert_eq!(
+            mutation_outcome(&top_level).first_error.as_deref(),
+            Some("rollback failed: the view may be left modified")
+        );
+
+        // An absent `success` is NOT an acknowledgement. The CLI's presentation
+        // default would promote a schema change (or a malformed empty result) to a
+        // committed write, and the lens would then report and locally retext a
+        // rename that no field says landed.
+        let unacknowledged = mutation_outcome(&serde_json::json!({"results": []}));
+        assert!(!unacknowledged.success);
+        assert_eq!(
+            unacknowledged.first_error.as_deref(),
+            Some("bn did not report whether the write committed")
+        );
+        // A non-boolean `success` is the same class of surprise.
+        assert!(!mutation_outcome(&serde_json::json!({"success": "yes"})).success);
+        // …and a failure with nothing to quote still names itself.
+        assert_eq!(
+            mutation_outcome(&serde_json::json!({"success": false}))
+                .first_error
+                .as_deref(),
+            Some("mutation failed")
+        );
+    }
+
+    #[test]
+    fn a_read_payload_without_decodable_hex_is_not_an_empty_dump() {
+        // `render_read`'s `None` is the "fall back to the CLI" signal, and
+        // `read_bytes` used to default it to `Ok("")`. Because a socket path existed,
+        // neither caller then fell back: `read` reported `(no data)` for the window
+        // and the data view laid out a region of unknown bytes — both of which read
+        // as claims about the target rather than about the payload.
+        assert!(render_read(&serde_json::json!({"address": "0x415200"})).is_none());
+        assert!(render_read(&serde_json::json!({"address": "0x415200", "hex": "zz"})).is_none());
+        assert!(render_read(&serde_json::json!({"address": "0x415200", "hex": "41"})).is_some());
+    }
+
+    #[test]
+    fn a_failed_dump_read_is_an_error_not_an_empty_window() {
+        // The instance does not exist, so no client resolves and the CLI fallback
+        // runs against a missing binary. `read_dump` must not flatten that to an
+        // empty dump: `datamap::linear` would render the window as unknown bytes.
+        let bn = Bn::new(
+            "/definitely/missing/bn-lens-test-binary".into(),
+            Some("bn-lens-test-no-such-instance".into()),
+            None,
+        );
+        assert!(bn.read_dump("0x415200", 64).is_err());
+    }
+
+    #[test]
+    fn issue21_render_read_reproduces_the_clis_hexdump_columns() {
+        // The linear data view scrapes these rows, so the column layout is a
+        // contract: `<addr>: <16 hex bytes padded to 47>  <ascii>`.
+        let value = serde_json::json!({
+            "address": "0x415200",
+            "length": 20,
+            "hex": "89504e470d0a1a0a0000000d49484452007f2041",
+        });
+        let rendered = render_read(&value).expect("decodable hex renders");
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines[0],
+            "00415200: 89 50 4e 47 0d 0a 1a 0a 00 00 00 0d 49 48 44 52  .PNG........IHDR"
+        );
+        // The second row is short; the hex field still pads to full width so the
+        // ascii column stays aligned.
+        assert_eq!(
+            lines[1],
+            "00415210: 00 7f 20 41                                      .. A"
+        );
+        // Non-printables and DEL render as `.`; 0x20 and 0x7e are the inclusive
+        // bounds of the printable range.
+        let bounds = serde_json::json!({"address": "0x1000", "hex": "1f207e7f"});
+        assert!(render_read(&bounds).unwrap().ends_with(". ~.\n"));
+
+        // A short read appends the note the CLI printed.
+        let short = serde_json::json!({
+            "address": "0x415200", "hex": "0011", "short_read": true,
+            "note": "short read: requested 8 bytes, only 2 mapped from 0x415200",
+        });
+        let rendered = render_read(&short).unwrap();
+        assert!(rendered
+            .ends_with("\n\nnote: short read: requested 8 bytes, only 2 mapped from 0x415200\n"));
+
+        // Zero bytes is a rendered row, not an empty string.
+        assert_eq!(
+            render_read(&serde_json::json!({"address": "0x1000", "hex": ""})).unwrap(),
+            "00001000: (no bytes)\n"
+        );
+        // Undecodable payloads fall back rather than panicking on a byte slice.
+        assert!(render_read(&serde_json::json!({"address": "0x1000", "hex": "abc"})).is_none());
+        assert!(render_read(&serde_json::json!({"address": "0x1000", "hex": "zz"})).is_none());
+        assert!(render_read(&serde_json::json!({"address": "0x1000", "hex": "é9"})).is_none());
+        assert!(render_read(&serde_json::json!({})).is_none());
+        // An address at the very top must clamp, not wrap (release has no
+        // overflow-checks, so a debug test is the only guard).
+        let top = serde_json::json!({
+            "address": "0xffffffffffffffff",
+            "hex": "00112233445566778899aabbccddeeff00",
+        });
+        assert_eq!(render_read(&top).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn issue21_render_xrefs_keeps_the_shape_usage_parses() {
+        // `usage::parse_xrefs` keys on the section headers and the
+        // `<caller addr>  <name>  (N sites: …)` row shape.
+        let value = serde_json::json!({
+            "address": "0x4016d0",
+            "code_ref_count": 5,
+            "data_ref_count": 1,
+            "items": [
+                {"kind": "code", "address": "0x40d214",
+                 "caller_function": {"address": "0x40d040", "name": "add_resource_record"}},
+                {"kind": "code", "address": "0x40d620",
+                 "caller_function": {"address": "0x40d040", "name": "add_resource_record"}},
+                {"kind": "code", "address": "0x41028c",
+                 "caller_function": {"address": "0x410240", "name": "expand_buf"}},
+                {"kind": "code", "address": "0x4102a0",
+                 "caller_function": {"address": "0x410240", "name": "expand_buf"}},
+                {"kind": "code", "address": "0x4102b4",
+                 "caller_function": {"address": "0x410240", "name": "expand_buf"}},
+                {"kind": "data", "address": "0x4152a0",
+                 "context": {"symbol": {"name": "ptr_table"}}}
+            ],
+        });
+        let rendered = render_xrefs(&value);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "xrefs to 0x4016d0 (5 code, 1 data)");
+        assert_eq!(lines[1], "");
+        assert_eq!(lines[2], "code refs: 5 sites across 2 functions");
+        assert_eq!(
+            lines[3],
+            "  0x40d040  add_resource_record  (2 sites: 0x40d214, 0x40d620)"
+        );
+        assert_eq!(
+            lines[4],
+            "  0x410240  expand_buf  (3 sites: 0x41028c, 0x4102a0, 0x4102b4)"
+        );
+        assert_eq!(lines[5], "");
+        // A function-less data ref is a "location", never miscounted as a function.
+        assert_eq!(lines[6], "data refs: 1 site across 1 location");
+        assert_eq!(lines[7], "  <unknown>  ptr_table  (1 site: 0x4152a0)");
+    }
+
+    #[test]
+    fn issue21_render_xrefs_reports_absence_the_way_the_cli_did() {
+        let empty = serde_json::json!({"address": "0x400238", "items": []});
+        assert_eq!(
+            render_xrefs(&empty),
+            "xrefs to 0x400238 (0 code, 0 data)\n\ncode refs:\n- none\n\ndata refs:\n- none\n"
+        );
+
+        // A same-name thunk/real collision: the note is what stops a zero-caller
+        // member reading as dead code.
+        let ambiguous = serde_json::json!({
+            "address": "0x401000",
+            "ambiguous_symbol": {"note": "2 symbols named parse_header; showing the one at 0x401000"},
+            "items": [],
+        });
+        assert_eq!(
+            render_xrefs(&ambiguous).lines().next(),
+            Some("note: 2 symbols named parse_header; showing the one at 0x401000")
+        );
+
+        // Refs under DIFFERENT sections must not collapse into one group stamped
+        // with the first ref's label.
+        let sections = serde_json::json!({
+            "address": "0x415200",
+            "items": [
+                {"kind": "data", "address": "0x420000",
+                 "context": {"sections": [{"name": ".data.rel.ro"}]}},
+                {"kind": "data", "address": "0x430000",
+                 "context": {"sections": [{"name": ".init_array"}]}}
+            ],
+        });
+        let rendered = render_xrefs(&sections);
+        assert!(rendered.contains("data refs: 2 sites across 2 locations"));
+        assert!(rendered.contains("  <unknown>  .data.rel.ro  (1 site: 0x420000)"));
+        assert!(rendered.contains("  <unknown>  .init_array  (1 site: 0x430000)"));
+
+        // A label-less ref keys on its own address, so two of them stay distinct
+        // rather than coalescing into one `<unknown>` row.
+        let bare = serde_json::json!({
+            "address": "0x415200",
+            "items": [
+                {"kind": "data", "address": "0x420000"},
+                {"kind": "data", "address": "0x430000"}
+            ],
+        });
+        assert!(render_xrefs(&bare).contains("data refs: 2 sites across 2 locations"));
+
+        // The deprecated dual-array shape still renders (function info embeds it).
+        let dual = serde_json::json!({
+            "address": "0x401000",
+            "code_refs": [{"address": "0x402000",
+                           "caller_function": {"address": "0x401f00", "name": "main"}}],
+            "data_refs": [],
+        });
+        assert!(render_xrefs(&dual).contains("code refs: 1 site across 1 function"));
+    }
+
+    #[test]
+    fn issue21_render_class_show_reproduces_the_cli_listing() {
+        let value = serde_json::json!({
+            "name": "media::Demuxer",
+            "confidence": "rtti",
+            "size": {"value": "0x48", "source": "bn_type"},
+            "bases": [{"name": "media::Source"}, {}],
+            "vtable": {"address": "0x412340", "slots": [
+                {"index": 0, "address": "0x404100",
+                 "method": {"display_name": "media::Demuxer::~Demuxer()"}},
+                {"index": 1, "address": "0x404180", "pure_virtual": true},
+                {"index": 2, "address": "0x000000", "null": true},
+                {"index": 3, "address": "0x404200", "external": true,
+                 "external_name": "media::Source::seek"},
+                {"index": 4, "address": "0x404280", "external": true},
+                {"index": 5, "address": "0x404300"}
+            ]},
+            "secondary_vtables": [{"address": "0x412400", "offset_to_top": -16,
+                                   "slots": [{"index": 0, "address": "0x404380",
+                                              "method": {"name": "thunk_seek"}}]}],
+            "methods": [
+                {"kind": "ctor", "address": "0x404000", "demangled": "media::Demuxer::Demuxer()"},
+                {"kind": "dtor", "address": "0x404100", "demangled": "media::Demuxer::~Demuxer()"},
+                {"kind": "method", "address": "0x404400", "demangled": "media::Demuxer::probe()"}
+            ],
+            "instances": {
+                "construction_sites": [
+                    {"kind": "operator_new", "address": "0x405000", "size": "0x48",
+                     "function": "media::open_stream"},
+                    {"kind": "stack", "address": "0x405100"}
+                ],
+                "stored_globals": [{"symbol": "g_demuxer", "address": "0x415200"}]
+            }
+        });
+        let rendered = render_class_show(&value);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines[0],
+            "class media::Demuxer  (size 0x48, vtable @ 0x412340, base: media::Source, ?)"
+        );
+        assert_eq!(lines[1], "  [rtti]");
+        // ctor/dtor rows pad the kind to 6 columns, as the CLI did.
+        assert_eq!(lines[2], "  ctor   0x404000  media::Demuxer::Demuxer()");
+        assert_eq!(lines[3], "  dtor   0x404100  media::Demuxer::~Demuxer()");
+        // Every slot-label branch.
+        assert_eq!(lines[4], "  vtable [0] 0x404100  media::Demuxer::~Demuxer()");
+        assert_eq!(lines[5], "  vtable [1] 0x404180  __cxa_pure_virtual");
+        assert_eq!(lines[6], "  vtable [2] 0x000000  <null>");
+        assert_eq!(lines[7], "  vtable [3] 0x404200  media::Source::seek [external]");
+        assert_eq!(lines[8], "  vtable [4] 0x404280  <external>");
+        assert_eq!(lines[9], "  vtable [5] 0x404300  <unnamed>");
+        assert_eq!(lines[10], "  secondary vtable @ 0x412400 (offset-to-top -16):");
+        assert_eq!(lines[11], "    [0] 0x404380  thunk_seek");
+        assert_eq!(lines[12], "  methods (1):");
+        assert_eq!(lines[13], "    0x404400  media::Demuxer::probe()");
+        assert_eq!(
+            lines[14],
+            "  instances: operator_new @ 0x405000 (size 0x48) (in media::open_stream) ; \
+             stack @ 0x405100 ; stored -> g_demuxer @ 0x415200"
+        );
+    }
+
+    #[test]
+    fn issue21_render_class_show_never_invents_virtuals_or_drops_a_collision() {
+        // A vtable symbol with no resolvable slots must SAY so — rendering an empty
+        // virtual list would read as "this class has no virtuals".
+        let no_slots = serde_json::json!({
+            "name": "media::Controller", "confidence": "symbol",
+            "vtable": {"address": "0x412500", "slots": []},
+        });
+        let rendered = render_class_show(&no_slots);
+        assert!(rendered.contains("  vtable: symbol present but no slots resolved here"));
+        assert!(rendered.contains("applied at load time via relocations"));
+
+        // No vtable at all: no note, and the minimal record still renders.
+        let bare = serde_json::json!({"name": "media::Packet", "confidence": "name_only"});
+        assert_eq!(
+            render_class_show(&bare),
+            "class media::Packet\n  [name_only]\n"
+        );
+
+        // An ambiguous query lists every match rather than silently picking one.
+        let ambiguous = serde_json::json!({
+            "ambiguous": true, "query": "Parser",
+            "matches": [
+                {"name": "media::Parser", "confidence": "rtti"},
+                {"name": "net::Parser", "confidence": "symbol"}
+            ],
+        });
+        let rendered = render_class_show(&ambiguous);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "ambiguous class 'Parser': 2 matches");
+        assert_eq!(lines[1], "");
+        assert_eq!(lines[2], "class media::Parser");
+        assert_eq!(lines[4], "");
+        assert_eq!(lines[5], "class net::Parser");
+    }
+
+    #[test]
+    fn issue21_socket_renders_carry_the_clis_trailing_newline() {
+        // Found by dogfooding, not by reading: `syntax::tokenize_plain` splits on
+        // '\n', so the newline bn's CLI printed contributed a final empty line. A
+        // render without it made the same xrefs read one line shorter over the
+        // socket than over the CLI — the viewer footer said `1/7` where the CLI path
+        // said `1/8`.
+        let xrefs = render_xrefs(&serde_json::json!({"address": "0x401160", "items": []}));
+        assert!(xrefs.ends_with('\n'), "xrefs render: {xrefs:?}");
+        assert_eq!(
+            xrefs.split('\n').count(),
+            xrefs.lines().count() + 1,
+            "the trailing newline must yield the extra split element the CLI path had"
+        );
+
+        let read = render_read(&serde_json::json!({"address": "0x1000", "hex": "00"})).unwrap();
+        assert!(read.ends_with('\n'), "read render: {read:?}");
+
+        let disasm = render_disasm_linear(&serde_json::json!({"text": "0040d214  nop"}));
+        assert!(disasm.ends_with('\n'), "disasm render: {disasm:?}");
+
+        // `type_info` is the deliberate exception: `type_show` splits with `.lines()`
+        // and needs an empty render to stay empty so its placeholder still fires.
+        assert!(render_type_info(&serde_json::json!({"layout": ""})).is_none());
+    }
+
+    #[test]
+    fn issue21_render_type_info_and_disasm_match_their_cli_text() {
+        // `types show` prints the rendered layout, falling back to the declaration.
+        let layout = serde_json::json!({
+            "layout": "struct packet_hdr // size=0x10\n    0x0  uint32_t magic;",
+            "decl": "struct packet_hdr",
+        });
+        assert!(render_type_info(&layout).unwrap().starts_with("struct packet_hdr //"));
+        assert_eq!(
+            render_type_info(&serde_json::json!({"decl": "typedef uint32_t handle_t"})).as_deref(),
+            Some("typedef uint32_t handle_t")
+        );
+        assert!(render_type_info(&serde_json::json!({"layout": ""})).is_none());
+        assert!(render_type_info(&serde_json::json!({})).is_none());
+
+        // A linear disasm leads with `// bn: <note>` — load-bearing, because
+        // `usage::disasm_line` skips comment lines to find the instruction.
+        let disasm = serde_json::json!({
+            "note": "linear disassembly of 1 instruction from 0x40d214 (address-linear order, not function-bounded)",
+            "text": "0040d214  e8 47 12 00 00   call    add_resource_record",
+        });
+        let rendered = render_disasm_linear(&disasm);
+        assert!(rendered.starts_with("// bn: linear disassembly of 1 instruction"));
+        assert_eq!(
+            rendered.lines().nth(1),
+            Some("0040d214  e8 47 12 00 00   call    add_resource_record")
+        );
+        // A note with no body, and a body with no note, both stay well-formed.
+        assert_eq!(
+            render_disasm_linear(&serde_json::json!({"note": "nothing decoded"})),
+            "// bn: nothing decoded\n"
+        );
+        assert_eq!(
+            render_disasm_linear(&serde_json::json!({"text": "0040d214  nop"})),
+            "0040d214  nop\n"
+        );
+    }
 
     #[test]
     fn string_keys_match_pythons_ensure_ascii_rendering() {
@@ -2522,10 +4391,12 @@ mod tests {
     }
 
     #[test]
-    fn decompile_render_appends_the_warnings_the_cli_text_mode_showed() {
+    fn warning_lines_recovers_the_warnings_the_cli_text_mode_showed() {
         // A #446 thunk/veneer decompile: the socket `text` reads like an infinite
         // self-recursion, and the warning is the only thing that says otherwise.
         // Dropping it (reading `text` alone) is the regression this guards.
+        // `decompile_read` carries these into `DecompileRead::warnings`, which
+        // `decomp_view_lines` renders below the body.
         let value = serde_json::json!({
             "text": "int32_t sub_401000()\n{\n    return sub_401000();\n}",
             "warnings": [
@@ -2533,13 +4404,16 @@ mod tests {
                  (a jump to the real body), not a self-recursive function.",
             ],
         });
-        let rendered = decompile_render(&value);
-        assert!(rendered.starts_with("int32_t sub_401000()"));
-        assert!(rendered.contains("\n\nwarning: thunk/veneer -> memcpy @ 0x402000:"));
+        let warnings = warning_lines(&value);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].starts_with("warning: thunk/veneer -> memcpy @ 0x402000:"),
+            "{warnings:?}"
+        );
     }
 
     #[test]
-    fn decompile_render_prefixes_the_interior_address_resolution_note() {
+    fn resolution_note_describes_an_interior_address_read() {
         // A goto/xref bounce to a mid-function address resolves to the container;
         // the leading note is what tells the reader the entry differs on purpose.
         let value = serde_json::json!({
@@ -2547,19 +4421,19 @@ mod tests {
             "function": {"name": "handler", "address": "0x401000"},
             "resolved_from": {"requested_address": "0x401014", "offset": "+0x14"},
         });
-        let rendered = decompile_render(&value);
         assert_eq!(
-            rendered.lines().next(),
+            resolution_note(&value).lines().next(),
             Some("// bn: 0x401014 is inside handler @ 0x401000 (+0x14); showing the containing function")
         );
     }
 
     #[test]
-    fn decompile_render_is_bare_text_when_there_is_nothing_to_annotate() {
-        // The common case — an exact-name decompile with no warnings — must be
-        // byte-identical to the plain `text`, no stray note or blank lines.
+    fn a_clean_decompile_carries_no_note_and_no_warnings() {
+        // The common case — an exact-name decompile with no warnings — must add
+        // nothing at all, so the body renders byte-identical to `text`.
         let value = serde_json::json!({"text": "void f()\n{\n}"});
-        assert_eq!(decompile_render(&value), "void f()\n{\n}");
+        assert!(resolution_note(&value).is_empty());
+        assert!(warning_lines(&value).is_empty());
     }
 
     #[test]
@@ -2568,6 +4442,24 @@ mod tests {
         assert!(!AnalysisState::from_raw("quick").is_complete());
         assert_eq!(AnalysisState::from_raw("").label(), "unknown");
         assert_eq!(AnalysisState::from_raw("partial").label(), "partial");
+    }
+
+    #[test]
+    fn a_failed_decompile_read_is_an_error_not_an_absence() {
+        // `Option` conflated "the backend answered, this function has no body" with
+        // "the read failed", and the viewer retried on the latter with a *second*
+        // full decompile: a timed-out backend paid the budget twice, and the retry
+        // could resolve against different live state. No client resolves for this
+        // instance, so the CLI fallback runs against a missing binary and fails.
+        let bn = Bn::new(
+            "/definitely/missing/bn-lens-test-binary".into(),
+            Some("bn-lens-test-no-such-instance".into()),
+            None,
+        );
+        match bn.decompile_read("main") {
+            Err(error) => assert!(!error.is_empty(), "the failure must carry a message"),
+            Ok(_) => panic!("a failed read must not be reported as an absence"),
+        }
     }
 
     #[test]
@@ -2776,3 +4668,4 @@ mod tests {
         assert!(!locals[1].is_stack());
     }
 }
+
