@@ -516,6 +516,16 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
+        key: "code key (cfg graph)",
+        action: "x p n y ; t s S / : act on the selected block — the graph hands off to the linear view at its head address first",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "a  (cfg graph)",
+        action: "ask the agent about the selected block (its head address and instructions)",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
         key: "/  then ] / [",
         action: "find; next / previous match",
     },
@@ -685,11 +695,36 @@ const LINES: &[HelpLine] = &[
 pub struct Help {
     open: bool,
     offset: usize,
+    /// View height of the last `render`, so the scroll keys can clamp against
+    /// the same start row the renderer will actually use. `Cell` because
+    /// `render` takes `&self`; the overlay is single-threaded TUI state.
+    view_height: std::cell::Cell<usize>,
 }
 
 impl Help {
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// The highest start row `render` can scroll to. Scroll state must clamp
+    /// against **this**, not `LINES.len() - 1`: an offset past it is invisible
+    /// (the renderer clamps the start anyway) yet still has to be walked back
+    /// down, which swallows the first ~`view_height` up-presses after `G`.
+    /// Before the first render there is no height to clamp by, so fall back to
+    /// the line count; the next render corrects it.
+    fn max_start(&self) -> usize {
+        match self.view_height.get() {
+            0 => LINES.len().saturating_sub(1),
+            height => LINES.len().saturating_sub(height),
+        }
+    }
+
+    /// Move the scroll by `delta` rows, normalizing first so a stale offset
+    /// (e.g. from a resize, or `open` landing on a section near the end) can't
+    /// absorb the press.
+    fn scroll_by(&mut self, delta: isize) {
+        let max = self.max_start();
+        self.offset = self.offset.min(max).saturating_add_signed(delta).min(max);
     }
 
     pub fn open(&mut self, context: HelpContext) {
@@ -707,28 +742,20 @@ impl Help {
             KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
                 self.open = false;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.offset = (self.offset + 1).min(LINES.len().saturating_sub(1));
-            }
-            KeyCode::Char('k') | KeyCode::Up => self.offset = self.offset.saturating_sub(1),
-            KeyCode::Char('d') | KeyCode::PageDown => {
-                self.offset = (self.offset + 10).min(LINES.len().saturating_sub(1));
-            }
-            KeyCode::Char('u') | KeyCode::PageUp => {
-                self.offset = self.offset.saturating_sub(10);
-            }
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
+            KeyCode::Char('d') | KeyCode::PageDown => self.scroll_by(10),
+            KeyCode::Char('u') | KeyCode::PageUp => self.scroll_by(-10),
             KeyCode::Char('g') | KeyCode::Home => self.offset = 0,
-            KeyCode::Char('G') | KeyCode::End => self.offset = LINES.len().saturating_sub(1),
+            KeyCode::Char('G') | KeyCode::End => self.offset = self.max_start(),
             _ => {}
         }
     }
 
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.offset = self.offset.saturating_sub(3),
-            MouseEventKind::ScrollDown => {
-                self.offset = (self.offset + 3).min(LINES.len().saturating_sub(1));
-            }
+            MouseEventKind::ScrollUp => self.scroll_by(-3),
+            MouseEventKind::ScrollDown => self.scroll_by(3),
             _ => {}
         }
     }
@@ -753,7 +780,9 @@ impl Help {
 
         let inner_width = box_width.saturating_sub(4) as usize;
         let view_height = box_height.saturating_sub(2) as usize;
-        let max_start = LINES.len().saturating_sub(view_height);
+        // Publish the height so the scroll keys clamp to the same start row.
+        self.view_height.set(view_height);
+        let max_start = self.max_start();
         let start = self.offset.min(max_start);
         let section_style = Style::default()
             .fg(Color::Cyan)
@@ -862,6 +891,91 @@ mod tests {
 
         help.on_key(key(KeyCode::Char('?')));
         assert!(!help.is_open());
+    }
+
+    /// The rendered rows of the overlay body, for comparing two frames.
+    fn body(buffer: &Buffer, area: Rect) -> Vec<String> {
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn draw(help: &Help, area: Rect) -> Buffer {
+        let mut buffer = Buffer::empty(area);
+        help.render(area, &mut buffer, HelpContext::Viewer);
+        buffer
+    }
+
+    /// #28: `G` used to park `offset` at `LINES.len() - 1`, ~`view_height` rows
+    /// past the highest start the renderer can use, so the up-presses that
+    /// followed were absorbed and the overlay read as frozen.
+    #[test]
+    fn end_clamps_to_the_start_row_the_renderer_can_reach() {
+        let area = Rect::new(0, 0, 100, 24);
+        let mut help = Help::default();
+        help.open(HelpContext::Viewer);
+        draw(&help, area);
+
+        // 24 rows − 2·2 margin = a 20-row box, 18 of them content.
+        help.on_key(key(KeyCode::Char('G')));
+        assert_eq!(help.offset, LINES.len() - 18);
+    }
+
+    #[test]
+    fn one_up_press_after_end_moves_the_rendered_view() {
+        let area = Rect::new(0, 0, 100, 24);
+        let mut help = Help::default();
+        help.open(HelpContext::Viewer);
+        draw(&help, area);
+
+        help.on_key(key(KeyCode::Char('G')));
+        let last_page = body(&draw(&help, area), area);
+        help.on_key(key(KeyCode::Up));
+        assert_ne!(body(&draw(&help, area), area), last_page);
+    }
+
+    /// The wheel had the same asymmetry as `k`/`Up`.
+    #[test]
+    fn one_wheel_up_after_scrolling_to_the_end_moves_the_view() {
+        let area = Rect::new(0, 0, 100, 24);
+        let mut help = Help::default();
+        help.open(HelpContext::Viewer);
+        draw(&help, area);
+
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..LINES.len() {
+            help.on_mouse(wheel(MouseEventKind::ScrollDown));
+        }
+        let bottom = body(&draw(&help, area), area);
+        help.on_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_ne!(body(&draw(&help, area), area), bottom);
+    }
+
+    /// The footer counter reads `start/max_start`; with the offset clamped to
+    /// the same bound, `G` must land on the last page rather than climb past it.
+    #[test]
+    fn footer_counter_agrees_with_the_offset_at_the_end() {
+        let area = Rect::new(0, 0, 100, 24);
+        let mut help = Help::default();
+        help.open(HelpContext::Viewer);
+        draw(&help, area);
+        help.on_key(key(KeyCode::Char('G')));
+        let max_start = LINES.len() - 18;
+        assert_eq!(help.offset, max_start);
+        help.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            help.offset, max_start,
+            "j at the end must not climb past it"
+        );
     }
 
     #[test]
