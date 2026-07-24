@@ -37,6 +37,21 @@ struct Refreshing {
     rx: Receiver<Result<Ctx, String>>,
 }
 
+/// An in-flight `p` usage peek running on a worker thread. The requesting view
+/// already shows its popup shell with a loading line; unlike a refresh, input
+/// stays live (the popup owns keys, so Esc dismisses it — the late result is
+/// then discarded on delivery rather than the `bn` calls being interrupted).
+struct Peeking {
+    started: Instant,
+    /// The view whose popup requested the report (its keys stay captured while
+    /// the popup is open, so it can't change out from under us unnoticed).
+    view: AppView,
+    /// Delivery is matched on the popup's address: a closed or re-targeted
+    /// popup rejects the lines and the stale report is dropped.
+    addr: String,
+    rx: Receiver<Vec<String>>,
+}
+
 /// Which top-level list the picker pane is showing.
 #[derive(Clone, Copy, PartialEq)]
 enum AppView {
@@ -72,6 +87,7 @@ struct App {
     partner: Option<crate::herdr::PaneAgent>,
     last_poll: Option<Instant>,
     refreshing: Option<Refreshing>,
+    peeking: Option<Peeking>,
     /// Context-rebuild failures belong to the old ctx, so retain them here;
     /// cached-list/state failures are shared through `ctx.bn.last_error()`.
     /// Per-item viewer reads render their errors locally instead.
@@ -106,6 +122,7 @@ impl App {
             partner: None,
             last_poll: None,
             refreshing: None,
+            peeking: None,
             refresh_error: None,
         }
     }
@@ -273,6 +290,10 @@ impl App {
                 self.viewer = Some(Viewer::new(&self.ctx, name, false));
                 false
             }
+            Action::PeekUsage { addr, hint } => {
+                self.start_peek(addr, hint);
+                false
+            }
             Action::Switch => {
                 self.open_switcher();
                 false
@@ -354,6 +375,77 @@ impl App {
                 self.refreshing = None;
             }
             Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Kick off a usage report (`p` peek) on a worker thread, mirroring
+    /// [`Self::start_refresh`]: for hot symbols the report's serial `bn` calls
+    /// take seconds, and running them on the UI thread froze the TUI with no
+    /// feedback. The requesting view has already opened its popup shell with a
+    /// loading line; [`Self::poll_peek`] fills it in when the worker delivers.
+    /// A new peek replaces any in-flight one (the old receiver is dropped, so
+    /// the stale worker's send fails and its result vanishes).
+    fn start_peek(&mut self, addr: String, hint: String) {
+        let src = crate::usage::UsageSource::from_ctx(&self.ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let addr = addr.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::usage::report(&src, &addr, &hint));
+            });
+        }
+        self.peeking = Some(Peeking {
+            started: Instant::now(),
+            view: self.view,
+            addr,
+            rx,
+        });
+    }
+
+    /// Deliver a finished peek to the popup that requested it, or — while it's
+    /// still running — keep the popup's loading counter ticking. A popup that
+    /// was closed (Esc) or re-targeted rejects delivery; the result is dropped
+    /// and the peek stops being tracked.
+    fn poll_peek(&mut self) {
+        let Some(peeking) = &self.peeking else {
+            return;
+        };
+        let (view, addr) = (peeking.view, peeking.addr.clone());
+        match peeking.rx.try_recv() {
+            Ok(lines) => {
+                self.deliver_usage(view, &addr, lines);
+                self.peeking = None;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.deliver_usage(view, &addr, vec!["✗ usage worker died".into()]);
+                self.peeking = None;
+            }
+            Err(TryRecvError::Empty) => {
+                let elapsed = peeking.started.elapsed().as_secs_f32();
+                if !self.deliver_usage(view, &addr, crate::usage::loading_lines(elapsed)) {
+                    self.peeking = None;
+                }
+            }
+        }
+    }
+
+    /// Route usage lines to `view`'s popup. False if the view (or its popup for
+    /// `addr`) is gone — the caller drops the in-flight peek.
+    fn deliver_usage(&mut self, view: AppView, addr: &str, lines: Vec<String>) -> bool {
+        match view {
+            AppView::Strings => self
+                .strings
+                .as_mut()
+                .is_some_and(|s| s.set_usage_lines(addr, lines)),
+            AppView::Imports => self
+                .imports
+                .as_mut()
+                .is_some_and(|s| s.set_usage_lines(addr, lines)),
+            AppView::Exports => self
+                .exports
+                .as_mut()
+                .is_some_and(|s| s.set_usage_lines(addr, lines)),
+            _ => false,
         }
     }
 
@@ -808,6 +900,7 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
     let mut app = App::new(ctx);
     let res = loop {
         app.poll_refresh();
+        app.poll_peek();
         app.poll_status();
         term.draw(|f| {
             app.area = f.area();
@@ -862,9 +955,9 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
             app.draw_refresh(f.buffer_mut(), app.area);
         })?;
 
-        // Tick faster while refreshing so the banner's counter stays smooth;
-        // otherwise wake ~1/s to refresh the partner status.
-        let timeout = if app.refreshing.is_some() {
+        // Tick faster while a refresh or peek is in flight so their counters
+        // stay smooth; otherwise wake ~1/s to refresh the partner status.
+        let timeout = if app.refreshing.is_some() || app.peeking.is_some() {
             Duration::from_millis(100)
         } else {
             Duration::from_millis(400)

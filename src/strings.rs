@@ -153,15 +153,36 @@ impl StringsList {
     /// decompile each referencing function once (`--addresses`), and show exact
     /// disassembly plus approximate pseudo-C at each callsite, grouped by
     /// function, plus any data refs. (`x`/Enter opens the full xrefs listing.)
-    fn open_usage(&mut self, ctx: &Ctx) {
-        let Some(item) = self.current() else { return };
+    /// Opens the popup shell immediately (loading line); the app computes the
+    /// report on a worker thread and delivers it via [`Self::set_usage_lines`].
+    fn open_usage(&mut self) -> Action {
+        let Some(item) = self.current() else {
+            return Action::None;
+        };
         let (addr, content) = (item.addr.clone(), item.content.clone());
         self.usage = Some(Usage {
             title: format!("used in code · \"{}\"", ellipsize(&content, 34)),
-            lines: crate::usage::report(ctx, &addr, &content),
-            addr,
+            lines: crate::usage::loading_lines(0.0),
+            addr: addr.clone(),
             off: 0,
         });
+        Action::PeekUsage {
+            addr,
+            hint: content,
+        }
+    }
+
+    /// Fill the open usage popup with the worker's report. Returns false —
+    /// and drops the lines — if the popup was closed or re-targeted meanwhile.
+    pub fn set_usage_lines(&mut self, addr: &str, lines: Vec<String>) -> bool {
+        match &mut self.usage {
+            Some(usage) if usage.addr == addr => {
+                usage.off = usage.off.min(lines.len().saturating_sub(1));
+                usage.lines = lines;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn usage_key(&mut self, k: KeyEvent) -> Action {
@@ -187,7 +208,7 @@ impl StringsList {
         Action::None
     }
 
-    pub fn on_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Action {
+    pub fn on_key(&mut self, k: KeyEvent, _ctx: &Ctx) -> Action {
         if self.usage.is_some() {
             return self.usage_key(k);
         }
@@ -256,7 +277,7 @@ impl StringsList {
                 self.mode = Mode::Search;
                 self.sel = 0;
             }
-            KeyCode::Char('p') => self.open_usage(ctx),
+            KeyCode::Char('p') => return self.open_usage(),
             KeyCode::Enter | KeyCode::Char('x') => {
                 if let Some(a) = self.current_addr() {
                     return Action::OpenXrefs(a);

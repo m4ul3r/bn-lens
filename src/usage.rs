@@ -3,8 +3,10 @@
 //! once (`--addresses`), and render exact disassembly plus an explicitly
 //! approximate pseudo-C mapping at each callsite, plus any data-ref lines.
 
+use crate::bn::Bn;
 use crate::ctx::Ctx;
 use crate::decomp::{addr_lines, lines_at};
+use std::collections::HashMap;
 
 /// Caps that bound a peek's latency: one decompile per referencing function
 /// (~hundreds of ms each) and a total site count. The full set is one `x` away.
@@ -16,21 +18,58 @@ const MAX_FUNCS: usize = 6;
 const MAX_HINT_RESCUE_DISTANCE: u64 = 0x40;
 const MIN_HINT_RESCUE_CHARS: usize = 4;
 
+/// The slice of [`Ctx`] a usage report actually reads, snapshotted so the
+/// report can run on a worker thread (`Ctx` itself is not `Send` — it holds a
+/// lazily-built `OnceCell`). `Bn` clones share the socket client and failure
+/// state by `Arc`, so backend errors still surface in the shared status bar.
+pub struct UsageSource {
+    bn: Bn,
+    analysis_warning: Option<String>,
+    analysis_complete: bool,
+    display_by_name: HashMap<String, String>,
+}
+
+impl UsageSource {
+    pub fn from_ctx(ctx: &Ctx) -> Self {
+        UsageSource {
+            bn: ctx.bn.clone(),
+            analysis_warning: ctx.analysis_warning(),
+            analysis_complete: ctx.analysis_complete(),
+            display_by_name: ctx.display_by_name.clone(),
+        }
+    }
+
+    fn display_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.display_by_name
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name)
+    }
+}
+
+/// The popup body while the report worker runs. Rebuilt each tick by the app
+/// so the elapsed counter moves; Esc closes the popup and the app discards the
+/// in-flight result on delivery.
+pub fn loading_lines(elapsed_secs: f32) -> Vec<String> {
+    vec![format!("⟳ loading usage…  {elapsed_secs:.1}s   · Esc to close")]
+}
+
 /// Build the usage-report lines for `addr` (the popup body). Empty references
-/// yield a single analysis-qualified explanatory line.
-pub fn report(ctx: &Ctx, addr: &str, hint: &str) -> Vec<String> {
-    let raw_xrefs = match ctx.bn.xrefs_checked(addr) {
+/// yield a single analysis-qualified explanatory line. Runs on a worker thread
+/// (the `p` peek), so it takes the [`UsageSource`] snapshot rather than `&Ctx`.
+pub fn report(src: &UsageSource, addr: &str, hint: &str) -> Vec<String> {
+    let raw_xrefs = match src.bn.xrefs_checked(addr) {
         Ok(xrefs) => xrefs,
         Err(error) => return vec![format!("✗ {error}")],
     };
     let (code, data) = parse_xrefs(&raw_xrefs);
     let mut lines: Vec<String> = Vec::new();
-    if let Some(warning) = ctx.analysis_warning() {
-        lines.push(warning);
+    if let Some(warning) = &src.analysis_warning {
+        lines.push(warning.clone());
         lines.push(String::new());
     }
     if code.is_empty() && data.is_empty() {
-        lines.push(if ctx.analysis_complete() {
+        lines.push(if src.analysis_complete {
             "no code or data references".into()
         } else {
             "no references observed in incomplete analysis".into()
@@ -46,8 +85,8 @@ pub fn report(ctx: &Ctx, addr: &str, hint: &str) -> Vec<String> {
                 break;
             }
             funcs_left -= 1;
-            lines.push(format!("  {}", ctx.display_name(func)));
-            let dec = addr_lines(&ctx.bn.decompile_addr(func));
+            lines.push(format!("  {}", src.display_name(func)));
+            let dec = addr_lines(&src.bn.decompile_addr(func));
             for site in sites {
                 if sites_left == 0 {
                     lines.push("    … more sites — x for the full list".into());
@@ -58,7 +97,7 @@ pub fn report(ctx: &Ctx, addr: &str, hint: &str) -> Vec<String> {
                 // address-prefixed decompile can assign a call address to a
                 // declaration/neighboring statement, so pseudo-C is explicitly
                 // approximate and never replaces the instruction evidence.
-                lines.push(format!("    {site}  asm: {}", disasm_line(ctx, site)));
+                lines.push(format!("    {site}  asm: {}", disasm_line(&src.bn, site)));
                 let matched = crate::ctx::parse_hex(site)
                     .map(|cs| best_decompile_lines(&dec, cs, hint))
                     .unwrap_or_default();
@@ -167,9 +206,8 @@ fn parse_xrefs(text: &str) -> (Vec<(String, Vec<String>)>, Vec<String>) {
 
 /// The instruction line at `addr` (first non-comment line of a 1-instruction
 /// linear disasm), trimmed; falls back to the bare address on any miss.
-fn disasm_line(ctx: &Ctx, addr: &str) -> String {
-    ctx.bn
-        .disasm_linear(addr, 1)
+fn disasm_line(bn: &Bn, addr: &str) -> String {
+    bn.disasm_linear(addr, 1)
         .lines()
         .map(str::trim_end)
         .find(|l| !l.trim_start().starts_with("//") && !l.trim().is_empty())
@@ -179,7 +217,18 @@ fn disasm_line(ctx: &Ctx, addr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{best_decompile_lines, parse_xrefs};
+    use super::{best_decompile_lines, loading_lines, parse_xrefs};
+
+    #[test]
+    fn loading_lines_show_elapsed_and_dismiss_hint() {
+        let lines = loading_lines(0.0);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("loading usage"));
+        assert!(lines[0].contains("0.0s"));
+        assert!(lines[0].contains("Esc"));
+        // The counter must actually move as the app re-renders it each tick.
+        assert!(loading_lines(2.34)[0].contains("2.3s"));
+    }
 
     #[test]
     fn parses_code_callsites_and_data_refs() {

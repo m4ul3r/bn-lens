@@ -16,6 +16,9 @@ use std::collections::{HashMap, HashSet};
 pub enum Action {
     OpenDecompile(String),
     OpenXrefs(String),
+    /// Load a usage report for (addr, hint) on the app's worker thread; the
+    /// requesting view has already opened its popup shell with a loading line.
+    PeekUsage { addr: String, hint: String },
     Switch,
     /// Return to the Symbols list (Esc from a non-Symbols list, filter empty).
     Home,

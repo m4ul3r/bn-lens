@@ -174,15 +174,33 @@ impl ExportsList {
     }
 
     /// `p`: peek where the export is used — exact asm plus approximate C.
-    fn open_usage(&mut self, ctx: &Ctx) {
-        let Some(item) = self.current() else { return };
+    /// Opens the popup shell immediately (loading line); the app computes the
+    /// report on a worker thread and delivers it via [`Self::set_usage_lines`].
+    fn open_usage(&mut self) -> Action {
+        let Some(item) = self.current() else {
+            return Action::None;
+        };
         let (addr, name) = (item.addr.clone(), item.display_name.clone());
         self.usage = Some(Usage {
             title: format!("uses of {name}"),
-            lines: crate::usage::report(ctx, &addr, &name),
-            addr,
+            lines: crate::usage::loading_lines(0.0),
+            addr: addr.clone(),
             off: 0,
         });
+        Action::PeekUsage { addr, hint: name }
+    }
+
+    /// Fill the open usage popup with the worker's report. Returns false —
+    /// and drops the lines — if the popup was closed or re-targeted meanwhile.
+    pub fn set_usage_lines(&mut self, addr: &str, lines: Vec<String>) -> bool {
+        match &mut self.usage {
+            Some(usage) if usage.addr == addr => {
+                usage.off = usage.off.min(lines.len().saturating_sub(1));
+                usage.lines = lines;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn usage_key(&mut self, k: KeyEvent) -> Action {
@@ -208,7 +226,7 @@ impl ExportsList {
         Action::None
     }
 
-    pub fn on_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Action {
+    pub fn on_key(&mut self, k: KeyEvent, _ctx: &Ctx) -> Action {
         if self.usage.is_some() {
             return self.usage_key(k);
         }
@@ -273,7 +291,7 @@ impl ExportsList {
                 self.mode = Mode::Search;
                 self.sel = 0;
             }
-            KeyCode::Char('p') => self.open_usage(ctx),
+            KeyCode::Char('p') => return self.open_usage(),
             KeyCode::Enter => return self.open_action(),
             KeyCode::Char('x') => return self.xref_action(),
             _ => {}
