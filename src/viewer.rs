@@ -770,7 +770,17 @@ impl Viewer {
         let lo_str = format!("0x{lo:x}");
         let hi_str = format!("0x{hi:x}");
         let vars = ctx.bn.data_vars(&lo_str, &hi_str);
-        let dump = ctx.bn.read_dump(&lo_str, (hi - lo) as usize);
+        // A failed read must not be laid out as a window of unknown bytes — that
+        // reads as "this region is empty", which is a conclusion about the target.
+        let dump = match ctx.bn.read_dump(&lo_str, (hi - lo) as usize) {
+            Ok(dump) => dump,
+            Err(error) => {
+                self.lines = Vec::new();
+                self.spans = Vec::new();
+                self.status = format!(" ✗ {error}");
+                return;
+            }
+        };
         let bytes = crate::datamap::parse_hexdump(&dump, lo);
         let result = crate::datamap::linear(&label, lo, hi, &vars, &bytes, addr);
         self.lines = result.lines;

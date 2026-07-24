@@ -988,13 +988,13 @@ fn mutation_outcome(value: &serde_json::Value) -> MutationOutcome {
     let failed = rows
         .iter()
         .find(|row| FAILED_MUTATION_STATUSES.contains(&status(row).as_str()));
-    // The CLI defaults an absent `success` to true; mirror that rather than reading a
-    // shape change as a failed write.
-    let reported = value
-        .get("success")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let success = reported && failed.is_none();
+    // Fail closed on a missing or non-boolean `success`. The CLI defaults it to true
+    // for *presentation*, but as a write acknowledgement that default is unsafe: a
+    // schema change or a malformed empty result would be promoted to a committed
+    // write, and the lens would report — and locally retext — a rename that no field
+    // says landed. Verification-awareness still applies on top (the CLI's rule).
+    let reported = value.get("success").and_then(serde_json::Value::as_bool);
+    let success = reported == Some(true) && failed.is_none();
     let changed_count = rows.iter().filter(|row| status(row) == "verified").count() as u64;
     let first_error = (!success).then(|| {
         failed
@@ -1012,7 +1012,13 @@ fn mutation_outcome(value: &serde_json::Value) -> MutationOutcome {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
             })
-            .unwrap_or_else(|| "mutation failed".into())
+            .unwrap_or_else(|| match reported {
+                // Nothing in the payload says the write committed. Naming that
+                // specifically matters: it is a bridge/schema problem, not a
+                // rejected mutation, and retrying the same write will not fix it.
+                None => "bn did not report whether the write committed".into(),
+                Some(_) => "mutation failed".into(),
+            })
     });
     MutationOutcome {
         success,
@@ -2496,7 +2502,21 @@ impl Bn {
                 "read",
                 serde_json::json!({"address": addr, "length": length}),
             )? {
-                Ok(value) => Ok(render_read(&value).unwrap_or_default()),
+                // `render_read` returns `None` only for a missing or undecodable
+                // `hex` field, and it documents that as the fall-back signal — but a
+                // socket path *did* exist here, so neither caller falls back.
+                // Defaulting it to `Ok("")` therefore reported an unexpected payload
+                // as an absence: `read` claimed `(no data)` for the window and the
+                // data view rendered a region of unknown bytes.
+                Ok(value) => render_read(&value).ok_or_else(|| {
+                    let bridge = match self.bridge_version() {
+                        Some(version) => format!(" (bridge {version})"),
+                        None => String::new(),
+                    };
+                    format!(
+                        "bn read returned no decodable hex for {length} bytes at {addr}{bridge}"
+                    )
+                }),
                 Err(error) => Err(error),
             },
         )
@@ -2504,17 +2524,20 @@ impl Bn {
 
     /// Like [`Self::read`] but via `--out`, so a large window (the linear data
     /// view can request several KB) doesn't trip bn's stdout spill envelope.
-    /// Empty on failure.
-    pub fn read_dump(&self, addr: &str, length: usize) -> String {
+    ///
+    /// `Err` rather than an empty dump: the data view lays out whatever bytes it is
+    /// given, so "the read failed" and "these bytes are all unknown" have to stay
+    /// distinguishable at the call site.
+    pub fn read_dump(&self, addr: &str, length: usize) -> Result<String, String> {
         if let Some(result) = self.read_bytes(addr, length) {
-            return result.unwrap_or_default();
+            return result;
         }
         let len = length.to_string();
-        let out = self.run_out(&cli_argv(&["read", "--length", &len], &[addr]));
+        let out = self.run_out_checked(&cli_argv(&["read", "--length", &len], &[addr]))?;
         if out.trim_start().starts_with('✗') {
-            String::new()
+            Err(clean_err(&out))
         } else {
-            out
+            Ok(out)
         }
     }
 }
@@ -3781,9 +3804,18 @@ mod tests {
             Some("rollback failed: the view may be left modified")
         );
 
-        // An absent `success` defaults to true, as the CLI does — a shape change
-        // must not read as a failed write.
-        assert!(mutation_outcome(&serde_json::json!({"results": []})).success);
+        // An absent `success` is NOT an acknowledgement. The CLI's presentation
+        // default would promote a schema change (or a malformed empty result) to a
+        // committed write, and the lens would then report and locally retext a
+        // rename that no field says landed.
+        let unacknowledged = mutation_outcome(&serde_json::json!({"results": []}));
+        assert!(!unacknowledged.success);
+        assert_eq!(
+            unacknowledged.first_error.as_deref(),
+            Some("bn did not report whether the write committed")
+        );
+        // A non-boolean `success` is the same class of surprise.
+        assert!(!mutation_outcome(&serde_json::json!({"success": "yes"})).success);
         // …and a failure with nothing to quote still names itself.
         assert_eq!(
             mutation_outcome(&serde_json::json!({"success": false}))
@@ -3791,6 +3823,31 @@ mod tests {
                 .as_deref(),
             Some("mutation failed")
         );
+    }
+
+    #[test]
+    fn a_read_payload_without_decodable_hex_is_not_an_empty_dump() {
+        // `render_read`'s `None` is the "fall back to the CLI" signal, and
+        // `read_bytes` used to default it to `Ok("")`. Because a socket path existed,
+        // neither caller then fell back: `read` reported `(no data)` for the window
+        // and the data view laid out a region of unknown bytes — both of which read
+        // as claims about the target rather than about the payload.
+        assert!(render_read(&serde_json::json!({"address": "0x415200"})).is_none());
+        assert!(render_read(&serde_json::json!({"address": "0x415200", "hex": "zz"})).is_none());
+        assert!(render_read(&serde_json::json!({"address": "0x415200", "hex": "41"})).is_some());
+    }
+
+    #[test]
+    fn a_failed_dump_read_is_an_error_not_an_empty_window() {
+        // The instance does not exist, so no client resolves and the CLI fallback
+        // runs against a missing binary. `read_dump` must not flatten that to an
+        // empty dump: `datamap::linear` would render the window as unknown bytes.
+        let bn = Bn::new(
+            "/definitely/missing/bn-lens-test-binary".into(),
+            Some("bn-lens-test-no-such-instance".into()),
+            None,
+        );
+        assert!(bn.read_dump("0x415200", 64).is_err());
     }
 
     #[test]
