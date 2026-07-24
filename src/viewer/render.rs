@@ -295,6 +295,22 @@ impl Viewer {
             crate::ui::put_spans(buffer, area.x, area.y + 1, code_width, &location);
         }
 
+        // The address the cursor is actually on, right-aligned so it stays put as
+        // you move and whatever occupies the left of row 1 (location, a hotspot
+        // hint, status, or a search/goto prompt). Code views only.
+        if let Some(addr) = self.cursor_addr() {
+            let label = format!("@ 0x{addr:x} ");
+            let x = area.x + (code_width.saturating_sub(label.chars().count())) as u16;
+            crate::ui::put_str(
+                buffer,
+                x,
+                area.y + 1,
+                label,
+                code_width,
+                Style::default().fg(Color::Cyan),
+            );
+        }
+
         let hint = if self.stack_view.is_open() {
             crate::ui::hint_bar(&[
                 &[("", "stack")],
