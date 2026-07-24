@@ -30,6 +30,10 @@ struct Usage {
 
 pub struct StringsList {
     items: Vec<StrItem>,
+    /// Backend read failure. `Bn::strings` hands back a plain `Vec`, so the
+    /// error is recovered from the shared health cell — see
+    /// [`crate::picker::empty_list_error`].
+    error: Option<String>,
     awidth: usize,
     filter: String,
     prev_filter: String,
@@ -56,6 +60,7 @@ fn parse_hex(s: &str) -> Option<u64> {
 impl StringsList {
     pub fn new(ctx: &Ctx) -> Self {
         let items = Self::build(ctx);
+        let error = crate::picker::empty_list_error(items.is_empty(), ctx.bn.last_error());
         let awidth = items
             .iter()
             .map(|it| it.addr.len())
@@ -64,6 +69,7 @@ impl StringsList {
             .max(10);
         StringsList {
             items,
+            error,
             awidth,
             filter: String::new(),
             prev_filter: String::new(),
@@ -78,6 +84,7 @@ impl StringsList {
     /// Re-pull strings from a rebuilt ctx (keeps the filter, snaps the cursor).
     pub fn refresh(&mut self, ctx: &Ctx) {
         self.items = Self::build(ctx);
+        self.error = crate::picker::empty_list_error(self.items.is_empty(), ctx.bn.last_error());
         self.awidth = self
             .items
             .iter()
@@ -88,6 +95,9 @@ impl StringsList {
         // Keep the cursor valid if the rebuilt list shrank.
         self.sel = self.sel.min(self.filtered().len().saturating_sub(1));
         self.top = self.top.min(self.sel);
+        // The list underneath moved; a surviving popup would describe the
+        // pre-refresh selection.
+        self.usage = None;
     }
 
     /// Deduped by address. bn emits the same content at several addresses
@@ -232,7 +242,10 @@ impl StringsList {
                 }
                 KeyCode::Down => self.move_sel(1),
                 KeyCode::Up => self.move_sel(-1),
-                KeyCode::Char(c) => {
+                // A ctrl chord is never text: crossterm decodes ^U as
+                // `Char('u') + CONTROL`, so an unguarded arm turns a line-edit
+                // reflex into a literal letter in the filter.
+                KeyCode::Char(c) if !ctrl => {
                     self.filter.push(c);
                     self.sel = 0;
                 }
@@ -361,6 +374,22 @@ impl StringsList {
         );
         crate::ui::render_bar(buf, x0, area.y + area.height.saturating_sub(1), w, &hint);
 
+        // A failed read must dominate the (necessarily empty) table — an empty
+        // strings list is a real finding, and a bridge failure must not borrow
+        // its authority.
+        if let Some(error) = &self.error {
+            crate::ui::put_str(
+                buf,
+                x0 + 2,
+                area.y + 3,
+                format!("✗ {error}"),
+                w.saturating_sub(4),
+                Style::default().fg(Color::Red),
+            );
+            self.render_usage(area, buf);
+            return;
+        }
+
         for (row, &i) in rows.iter().enumerate().skip(self.top).take(listh) {
             let y = area.y + 2 + (row - self.top) as u16;
             let it = &self.items[i];
@@ -422,5 +451,67 @@ impl StringsList {
             (bw - 4) as usize,
             Style::default().add_modifier(Modifier::DIM),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::picker::tests::{ctrl, plain};
+
+    #[test]
+    fn a_failed_read_surfaces_an_error_instead_of_an_empty_table() {
+        // `Bn::strings` swallows its error into the shared health cell; the view
+        // has to recover it, or a wedged bridge reads as "this binary has no
+        // strings".
+        let ctx = Ctx::stub();
+        let list = StringsList::new(&ctx);
+        assert!(list.items.is_empty());
+        assert!(
+            list.error.is_some_and(|error| !error.is_empty()),
+            "an empty strings list under a recorded read failure must show it"
+        );
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_filter() {
+        let ctx = Ctx::stub();
+        let mut list = StringsList::new(&ctx);
+        list.on_key(plain('/'), &ctx);
+        for ch in "passwd".chars() {
+            list.on_key(plain(ch), &ctx);
+        }
+        assert_eq!(list.filter, "passwd");
+        for ch in ['a', 'e', 'u', 'w', 'r'] {
+            list.on_key(ctrl(ch), &ctx);
+        }
+        assert_eq!(
+            list.filter, "passwd",
+            "a ctrl chord must not push its letter into the filter"
+        );
+    }
+
+    #[test]
+    fn refresh_closes_a_stale_usage_popup() {
+        let ctx = Ctx::stub();
+        let mut list = StringsList::new(&ctx);
+        list.usage = Some(Usage {
+            title: "used in code · \"cfg reload\"".into(),
+            addr: "0x4a1200".into(),
+            lines: vec!["0x401980  apply_config".into()],
+            off: 0,
+        });
+        assert!(list.popup_open());
+        list.refresh(&ctx);
+        assert!(
+            !list.popup_open(),
+            "a refresh moves the list; the popup would describe the old selection"
+        );
+    }
+
+    #[test]
+    fn ellipsize_caps_at_the_char_budget() {
+        assert_eq!(ellipsize("short", 10), "short");
+        assert_eq!(ellipsize("0123456789abc", 10), "0123456789…");
     }
 }

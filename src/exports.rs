@@ -55,6 +55,10 @@ struct Usage {
 
 pub struct ExportsList {
     items: Vec<ExpItem>,
+    /// Backend read failure. Rendered instead of the rows: "no exported
+    /// symbols" is a claim about the binary's public API, and a failed read
+    /// must never be able to pass for one.
+    error: Option<String>,
     awidth: usize,
     filter: String,
     prev_filter: String,
@@ -71,7 +75,7 @@ fn parse_hex(s: &str) -> Option<u64> {
 
 impl ExportsList {
     pub fn new(ctx: &Ctx) -> Self {
-        let items = Self::build(ctx);
+        let (items, error) = Self::build(ctx);
         let awidth = items
             .iter()
             .map(|it| it.addr.len())
@@ -80,6 +84,7 @@ impl ExportsList {
             .max(10);
         ExportsList {
             items,
+            error,
             awidth,
             filter: String::new(),
             prev_filter: String::new(),
@@ -92,7 +97,9 @@ impl ExportsList {
     }
 
     pub fn refresh(&mut self, ctx: &Ctx) {
-        self.items = Self::build(ctx);
+        let (items, error) = Self::build(ctx);
+        self.items = items;
+        self.error = error;
         self.awidth = self
             .items
             .iter()
@@ -103,14 +110,20 @@ impl ExportsList {
         // Keep the cursor valid if the rebuilt list shrank.
         self.sel = self.sel.min(self.filtered().len().saturating_sub(1));
         self.top = self.top.min(self.sel);
+        // The list underneath moved; a surviving popup would describe the
+        // pre-refresh selection.
+        self.usage = None;
     }
 
     /// Functions first, then data — both by address — so the callable public API
     /// leads and exported globals trail.
-    fn build(ctx: &Ctx) -> Vec<ExpItem> {
+    fn build(ctx: &Ctx) -> (Vec<ExpItem>, Option<String>) {
+        let exports = match ctx.bn.exports_list_checked() {
+            Ok(exports) => exports,
+            Err(error) => return (Vec::new(), Some(error)),
+        };
         let mut items: Vec<ExpItem> = dedupe(
-            ctx.bn
-                .exports_list()
+            exports
                 .into_iter()
                 .map(|e| {
                     // Cross-check bn's `(data)` tag against the known function set:
@@ -134,7 +147,7 @@ impl ExportsList {
                     .cmp(&parse_hex(&b.addr).unwrap_or(0)),
             )
         });
-        items
+        (items, None)
     }
 
     pub fn is_searching(&self) -> bool {
@@ -269,7 +282,10 @@ impl ExportsList {
                 }
                 KeyCode::Down => self.move_sel(1),
                 KeyCode::Up => self.move_sel(-1),
-                KeyCode::Char(c) => {
+                // A ctrl chord is never text: crossterm decodes ^U as
+                // `Char('u') + CONTROL`, so an unguarded arm turns a line-edit
+                // reflex into a literal letter in the filter.
+                KeyCode::Char(c) if !ctrl => {
                     self.filter.push(c);
                     self.sel = 0;
                 }
@@ -398,6 +414,21 @@ impl ExportsList {
         );
         crate::ui::render_bar(buf, x0, area.y + area.height.saturating_sub(1), w, &hint);
 
+        // A failed read must dominate the (necessarily empty) table — never let
+        // "no exported symbols" stand in for "the read failed".
+        if let Some(error) = &self.error {
+            crate::ui::put_str(
+                buf,
+                x0 + 2,
+                area.y + 3,
+                format!("✗ {error}"),
+                w.saturating_sub(4),
+                Style::default().fg(Color::Red),
+            );
+            self.render_usage(area, buf);
+            return;
+        }
+
         if rows.is_empty() {
             crate::ui::put_str(
                 buf,
@@ -486,6 +517,56 @@ impl ExportsList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::picker::tests::{ctrl, plain};
+
+    #[test]
+    fn a_failed_read_surfaces_an_error_instead_of_an_empty_table() {
+        // The stub ctx names a bn binary/instance that don't exist, so the read
+        // fails — "no exported symbols" must not stand in for that.
+        let ctx = Ctx::stub();
+        let list = ExportsList::new(&ctx);
+        assert!(list.items.is_empty());
+        assert!(
+            list.error.is_some_and(|error| !error.is_empty()),
+            "a failed exports read must surface the backend's message"
+        );
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_filter() {
+        let ctx = Ctx::stub();
+        let mut list = ExportsList::new(&ctx);
+        list.on_key(plain('/'), &ctx);
+        for ch in "init".chars() {
+            list.on_key(plain(ch), &ctx);
+        }
+        assert_eq!(list.filter, "init");
+        for ch in ['a', 'e', 'u', 'w', 'r'] {
+            list.on_key(ctrl(ch), &ctx);
+        }
+        assert_eq!(
+            list.filter, "init",
+            "a ctrl chord must not push its letter into the filter"
+        );
+    }
+
+    #[test]
+    fn refresh_closes_a_stale_usage_popup() {
+        let ctx = Ctx::stub();
+        let mut list = ExportsList::new(&ctx);
+        list.usage = Some(Usage {
+            title: "uses of mock_init".into(),
+            addr: "0x401000".into(),
+            lines: vec!["0x401240  mock_bootstrap".into()],
+            off: 0,
+        });
+        assert!(list.popup_open());
+        list.refresh(&ctx);
+        assert!(
+            !list.popup_open(),
+            "a refresh moves the list; the popup would describe the old selection"
+        );
+    }
 
     fn item(addr: &str, name: &str, is_data: bool) -> ExpItem {
         ExpItem {

@@ -28,6 +28,11 @@ enum Mode {
 
 pub struct MarksList {
     items: Vec<Mark>,
+    /// Backend read failure. `Bn::marks` hands back a plain `Vec`, so the error
+    /// is recovered from the shared health cell — see
+    /// [`crate::picker::empty_list_error`]. "no comments or tags yet" is a claim
+    /// about the shared map and must not stand in for a failed read.
+    error: Option<String>,
     awidth: usize,
     kwidth: usize,
     filter: String,
@@ -79,6 +84,7 @@ fn normalize(
 impl MarksList {
     pub fn new(ctx: &Ctx) -> Self {
         let items = Self::build(ctx);
+        let error = crate::picker::empty_list_error(items.is_empty(), ctx.bn.last_error());
         let awidth = items
             .iter()
             .map(|it| it.addr.len())
@@ -93,6 +99,7 @@ impl MarksList {
             .clamp(7, 24);
         MarksList {
             items,
+            error,
             awidth,
             kwidth,
             filter: String::new(),
@@ -106,6 +113,7 @@ impl MarksList {
 
     pub fn refresh(&mut self, ctx: &Ctx) {
         self.items = Self::build(ctx);
+        self.error = crate::picker::empty_list_error(self.items.is_empty(), ctx.bn.last_error());
         self.awidth = self
             .items
             .iter()
@@ -204,7 +212,10 @@ impl MarksList {
                 }
                 KeyCode::Down => self.move_sel(1),
                 KeyCode::Up => self.move_sel(-1),
-                KeyCode::Char(c) => {
+                // A ctrl chord is never text: crossterm decodes ^U as
+                // `Char('u') + CONTROL`, so an unguarded arm turns a line-edit
+                // reflex into a literal letter in the filter.
+                KeyCode::Char(c) if !ctrl => {
                     self.filter.push(c);
                     self.sel = 0;
                 }
@@ -317,6 +328,21 @@ impl MarksList {
         );
         crate::ui::render_bar(buf, x0, area.y + area.height.saturating_sub(1), w, &hint);
 
+        // A failed read must dominate the empty table — the shared map reading as
+        // "nothing marked yet" is exactly the wrong conclusion when the comment or
+        // tag enumeration failed.
+        if let Some(error) = &self.error {
+            crate::ui::put_str(
+                buf,
+                x0 + 2,
+                area.y + 3,
+                format!("✗ {error}"),
+                w.saturating_sub(4),
+                Style::default().fg(Color::Red),
+            );
+            return;
+        }
+
         if rows.is_empty() {
             crate::ui::put_str(
                 buf,
@@ -376,9 +402,41 @@ impl MarksList {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize;
+    use super::{normalize, MarksList};
     use crate::bn::Mark;
+    use crate::ctx::Ctx;
+    use crate::picker::tests::{ctrl, plain};
     use std::collections::HashMap;
+
+    #[test]
+    fn a_failed_read_surfaces_an_error_instead_of_an_empty_table() {
+        // `Bn::marks` swallows its error into the shared health cell; without
+        // recovering it the shared map reads as "nothing marked yet".
+        let ctx = Ctx::stub();
+        let list = MarksList::new(&ctx);
+        assert!(list.items.is_empty());
+        assert!(
+            list.error.is_some_and(|error| !error.is_empty()),
+            "an empty marks list under a recorded read failure must show it"
+        );
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_filter() {
+        let mut list = MarksList::new(&Ctx::stub());
+        list.on_key(plain('/'));
+        for ch in "bounds".chars() {
+            list.on_key(plain(ch));
+        }
+        assert_eq!(list.filter, "bounds");
+        for ch in ['a', 'e', 'u', 'w', 'r'] {
+            list.on_key(ctrl(ch));
+        }
+        assert_eq!(
+            list.filter, "bounds",
+            "a ctrl chord must not push its letter into the filter"
+        );
+    }
 
     fn mark(addr: &str, kind: &str, text: &str, func: &str) -> Mark {
         Mark {

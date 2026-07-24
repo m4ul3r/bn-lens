@@ -1328,10 +1328,6 @@ impl Bn {
         Ok(all)
     }
 
-    pub fn imports_list(&self) -> Vec<Import> {
-        self.imports_list_checked().unwrap_or_default()
-    }
-
     /// `bn types` -> the full type list (name + kind) for the Types view,
     /// paged with `--offset` until the envelope reports `has_more: false` so a
     /// database past the page size is never silently truncated.
@@ -1536,10 +1532,6 @@ impl Bn {
             }
         }
         Ok(all)
-    }
-
-    pub fn exports_list(&self) -> Vec<Export> {
-        self.exports_list_checked().unwrap_or_default()
     }
 
     /// Basic blocks + typed edges of `ident`'s control-flow graph at rendering

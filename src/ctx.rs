@@ -432,6 +432,43 @@ pub fn scan_recent(text: &str) -> Vec<String> {
     v.into_iter().map(|(t, _)| t).collect()
 }
 
+/// An empty `Ctx` for key-handling tests in the view modules.
+///
+/// The views take `&Ctx` even where they only read it on the paths a keypress
+/// test never reaches, and `Ctx` cannot be built outside this module (private
+/// `strings_map`). The `Bn` handle names an instance that does not exist, so it
+/// resolves no socket client: any read it is asked for fails instead of touching
+/// a live database.
+#[cfg(test)]
+impl Ctx {
+    pub fn stub() -> Ctx {
+        Ctx {
+            bn: Bn::new(
+                "bn-lens-test-no-such-binary".into(),
+                Some("bn-lens-test-no-such-instance".into()),
+                None,
+            ),
+            herdr: String::new(),
+            agent_pane: String::new(),
+            agent_session: String::new(),
+            instance_label: "test".into(),
+            target: String::new(),
+            arch: String::new(),
+            analysis_state: AnalysisState::Full,
+            funcs: Vec::new(),
+            func_names: HashSet::new(),
+            import_names: HashSet::new(),
+            data_names: HashSet::new(),
+            addr_by_name: HashMap::new(),
+            name_by_addr: HashMap::new(),
+            display_by_name: HashMap::new(),
+            sections_text: Vec::new(),
+            section_ranges: Vec::new(),
+            strings_map: std::cell::OnceCell::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_section_ranges, scan_recent_for_target, sec_rank, target_key};

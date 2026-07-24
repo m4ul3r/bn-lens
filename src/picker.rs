@@ -26,6 +26,27 @@ pub enum Action {
     None,
 }
 
+/// The error a list view must show instead of an empty table.
+///
+/// A backend read that fails renders as `0/0` otherwise, and on an
+/// attack-surface view that is a false all-clear — "this binary imports
+/// nothing" is a conclusion a reader will actually draw. Views whose backend
+/// read hands back a plain `Vec` (strings, types, marks: the error is swallowed
+/// inside `Bn`) recover it from the shared health cell (`Bn::last_error`).
+///
+/// Deliberately *not* keyed to one command: the health cell holds a single slot
+/// for the most recent state-read failure, so any failed state read means this
+/// view's emptiness is untrustworthy. Over-attributing an unrelated bridge
+/// failure is the safe direction; claiming a genuine zero is not. A list with
+/// rows never shows it — it has real content to stand on.
+pub fn empty_list_error(rows_empty: bool, health: Option<String>) -> Option<String> {
+    if rows_empty {
+        health
+    } else {
+        None
+    }
+}
+
 const YOU: u8 = 1;
 const AGENT: u8 = 2;
 const RECENT_CAP: usize = 12;
@@ -1104,7 +1125,10 @@ impl Picker {
                 }
                 KeyCode::Down => self.move_sel(1),
                 KeyCode::Up => self.move_sel(-1),
-                KeyCode::Char(c) => {
+                // A ctrl chord is never text: crossterm decodes ^U as
+                // `Char('u') + CONTROL`, so an unguarded arm turns a line-edit
+                // reflex into a literal letter in the query.
+                KeyCode::Char(c) if !ctrl => {
                     self.filter.push(c);
                     self.sel = 0;
                 }
@@ -1196,8 +1220,57 @@ impl Picker {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// `KeyEvent` for a bare character, as a terminal delivers ordinary typing.
+    pub(crate) fn plain(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    /// `KeyEvent` for `Ctrl+<ch>`, the shape crossterm decodes a control byte
+    /// into (0x15 -> `Char('u')` + `CONTROL`).
+    pub(crate) fn ctrl(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn empty_list_reports_a_failed_read_instead_of_zero_rows() {
+        let failure = || Some("bn imports: could not reach instance".to_string());
+        // Empty + a recorded failure: the emptiness is the failure, not a finding.
+        assert_eq!(
+            empty_list_error(true, failure()),
+            failure(),
+            "an empty list under a failed state read must surface the error"
+        );
+        // Empty with a healthy backend is a genuine zero-row table.
+        assert_eq!(empty_list_error(true, None), None);
+        // Rows present: never claim a failure over real content.
+        assert_eq!(empty_list_error(false, failure()), None);
+        assert_eq!(empty_list_error(false, None), None);
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_symbols_filter() {
+        let ctx = Ctx::stub();
+        let mut picker = Picker::new(&ctx);
+        picker.on_key(plain('/'));
+        for ch in "parse".chars() {
+            picker.on_key(plain(ch));
+        }
+        assert_eq!(picker.filter, "parse");
+        // Line-edit reflexes: none of these is text.
+        for ch in ['a', 'e', 'u', 'w', 'k', 'r'] {
+            picker.on_key(ctrl(ch));
+        }
+        assert_eq!(
+            picker.filter, "parse",
+            "a ctrl chord must not push its letter into the query"
+        );
+        // Shift is still text — capitals must survive the guard.
+        picker.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert_eq!(picker.filter, "parseX");
+    }
 
     #[test]
     fn fmt_size_scales_units() {

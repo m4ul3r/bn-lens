@@ -48,6 +48,7 @@ impl Viewer {
     }
 
     fn rename_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let Popup::Rename {
             old,
             buf,
@@ -76,7 +77,11 @@ impl Viewer {
                 buf.pop();
                 err.clear();
             }
-            KeyCode::Char(ch) => {
+            // A ctrl chord is never part of a name. `App::capturing_text`
+            // suppresses the global `^R` while this popup is open, so without
+            // the guard `^R` pushes a literal `r` — and `valid_ident` accepts
+            // it, committing the rename with a stray character.
+            KeyCode::Char(ch) if !control => {
                 buf.push(ch);
                 err.clear();
             }
@@ -250,6 +255,7 @@ impl Viewer {
 
     fn comment_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
         let wrap = self.comment_wrap.get().max(1);
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let Popup::Comment {
             target,
             buf,
@@ -325,7 +331,10 @@ impl Viewer {
                     buf.remove(byte_at(buf, *cursor));
                 }
             }
-            KeyCode::Char(ch) => {
+            // A ctrl chord is never text — `^R`/`^U`/`^A` reflexes must not land
+            // literal letters in the comment (`App::capturing_text` suppresses
+            // the global `^R` while this popup owns input).
+            KeyCode::Char(ch) if !control => {
                 buf.insert(byte_at(buf, *cursor), ch);
                 *cursor += 1;
             }
@@ -335,6 +344,7 @@ impl Viewer {
     }
 
     fn tag_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Exit {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let Popup::Tag { target, buf } = &mut self.popup else {
             return Exit::Stay;
         };
@@ -360,13 +370,15 @@ impl Viewer {
             KeyCode::Backspace => {
                 buf.pop();
             }
-            KeyCode::Char(ch) => buf.push(ch),
+            // A ctrl chord is never text (see `rename_key`).
+            KeyCode::Char(ch) if !control => buf.push(ch),
             _ => {}
         }
         Exit::Stay
     }
 
     fn search_key(&mut self, key: KeyEvent) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Enter => {
                 if let Some(input) = self.search_input.take() {
@@ -380,7 +392,8 @@ impl Viewer {
                     input.pop();
                 }
             }
-            KeyCode::Char(ch) => {
+            // A ctrl chord is never part of a query (see `rename_key`).
+            KeyCode::Char(ch) if !control => {
                 if let Some(input) = self.search_input.as_mut() {
                     input.push(ch);
                 }
@@ -392,6 +405,7 @@ impl Viewer {
     /// Address/symbol goto (`:`): edit the buffer, commit on Enter. On commit the
     /// input is resolved and navigated in `goto_address`.
     fn goto_key(&mut self, key: KeyEvent, ctx: &Ctx) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Enter => {
                 if let Some(input) = self.goto_input.take() {
@@ -404,7 +418,8 @@ impl Viewer {
                     input.pop();
                 }
             }
-            KeyCode::Char(ch) => {
+            // A ctrl chord is never part of an address (see `rename_key`).
+            KeyCode::Char(ch) if !control => {
                 if let Some(input) = self.goto_input.as_mut() {
                     input.push(ch);
                 }
@@ -874,6 +889,7 @@ impl Viewer {
     }
 
     fn ask_key(&mut self, key: KeyEvent, ctx: &Ctx) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let Popup::Ask { prefix, buf, .. } = &mut self.popup else {
             return;
         };
@@ -901,7 +917,9 @@ impl Viewer {
             KeyCode::Backspace => {
                 buf.pop();
             }
-            KeyCode::Char(ch) => buf.push(ch),
+            // A ctrl chord is never text (see `rename_key`) — and this buffer
+            // ships to another agent's pane, so a stray letter is published.
+            KeyCode::Char(ch) if !control => buf.push(ch),
             _ => {}
         }
     }
@@ -1068,5 +1086,117 @@ impl Viewer {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::picker::tests::{ctrl, plain};
+
+    /// A viewer over the stub ctx: every backend read fails, so the buffer is
+    /// empty — which is all a key-handling test needs.
+    fn viewer(ctx: &Ctx) -> Viewer {
+        Viewer::new(ctx, "handle_request".into(), false)
+    }
+
+    /// Type each char through `on_key`, then each ctrl chord, and hand back the
+    /// viewer for inspection.
+    fn typed(ctx: &Ctx, mut v: Viewer, text: &str) -> Viewer {
+        for ch in text.chars() {
+            v.on_key(plain(ch), ctx);
+        }
+        // ^R is the worst of these: `App::capturing_text` suppresses the global
+        // refresh while a viewer field is open, so an unguarded arm inserts `r`.
+        for ch in ['r', 'a', 'e', 'u', 'w'] {
+            v.on_key(ctrl(ch), ctx);
+        }
+        v
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_rename_box() {
+        let ctx = Ctx::stub();
+        let mut v = viewer(&ctx);
+        v.popup = Popup::Rename {
+            old: "arg1".into(),
+            buf: String::new(),
+            err: String::new(),
+            scope: super::super::RenameScope::Local,
+        };
+        v = typed(&ctx, v, "frame_len");
+        let Popup::Rename { buf, .. } = &v.popup else {
+            panic!("the rename popup must still own input");
+        };
+        assert_eq!(
+            buf, "frame_len",
+            "^R in a rename box must not commit a stray character into the symbol"
+        );
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_comment_editor() {
+        let ctx = Ctx::stub();
+        let mut v = viewer(&ctx);
+        v.popup = Popup::Comment {
+            target: super::super::AnnTarget::Func("handle_request".into()),
+            buf: String::new(),
+            cursor: 0,
+            existing: false,
+        };
+        v = typed(&ctx, v, "bounds check");
+        let Popup::Comment { buf, cursor, .. } = &v.popup else {
+            panic!("the comment popup must still own input");
+        };
+        assert_eq!(buf, "bounds check");
+        assert_eq!(*cursor, "bounds check".chars().count());
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_tag_note() {
+        let ctx = Ctx::stub();
+        let mut v = viewer(&ctx);
+        v.popup = Popup::Tag {
+            target: super::super::AnnTarget::Func("handle_request".into()),
+            buf: String::new(),
+        };
+        v = typed(&ctx, v, "revisit");
+        let Popup::Tag { buf, .. } = &v.popup else {
+            panic!("the tag popup must still own input");
+        };
+        assert_eq!(buf, "revisit");
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_ask_composer() {
+        // This buffer ships to another agent's pane, so a stray letter is
+        // published, not just displayed.
+        let ctx = Ctx::stub();
+        let mut v = viewer(&ctx);
+        v.popup = Popup::Ask {
+            label: "ask".into(),
+            preview: String::new(),
+            prefix: "look at ".into(),
+            buf: String::new(),
+        };
+        v = typed(&ctx, v, "the length check");
+        let Popup::Ask { buf, .. } = &v.popup else {
+            panic!("the ask composer must still own input");
+        };
+        assert_eq!(buf, "the length check");
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_type_into_the_search_and_goto_prompts() {
+        let ctx = Ctx::stub();
+        let mut v = viewer(&ctx);
+        v.search_input = Some(String::new());
+        v = typed(&ctx, v, "memcpy");
+        assert_eq!(v.search_input.as_deref(), Some("memcpy"));
+
+        v.search_input = None;
+        v.goto_input = Some(String::new());
+        v = typed(&ctx, v, "0x401a20");
+        assert_eq!(v.goto_input.as_deref(), Some("0x401a20"));
     }
 }
