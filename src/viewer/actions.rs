@@ -216,23 +216,44 @@ impl Viewer {
         }
         let (target, buf) = self.comment_edit_target(ctx);
         let cursor = buf.chars().count();
+        let existing = !buf.is_empty();
         self.popup = Popup::Comment {
             target,
             buf,
             cursor,
+            existing,
         };
     }
 
     /// Resolve where `;` comments *and* the current text to edit (empty for a
-    /// new comment). A deliberately-selected address (or the disasm/MLIL line
-    /// address) edits that address's comment; otherwise the function — see
-    /// [`func_comment_target`] for how a bare `;` picks its slot.
+    /// new comment). A concrete line address wins — a deliberately-selected Addr
+    /// hotspot, the disasm/MLIL line's leading address, or (the case that lets
+    /// `;` annotate a specific *decompile* line rather than the whole function)
+    /// that line's own address from the `--addresses` JSON. The comment then
+    /// renders inline on the line and, being address-scoped, shows in Marks.
+    /// Only an address-less line (signature, brace, blank) falls back to the
+    /// whole-function note — see [`func_comment_target`] for how it picks a slot.
     fn comment_edit_target(&self, ctx: &Ctx) -> (AnnTarget, String) {
-        if let Some(addr) = self.explicit_addr() {
+        if let Some(addr) = self.explicit_addr().or_else(|| self.decomp_line_addr(ctx)) {
             let text = ctx.bn.comment_get_addr(&addr).unwrap_or_default();
             return (AnnTarget::Addr(addr), text);
         }
         func_comment_target(&self.name, ctx.bn.comment_get_func(&self.name))
+    }
+
+    /// The decompile cursor line's *own* address (its `--addresses` JSON entry),
+    /// or `None` in another view or on a line carrying no address of its own (a
+    /// declaration, brace, or blank line). Unlike [`current_code_addr`], it does
+    /// **not** snap to a neighbouring line: an address-less line must fall
+    /// through to the whole-function comment, not steal the next statement's
+    /// address.
+    fn decomp_line_addr(&self, ctx: &Ctx) -> Option<String> {
+        if !matches!(self.view, View::Decomp) {
+            return None;
+        }
+        let (_, _, text) = ctx.bn.decompile_json(&self.name)?;
+        let dec = crate::decomp::dec_lines(&text);
+        dec.get(self.cline)?.addr.map(|a| format!("0x{a:x}"))
     }
 
     /// `t`: bookmark/tag. Same target resolution as [`open_comment`].

@@ -210,6 +210,10 @@ enum Popup {
         /// Insertion caret as a **char** index into `buf` (0..=char count), for
         /// full in-place editing (move, insert/delete mid-string).
         cursor: usize,
+        /// Whether the popup opened on an *existing* comment (pre-filled `buf`).
+        /// Clearing it to empty then deletes the comment; a new comment left
+        /// empty is just discarded.
+        existing: bool,
     },
     Tag {
         target: AnnTarget,

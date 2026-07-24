@@ -996,6 +996,7 @@ impl Viewer {
                 target,
                 buf: input,
                 cursor,
+                ..
             } => {
                 // Comments can be long (and are pre-filled for edit-in-place), so
                 // wrap the value, keep the caret in view, and draw it as a block.

@@ -1975,6 +1975,18 @@ impl Bn {
         mutation_ok(&out)
     }
 
+    /// Delete the comment at `addr` (clearing a comment edited down to empty).
+    pub fn comment_delete_addr(&self, addr: &str) -> bool {
+        let out = self.run(&["comment", "delete", addr, "--summary"]);
+        mutation_ok(&out)
+    }
+
+    /// Delete a function's documentation comment.
+    pub fn comment_delete_func(&self, func: &str) -> bool {
+        let out = self.run(&["comment", "delete", "--function", func, "--summary"]);
+        mutation_ok(&out)
+    }
+
     /// Add a tag of `ty` (e.g. `Bookmarks`) at an address, with optional note.
     pub fn tag_add_addr(&self, addr: &str, ty: &str, data: &str) -> bool {
         let out = self.run(&[
