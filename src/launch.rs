@@ -20,6 +20,16 @@ pub fn run() -> i32 {
     let session = herdr::pane_agent(&herdr_bin, &pane)
         .map(|a| a.session)
         .unwrap_or_default();
+    // An unreadable id is not a soft failure: `same_agent_session` is fail-closed
+    // on an empty expected id, so the lens comes up with asks disabled (the
+    // header says so in red). Say why here too — from the picker alone a
+    // mis-wired launch is indistinguishable from a pane whose agent changed.
+    if session.is_empty() {
+        eprintln!(
+            "bn lens: could not read the launching agent's session id — \
+             asks will be disabled for this lens"
+        );
+    }
     let out = herdr::open_picker(
         &herdr_bin,
         &pane,
