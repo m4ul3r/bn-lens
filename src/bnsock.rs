@@ -54,35 +54,34 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// `cancel_request` so the orphaned work is told to stop).
 pub const INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Ops that keep [`DEFAULT_TIMEOUT`]: whole-database state reads whose cost
-/// scales with the binary, not with the interaction, plus `py_exec`, which runs
-/// caller-supplied script. The lens issues these while building or rebuilding
-/// `Ctx` — on a worker thread, behind the refresh banner, where a long wait is
-/// visible and cancellable.
+/// Which budget a read runs under. Chosen by the **caller**, not derived from the
+/// op name: the whole-database ops (`imports`, `exports`, `strings`, `types`,
+/// `data_vars`, `py_exec`, …) are issued from *both* contexts. `App::set_view`
+/// builds the Strings/Imports/Exports/Classes/Types/Marks lists synchronously on
+/// the event thread, `Viewer::load_data` reads `data_vars` there, and the CFG/data
+/// fallbacks run `py_exec` there — so an op-name table would hand exactly those
+/// paths the ten-minute budget and let a wedged bridge freeze the TUI.
 ///
-/// Anything absent — including a future op — takes the interactive budget. That
-/// default is deliberate: for a TUI, a read that overruns and says so beats one
-/// that silently freezes the event loop.
-const ANALYSIS_OPS: &[&str] = &[
-    "list_functions",
-    "list_exports",
-    "list_comments",
-    "list_tags",
-    "imports",
-    "types",
-    "class_list",
-    "strings",
-    "sections",
-    "data_vars",
-    "py_exec",
-];
+/// A `Bn` handle carries one of these (`Bn::with_pace`); the pace is a property of
+/// the thread that owns the handle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pace {
+    /// Issued on the event thread, so the socket timeout *is* the freeze budget.
+    /// The default for a fresh handle: a read that overruns and says so beats one
+    /// that silently freezes the event loop.
+    Interactive,
+    /// Issued on a worker thread (a `Ctx` rebuild behind the refresh banner),
+    /// where the event loop keeps running and a genuinely long analysis read is
+    /// visible and cancellable.
+    Analysis,
+}
 
-/// The timeout `op` runs under. See [`INTERACTIVE_TIMEOUT`] and [`ANALYSIS_OPS`].
-fn op_timeout(op: &str) -> Duration {
-    if ANALYSIS_OPS.contains(&op) {
-        DEFAULT_TIMEOUT
-    } else {
-        INTERACTIVE_TIMEOUT
+impl Pace {
+    pub fn timeout(self) -> Duration {
+        match self {
+            Pace::Interactive => INTERACTIVE_TIMEOUT,
+            Pace::Analysis => DEFAULT_TIMEOUT,
+        }
     }
 }
 
@@ -277,11 +276,12 @@ impl Client {
     /// `target` is the `-t` selector; `None` lets the bridge use its active target.
     /// Errors are already human-facing (the bridge emits plain strings such as
     /// `Function not found: foo. Did you mean: fopen`).
-    /// The timeout is chosen per op ([`op_timeout`]): a per-keypress read gets the
-    /// interactive budget so a wedged bridge can't freeze the event thread for the
-    /// full analysis timeout.
+    /// Runs under [`Pace::Interactive`] — the safe default for the control reads
+    /// that call it directly (`list_targets`, liveness). Anything whose cost scales
+    /// with the binary goes through [`Self::request_timeout`] with the *caller's*
+    /// [`Pace`], because the op name alone cannot say which thread issued it.
     pub fn request(&self, op: &str, params: Value, target: Option<&str>) -> Result<Value, String> {
-        self.request_timeout(op, params, target, op_timeout(op))
+        self.request_timeout(op, params, target, Pace::Interactive.timeout())
     }
 
     pub fn request_timeout(
@@ -496,54 +496,15 @@ mod tests {
     }
 
     #[test]
-    fn per_keypress_reads_get_the_interactive_budget() {
-        // These run on the event thread, so the socket timeout *is* the freeze
-        // budget — ten minutes of it is a hang, not a slow read.
-        for op in [
-            "decompile",
-            "cfg",
-            "list_locals",
-            "xrefs",
-            "target_info",
-            "list_targets",
-            "class_show",
-        ] {
-            assert_eq!(
-                op_timeout(op),
-                INTERACTIVE_TIMEOUT,
-                "'{op}' is issued per keypress and must not be able to freeze the TUI \
-                 for the analysis timeout"
-            );
-        }
-        // An op we have never seen defaults to the interactive budget: overrunning
-        // loudly beats freezing the event loop silently.
-        assert_eq!(op_timeout("some_future_op"), INTERACTIVE_TIMEOUT);
+    fn the_pace_and_not_the_op_picks_the_budget() {
+        // The long budget is reachable only by a caller that says it is on a worker
+        // thread. Op name is not a proxy for that: `imports`/`strings`/`data_vars`/
+        // `py_exec` are issued from the event thread too (`App::set_view`,
+        // `Viewer::load_data`, the CFG/data fallbacks), and there the socket timeout
+        // *is* the freeze budget.
+        assert_eq!(Pace::Interactive.timeout(), INTERACTIVE_TIMEOUT);
+        assert_eq!(Pace::Analysis.timeout(), DEFAULT_TIMEOUT);
         assert!(INTERACTIVE_TIMEOUT < DEFAULT_TIMEOUT);
-    }
-
-    #[test]
-    fn whole_database_reads_keep_the_long_budget() {
-        // Ctx-building reads run on a worker thread behind the refresh banner,
-        // where a genuinely long analysis read is visible and cancellable.
-        for op in [
-            "list_functions",
-            "list_exports",
-            "imports",
-            "types",
-            "class_list",
-            "strings",
-            "sections",
-            "data_vars",
-            "list_comments",
-            "list_tags",
-            "py_exec",
-        ] {
-            assert_eq!(
-                op_timeout(op),
-                DEFAULT_TIMEOUT,
-                "'{op}' scales with the binary, not the interaction"
-            );
-        }
     }
 
     #[test]

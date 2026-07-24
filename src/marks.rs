@@ -28,10 +28,10 @@ enum Mode {
 
 pub struct MarksList {
     items: Vec<Mark>,
-    /// Backend read failure. `Bn::marks` hands back a plain `Vec`, so the error
-    /// is recovered from the shared health cell — see
-    /// [`crate::picker::empty_list_error`]. "no comments or tags yet" is a claim
-    /// about the shared map and must not stand in for a failed read.
+    /// Backend read failure, including a *partial* read (comments decoded, tags
+    /// did not) — see [`crate::picker::list_error`]. "no comments or tags yet" is
+    /// a claim about the shared map and must not stand in for a failed read, and
+    /// half the annotations must not read as all of them.
     error: Option<String>,
     awidth: usize,
     kwidth: usize,
@@ -83,8 +83,8 @@ fn normalize(
 
 impl MarksList {
     pub fn new(ctx: &Ctx) -> Self {
-        let items = Self::build(ctx);
-        let error = crate::picker::empty_list_error(items.is_empty(), ctx.bn.last_error());
+        let (items, read_error) = Self::build(ctx);
+        let error = crate::picker::list_error(items.is_empty(), read_error, ctx.bn.last_error());
         let awidth = items
             .iter()
             .map(|it| it.addr.len())
@@ -112,8 +112,10 @@ impl MarksList {
     }
 
     pub fn refresh(&mut self, ctx: &Ctx) {
-        self.items = Self::build(ctx);
-        self.error = crate::picker::empty_list_error(self.items.is_empty(), ctx.bn.last_error());
+        let (items, read_error) = Self::build(ctx);
+        self.items = items;
+        self.error =
+            crate::picker::list_error(self.items.is_empty(), read_error, ctx.bn.last_error());
         self.awidth = self
             .items
             .iter()
@@ -132,8 +134,9 @@ impl MarksList {
         self.top = self.top.min(self.sel);
     }
 
-    fn build(ctx: &Ctx) -> Vec<Mark> {
-        normalize(ctx.bn.marks(), &ctx.addr_by_name)
+    fn build(ctx: &Ctx) -> (Vec<Mark>, Option<String>) {
+        let listing = ctx.bn.marks();
+        (normalize(listing.items, &ctx.addr_by_name), listing.error)
     }
 
     pub fn is_searching(&self) -> bool {

@@ -30,9 +30,9 @@ struct Usage {
 
 pub struct StringsList {
     items: Vec<StrItem>,
-    /// Backend read failure. `Bn::strings` hands back a plain `Vec`, so the
-    /// error is recovered from the shared health cell — see
-    /// [`crate::picker::empty_list_error`].
+    /// Backend read failure, including a payload whose `items` field would not
+    /// decode — see [`crate::picker::list_error`]. An empty string table is a
+    /// claim about the binary and must not stand in for a failed read.
     error: Option<String>,
     awidth: usize,
     filter: String,
@@ -59,8 +59,8 @@ fn parse_hex(s: &str) -> Option<u64> {
 
 impl StringsList {
     pub fn new(ctx: &Ctx) -> Self {
-        let items = Self::build(ctx);
-        let error = crate::picker::empty_list_error(items.is_empty(), ctx.bn.last_error());
+        let (items, read_error) = Self::build(ctx);
+        let error = crate::picker::list_error(items.is_empty(), read_error, ctx.bn.last_error());
         let awidth = items
             .iter()
             .map(|it| it.addr.len())
@@ -83,8 +83,10 @@ impl StringsList {
 
     /// Re-pull strings from a rebuilt ctx (keeps the filter, snaps the cursor).
     pub fn refresh(&mut self, ctx: &Ctx) {
-        self.items = Self::build(ctx);
-        self.error = crate::picker::empty_list_error(self.items.is_empty(), ctx.bn.last_error());
+        let (items, read_error) = Self::build(ctx);
+        self.items = items;
+        self.error =
+            crate::picker::list_error(self.items.is_empty(), read_error, ctx.bn.last_error());
         self.awidth = self
             .items
             .iter()
@@ -105,11 +107,11 @@ impl StringsList {
     /// real `.rodata` literals first, symbol-table/header noise last (by section
     /// rank), then by address within each rank — so the useful strings lead
     /// instead of the ELF header junk a pure address sort surfaces first.
-    fn build(ctx: &Ctx) -> Vec<StrItem> {
+    fn build(ctx: &Ctx) -> (Vec<StrItem>, Option<String>) {
         let mut seen = std::collections::HashSet::new();
-        let mut items: Vec<StrItem> = ctx
-            .bn
-            .strings()
+        let listing = ctx.bn.strings();
+        let mut items: Vec<StrItem> = listing
+            .items
             .into_iter()
             .filter(|(_, addr)| addr.starts_with("0x") && seen.insert(addr.clone()))
             .map(|(content, addr)| StrItem { addr, content })
@@ -118,7 +120,7 @@ impl StringsList {
             let addr = parse_hex(&it.addr).unwrap_or(0);
             (ctx.string_rank(addr), addr)
         });
-        items
+        (items, listing.error)
     }
 
     fn filtered(&self) -> Vec<usize> {

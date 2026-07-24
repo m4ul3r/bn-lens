@@ -2,6 +2,7 @@
 //! functions and data symbols, the address maps, and the launching pane.
 
 use crate::bn::{self, AnalysisState, Bn, Func};
+use crate::bnsock::Pace;
 use crate::herdr;
 use std::collections::{HashMap, HashSet};
 
@@ -137,7 +138,10 @@ impl Ctx {
     pub fn strings(&self) -> &HashMap<String, String> {
         self.strings_map.get_or_init(|| {
             let mut best: HashMap<String, (u8, String)> = HashMap::new();
-            for (content, addr) in self.bn.strings() {
+            // The hotspot map only needs whatever resolved; a failed/partial read
+            // is already recorded in `Bn`'s health cell, and the Strings view
+            // reports it from its own `Listing`.
+            for (content, addr) in self.bn.strings().items {
                 let rank = parse_hex(&addr)
                     .and_then(|v| self.section_of(v))
                     .map_or(2, |(_, _, n, _)| sec_rank(n));
@@ -165,7 +169,16 @@ impl Ctx {
         let instance = bn::resolve_instance(&bn_bin, &cwd);
         let mut failures = Vec::new();
         if let Some(inst) = &instance {
-            match Self::build(&bn_bin, &herdr_bin, &agent_pane, Some(inst.clone()), None) {
+            // Startup: there is no event loop to freeze yet, so a first build of a
+            // large binary is allowed to take the analysis budget.
+            match Self::build(
+                &bn_bin,
+                &herdr_bin,
+                &agent_pane,
+                Some(inst.clone()),
+                None,
+                Pace::Analysis,
+            ) {
                 Ok(ctx) => return Ok(ctx),
                 Err(error) => failures.push(format!("{inst}: {error}")),
             }
@@ -182,6 +195,7 @@ impl Ctx {
                 &agent_pane,
                 Some(alt.instance_id.clone()),
                 None,
+                Pace::Analysis,
             ) {
                 Ok(ctx) => return Ok(ctx),
                 Err(error) => failures.push(format!("{}: {error}", alt.instance_id)),
@@ -206,14 +220,22 @@ impl Ctx {
     /// Build the context for a specific instance + target (target = None picks
     /// the active target). Errs if the target has no functions (lets `load`
     /// self-heal, and the switcher reject a bad pick).
+    ///
+    /// `pace` bounds *this build's* whole-database reads and belongs to the caller:
+    /// the `^R` refresh runs on a worker behind a banner and can afford
+    /// [`Pace::Analysis`], while a crumb-menu target switch rebuilds on the event
+    /// thread and must not. The handle stored in the returned `Ctx` is always
+    /// re-paced to [`Pace::Interactive`] — every later read through it (lazy
+    /// strings, the list views, the viewer) is issued from the event thread.
     pub fn build(
         bn_bin: &str,
         herdr_bin: &str,
         agent_pane: &str,
         instance: Option<String>,
         target: Option<String>,
+        pace: Pace,
     ) -> Result<Ctx, String> {
-        let mut bn = Bn::new(bn_bin.to_string(), instance.clone(), target.clone());
+        let mut bn = Bn::new(bn_bin.to_string(), instance.clone(), target.clone()).with_pace(pace);
         let target_sel = match target {
             Some(t) => {
                 bn.target = Some(t.clone());
@@ -308,7 +330,7 @@ impl Ctx {
             target: target_sel,
             arch: target_info.arch,
             analysis_state: target_info.analysis_state,
-            bn,
+            bn: bn.with_pace(Pace::Interactive),
             herdr: herdr_bin.to_string(),
             agent_pane: agent_pane.to_string(),
             agent_session: std::env::var("BN_LENS_AGENT_SESSION").unwrap_or_default(),

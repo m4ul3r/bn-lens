@@ -57,9 +57,9 @@ enum EditorResult {
 
 pub struct TypesList {
     items: Vec<TyItem>,
-    /// Backend read failure. `Bn::types_list` hands back a plain `Vec`, so the
-    /// error is recovered from the shared health cell — see
-    /// [`crate::picker::empty_list_error`].
+    /// Backend read failure, including a *partial* paged read (page 1 decoded,
+    /// page 2 did not) — see [`crate::picker::list_error`]. A truncated type
+    /// inventory must not render with a normal count.
     error: Option<String>,
     /// Transient confirmation for the last write (a `^S` declare), shown on the
     /// state line until the next keypress — the same affordance the viewer gives
@@ -294,8 +294,16 @@ impl TypeEditor {
             return EditorResult::None;
         }
         // Re-list at commit time (not the possibly stale view snapshot) and
-        // refuse to overwrite a type that already exists.
-        let clash = collisions(&affected, &ctx.bn.types_list());
+        // refuse to overwrite a type that already exists. A partial re-list cannot
+        // clear this check: the type that would be replaced may be exactly the one
+        // in the page that failed, and `bn types declare` replaces silently.
+        let existing = ctx.bn.types_list();
+        if let Some(error) = existing.error {
+            self.ok = false;
+            self.status = format!("✗ could not verify the type list is complete: {error}");
+            return EditorResult::None;
+        }
+        let clash = collisions(&affected, &existing.items);
         if !clash.is_empty() {
             self.ok = false;
             self.status = format!(
@@ -352,8 +360,8 @@ impl TypeEditor {
 
 impl TypesList {
     pub fn new(ctx: &Ctx) -> Self {
-        let items = Self::build(ctx);
-        let error = crate::picker::empty_list_error(items.is_empty(), ctx.bn.last_error());
+        let (items, read_error) = Self::build(ctx);
+        let error = crate::picker::list_error(items.is_empty(), read_error, ctx.bn.last_error());
         let kwidth = items
             .iter()
             .map(|it| it.kind.chars().count())
@@ -377,8 +385,10 @@ impl TypesList {
     }
 
     pub fn refresh(&mut self, ctx: &Ctx) {
-        self.items = Self::build(ctx);
-        self.error = crate::picker::empty_list_error(self.items.is_empty(), ctx.bn.last_error());
+        let (items, read_error) = Self::build(ctx);
+        self.items = items;
+        self.error =
+            crate::picker::list_error(self.items.is_empty(), read_error, ctx.bn.last_error());
         self.kwidth = self
             .items
             .iter()
@@ -395,10 +405,10 @@ impl TypesList {
         self.show = None;
     }
 
-    fn build(ctx: &Ctx) -> Vec<TyItem> {
-        let mut items: Vec<TyItem> = ctx
-            .bn
-            .types_list()
+    fn build(ctx: &Ctx) -> (Vec<TyItem>, Option<String>) {
+        let listing = ctx.bn.types_list();
+        let mut items: Vec<TyItem> = listing
+            .items
             .into_iter()
             .map(|t| TyItem {
                 name: t.name,
@@ -410,7 +420,7 @@ impl TypesList {
                 .cmp(&rank(&b.kind))
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
-        items
+        (items, listing.error)
     }
 
     pub fn is_searching(&self) -> bool {
@@ -483,8 +493,10 @@ impl TypesList {
     /// confirmation anywhere — indistinguishable from an Esc.
     fn finish_declare(&mut self, ctx: &Ctx, msg: String) {
         self.editor = None;
-        self.items = Self::build(ctx);
-        self.error = crate::picker::empty_list_error(self.items.is_empty(), ctx.bn.last_error());
+        let (items, read_error) = Self::build(ctx);
+        self.items = items;
+        self.error =
+            crate::picker::list_error(self.items.is_empty(), read_error, ctx.bn.last_error());
         self.sel = 0;
         self.top = 0;
         self.status = msg;

@@ -60,6 +60,9 @@ pub struct Bn {
     /// Socket client for this instance, when one is live. `None` means every call
     /// falls back to spawning `bn`.
     client: Option<Arc<crate::bnsock::Client>>,
+    /// Which timeout this handle's bridge reads run under. A property of the
+    /// *thread that owns the handle*, not of the op — see [`crate::bnsock::Pace`].
+    pace: crate::bnsock::Pace,
     /// The most recent state-building command failure for this handle. Clones
     /// share it, so a failed context/list refresh is visible to the top-level
     /// status bar instead of being flattened into a plausible empty result.
@@ -637,6 +640,22 @@ struct TypeItemJson {
     decl: String,
 }
 
+/// `items` carries no `#[serde(default)]` on purpose: an absent or non-array field
+/// must fail to decode rather than become an empty string table. See
+/// [`Bn::strings`].
+#[derive(Deserialize)]
+struct StringsJson {
+    items: Vec<StringItemJson>,
+}
+
+#[derive(Deserialize)]
+struct StringItemJson {
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+}
+
 /// Result of previewing a `types declare` (validate without committing): either
 /// the types it would define (name + rendered layout) or the parser error.
 pub enum TypeCheck {
@@ -729,11 +748,10 @@ fn clean_err(msg: &str) -> String {
 /// `has_more` flag. bn reports actual unions as `kind: "struct"`; the `decl`
 /// field (`union __BLOB_ARG` vs `struct S`) disambiguates, so recover the
 /// `union` kind from it here.
-fn parse_types_page(text: &str) -> (Vec<TypeItem>, bool) {
-    match serde_json::from_str::<TypesJson>(text.trim()) {
-        Ok(page) => types_page(page),
-        Err(_) => (Vec::new(), false),
-    }
+fn parse_types_page(text: &str) -> Result<(Vec<TypeItem>, bool), String> {
+    serde_json::from_str::<TypesJson>(text.trim())
+        .map(types_page)
+        .map_err(|error| format!("bn types returned invalid JSON: {error}"))
 }
 
 /// Shared by the socket and CLI paths so the union-recovery rule lives in one place.
@@ -782,6 +800,40 @@ fn push_mark(
     });
 }
 
+/// A whole-database list read that is allowed to *partially* fail.
+///
+/// The readers that hand one back recover what they can — pages that arrived
+/// before a later one failed, the half of a merged read that decoded — and report
+/// the failure next to it. A bare `Vec` made those outcomes indistinguishable from
+/// success: a truncated inventory rendered with a normal count, and a malformed
+/// envelope rendered as a genuine `0/0`. Neither is safe to draw a conclusion from.
+pub struct Listing<T> {
+    pub items: Vec<T>,
+    /// Set when any part of the read failed, **even if `items` is non-empty**.
+    pub error: Option<String>,
+}
+
+impl<T> Listing<T> {
+    fn ok(items: Vec<T>) -> Self {
+        Listing { items, error: None }
+    }
+
+    fn partial(items: Vec<T>, error: String) -> Self {
+        Listing {
+            items,
+            error: Some(error),
+        }
+    }
+
+    /// For a read merged from several sources: any failure marks the whole listing.
+    fn from_parts(items: Vec<T>, errors: Vec<String>) -> Self {
+        Listing {
+            items,
+            error: (!errors.is_empty()).then(|| errors.join("; ")),
+        }
+    }
+}
+
 impl Bn {
     pub fn new(bin: String, instance: Option<String>, target: Option<String>) -> Self {
         let client = resolve_client(instance.as_deref()).map(Arc::new);
@@ -790,8 +842,22 @@ impl Bn {
             instance,
             target,
             client,
+            pace: crate::bnsock::Pace::Interactive,
             health: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Re-pace this handle. Callers on a worker thread (a `Ctx` rebuild behind the
+    /// refresh banner) take [`Pace::Analysis`]; everything reachable from the event
+    /// thread must stay [`Pace::Interactive`], where the socket timeout doubles as
+    /// the freeze budget. Shared health is preserved, so a failure recorded before
+    /// the change stays visible.
+    ///
+    /// [`Pace::Analysis`]: crate::bnsock::Pace::Analysis
+    /// [`Pace::Interactive`]: crate::bnsock::Pace::Interactive
+    pub fn with_pace(mut self, pace: crate::bnsock::Pace) -> Self {
+        self.pace = pace;
+        self
     }
 
     /// Whether this handle talks to the bridge directly. Surfaced so the header can
@@ -813,7 +879,8 @@ impl Bn {
         scope: HealthScope,
     ) -> Option<Result<serde_json::Value, String>> {
         let client = self.client.as_ref()?;
-        let result = client.request(op, params, self.target.as_deref());
+        let result =
+            client.request_timeout(op, params, self.target.as_deref(), self.pace.timeout());
         if scope == HealthScope::Shared {
             match &result {
                 Ok(_) => self.record_success(key),
@@ -1092,14 +1159,6 @@ impl Bn {
             .unwrap_or_else(|error| format!("✗ {error}"))
     }
 
-    /// State-building counterpart to [`Self::run_out`]. Only list/context
-    /// reads use it: their failures invalidate cached absence/count claims and
-    /// therefore belong in the shared backend-health banner.
-    fn run_out_state(&self, args: &[&str]) -> String {
-        self.run_out_state_checked(args)
-            .unwrap_or_else(|error| format!("✗ {error}"))
-    }
-
     /// All instances (parsed from `bn session list --format json`), regardless
     /// of the bound instance.
     pub fn session_list(bin: &str) -> Vec<Instance> {
@@ -1212,8 +1271,12 @@ impl Bn {
     /// Every annotation — comments + tags — merged for the Marks view. Both come
     /// from `bn`'s JSON so we get the containing function and (for tags) the type
     /// without scraping text.
-    pub fn marks(&self) -> Vec<Mark> {
+    /// A failure in *either* half is reported: "no comments or tags yet" is a claim
+    /// about the reader's own annotations, so half a list must not be able to read
+    /// as all of it.
+    pub fn marks(&self) -> Listing<Mark> {
         let mut marks = Vec::new();
+        let mut errors = Vec::new();
         if let (Some(comments), Some(tags)) = (
             self.call(
                 "list_comments",
@@ -1228,8 +1291,49 @@ impl Bn {
                 HealthScope::Shared,
             ),
         ) {
-            if let Ok(list) = comments.and_then(|v| self.decode::<CommentListJson>(v, "comment list"))
-            {
+            match comments.and_then(|v| self.decode::<CommentListJson>(v, "comment list")) {
+                Ok(list) => {
+                    for c in list.items {
+                        push_mark(
+                            &mut marks,
+                            c.address,
+                            "comment".into(),
+                            c.comment,
+                            c.function,
+                        );
+                    }
+                }
+                Err(message) => {
+                    // A decode failure never reached shared health (`call` records
+                    // only the transport result), so record it here too.
+                    self.record_failure(&["comment", "list"], message.clone());
+                    errors.push(message);
+                }
+            }
+            match tags.and_then(|v| self.decode::<TagListJson>(v, "tag list")) {
+                Ok(list) => {
+                    for t in list.items {
+                        let kind = t
+                            .type_name
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "tag".into());
+                        push_mark(&mut marks, t.address, kind, t.data, t.function);
+                    }
+                }
+                Err(message) => {
+                    self.record_failure(&["tag", "list"], message.clone());
+                    errors.push(message);
+                }
+            }
+            return Listing::from_parts(marks, errors);
+        }
+        match self
+            .run_out_state_checked(&["comment", "list", "--format", "json"])
+            .and_then(|out| {
+                serde_json::from_str::<CommentListJson>(&out)
+                    .map_err(|error| format!("bn comment list returned invalid JSON: {error}"))
+            }) {
+            Ok(list) => {
                 for c in list.items {
                     push_mark(
                         &mut marks,
@@ -1240,7 +1344,15 @@ impl Bn {
                     );
                 }
             }
-            if let Ok(list) = tags.and_then(|v| self.decode::<TagListJson>(v, "tag list")) {
+            Err(message) => errors.push(message),
+        }
+        match self
+            .run_out_state_checked(&["tag", "list", "--format", "json"])
+            .and_then(|out| {
+                serde_json::from_str::<TagListJson>(&out)
+                    .map_err(|error| format!("bn tag list returned invalid JSON: {error}"))
+            }) {
+            Ok(list) => {
                 for t in list.items {
                     let kind = t
                         .type_name
@@ -1249,31 +1361,9 @@ impl Bn {
                     push_mark(&mut marks, t.address, kind, t.data, t.function);
                 }
             }
-            return marks;
+            Err(message) => errors.push(message),
         }
-        let comments = self.run_out_state(&["comment", "list", "--format", "json"]);
-        if let Ok(list) = serde_json::from_str::<CommentListJson>(&comments) {
-            for c in list.items {
-                push_mark(
-                    &mut marks,
-                    c.address,
-                    "comment".into(),
-                    c.comment,
-                    c.function,
-                );
-            }
-        }
-        let tags = self.run_out_state(&["tag", "list", "--format", "json"]);
-        if let Ok(list) = serde_json::from_str::<TagListJson>(&tags) {
-            for t in list.items {
-                let kind = t
-                    .type_name
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "tag".into());
-                push_mark(&mut marks, t.address, kind, t.data, t.function);
-            }
-        }
-        marks
+        Listing::from_parts(marks, errors)
     }
 
     /// JSON-backed imports for the attack-surface view.
@@ -1331,26 +1421,37 @@ impl Bn {
     /// `bn types` -> the full type list (name + kind) for the Types view,
     /// paged with `--offset` until the envelope reports `has_more: false` so a
     /// database past the page size is never silently truncated.
-    pub fn types_list(&self) -> Vec<TypeItem> {
+    pub fn types_list(&self) -> Listing<TypeItem> {
         let mut all: Vec<TypeItem> = Vec::new();
         loop {
             let offset = all.len();
-            let (mut items, has_more) = if let Some(result) = self.call(
+            let page = if let Some(result) = self.call(
                 "types",
                 serde_json::json!({"offset": offset}),
                 &["types"],
                 HealthScope::Shared,
             ) {
-                match result.and_then(|value| self.decode::<TypesJson>(value, "types")) {
-                    Ok(page) => types_page(page),
-                    Err(_) => (Vec::new(), false),
-                }
+                result
+                    .and_then(|value| self.decode::<TypesJson>(value, "types"))
+                    .map(types_page)
             } else {
                 let offset = offset.to_string();
-                let out = self.run_out_state(&[
+                self.run_out_state_checked(&[
                     "types", "--offset", &offset, "--limit", "5000", "--format", "json",
-                ]);
-                parse_types_page(&out)
+                ])
+                .and_then(|out| parse_types_page(&out))
+            };
+            let (mut items, has_more) = match page {
+                Ok(page) => page,
+                Err(message) => {
+                    // Two reasons this cannot be dropped: `call` already healed
+                    // shared health on the raw socket success, before the payload
+                    // was decoded; and `all` may hold pages from before the failure,
+                    // so returning it bare would present a truncated type inventory
+                    // with a normal count.
+                    self.record_failure(&["types"], message.clone());
+                    return Listing::partial(all, message);
+                }
             };
             // An empty page also ends the loop, so a malformed/stuck envelope
             // can't page forever.
@@ -1362,7 +1463,7 @@ impl Bn {
                 break;
             }
         }
-        all
+        Listing::ok(all)
     }
 
     /// `bn types show <name>` -> the rendered layout (struct fields + offsets).
@@ -1786,31 +1887,39 @@ impl Bn {
 
     /// All strings: (content, address). Content is bn's rendering (same escape
     /// form as the decompile, so it matches a quote-stripped literal directly).
-    pub fn strings(&self) -> Vec<(String, String)> {
+    pub fn strings(&self) -> Listing<(String, String)> {
         if let Some(result) =
             self.call("strings", serde_json::json!({}), &["strings"], HealthScope::Shared)
         {
-            let Ok(value) = result else {
-                return Vec::new();
+            // `items` is deliberately *not* `#[serde(default)]`: a missing or
+            // non-array field is a schema surprise, and treating it as an empty
+            // success rendered the Strings view as a genuine `0/0` (and silently
+            // disabled every string hotspot).
+            let list = match result.and_then(|value| self.decode::<StringsJson>(value, "strings")) {
+                Ok(list) => list,
+                Err(message) => {
+                    self.record_failure(&["strings"], message.clone());
+                    return Listing::partial(Vec::new(), message);
+                }
             };
-            let items = value
-                .get("items")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            return items
-                .into_iter()
-                .filter_map(|item| {
-                    let addr = item.get("address")?.as_str()?.to_string();
-                    let raw = item.get("value")?.as_str()?;
-                    // Re-escape to the CLI's rendering: the content→address map is
-                    // keyed on what the decompiler prints between quotes, not on
-                    // the raw bytes. See `json_escape_ascii`.
-                    Some((json_escape_ascii(raw), addr))
-                })
-                .collect();
+            return Listing::ok(
+                list.items
+                    .into_iter()
+                    .filter_map(|item| {
+                        // A single item missing its fields is skipped, as before —
+                        // only the envelope is treated as fatal.
+                        // Re-escape to the CLI's rendering: the content→address map
+                        // is keyed on what the decompiler prints between quotes, not
+                        // on the raw bytes. See `json_escape_ascii`.
+                        Some((json_escape_ascii(&item.value?), item.address?))
+                    })
+                    .collect(),
+            );
         }
-        let text = self.run_out_state(&["strings"]);
+        let text = match self.run_out_state_checked(&["strings"]) {
+            Ok(text) => text,
+            Err(message) => return Listing::partial(Vec::new(), message),
+        };
         let mut out = Vec::new();
         for line in text.lines() {
             let Some(addr) = line.split_whitespace().next() else {
@@ -1826,7 +1935,7 @@ impl Bn {
                 }
             }
         }
-        out
+        Listing::ok(out)
     }
 
     /// Structured locals + params from `bn local list --format json`.
@@ -2321,7 +2430,7 @@ mod tests {
     use super::{
         decompile_render, is_unknown_op, json_escape_ascii, parse_local_list_json,
         parse_types_page, push_mark, recovered_class, render_sections, text_field, AnalysisState,
-        Bn, ClassItemJson, CommentListJson, TagListJson,
+        Bn, ClassItemJson, CommentListJson, Listing, StringsJson, TagListJson,
     };
 
     #[test]
@@ -2520,7 +2629,7 @@ mod tests {
             {"name":"color","kind":"enum","decl":"enum color"},
             {"name":"unionizer_t","kind":"named_type_ref","decl":"typedef struct widget unionizer_t"}
         ],"has_more":false,"total":4,"returned":4}"#;
-        let (items, has_more) = parse_types_page(json);
+        let (items, has_more) = parse_types_page(json).expect("well-formed page");
         assert!(!has_more);
         let kinds: Vec<&str> = items.iter().map(|i| i.kind.as_str()).collect();
         assert_eq!(kinds, ["union", "struct", "enum", "named_type_ref"]);
@@ -2528,16 +2637,69 @@ mod tests {
     }
 
     #[test]
-    fn types_page_reports_more_pages_and_survives_garbage() {
+    fn types_page_reports_more_pages_and_names_garbage() {
         let json = r#"{"items":[{"name":"widget","kind":"struct","decl":"struct widget"}],
                        "has_more":true,"total":9001,"returned":1}"#;
-        let (items, has_more) = parse_types_page(json);
+        let (items, has_more) = parse_types_page(json).expect("well-formed page");
         assert_eq!(items.len(), 1);
         assert!(has_more, "has_more must surface so the caller keeps paging");
 
-        let (items, has_more) = parse_types_page("not json at all");
-        assert!(items.is_empty());
-        assert!(!has_more, "a malformed page must not page forever");
+        // A malformed page is an error, not an empty page: the empty page it used
+        // to return also ended the paging loop, so a partial type list came back
+        // looking complete.
+        let error = match parse_types_page("not json at all") {
+            Err(error) => error,
+            Ok((items, _)) => panic!("garbage must not decode ({} items)", items.len()),
+        };
+        assert!(error.contains("invalid JSON"), "{error:?}");
+    }
+
+    #[test]
+    fn a_fresh_handle_is_paced_for_the_event_thread() {
+        // The safe default: an un-re-paced handle can only ever be reached from the
+        // event thread as far as this type knows, and there the socket timeout *is*
+        // the freeze budget. Opting into the ten-minute budget is explicit.
+        let bn = Bn::new("bn".into(), Some("bn-lens-test-no-such-instance".into()), None);
+        assert_eq!(bn.pace, crate::bnsock::Pace::Interactive);
+        assert_eq!(
+            bn.with_pace(crate::bnsock::Pace::Analysis).pace,
+            crate::bnsock::Pace::Analysis
+        );
+    }
+
+    #[test]
+    fn a_strings_payload_without_a_usable_items_field_does_not_decode() {
+        // A schema change or a truncated result must not become an *empty string
+        // table*: that renders as a genuine "this binary has no strings" and
+        // silently disables every string hotspot in the viewer.
+        assert!(serde_json::from_value::<StringsJson>(serde_json::json!({"count": 0})).is_err());
+        assert!(
+            serde_json::from_value::<StringsJson>(serde_json::json!({"items": "nope"})).is_err()
+        );
+        // A single item missing its fields is still skipped rather than fatal.
+        let list: StringsJson = serde_json::from_value(serde_json::json!({"items": [
+            {"address": "0x4008a0", "value": "%s: cannot open %s"},
+            {"value": "orphan with no address"}
+        ]}))
+        .expect("a well-formed envelope decodes");
+        assert_eq!(list.items.len(), 2);
+        assert!(list.items[1].address.is_none());
+    }
+
+    #[test]
+    fn a_partially_failed_merge_keeps_its_rows_and_its_error() {
+        // Comments decoded, tags did not: half the annotations must not be able to
+        // read as all of them just because rows came back.
+        let listing = Listing::from_parts(
+            vec![1, 2],
+            vec!["bn tag list returned unexpected JSON".to_string()],
+        );
+        assert_eq!(listing.items.len(), 2);
+        assert_eq!(
+            listing.error.as_deref(),
+            Some("bn tag list returned unexpected JSON")
+        );
+        assert!(Listing::from_parts(vec![1], Vec::new()).error.is_none());
     }
 
     #[test]

@@ -153,12 +153,16 @@ impl App {
     }
 
     fn rebuild_ctx(&mut self, instance: Option<String>, target: Option<String>) {
+        // On the event thread: the switcher/crumb rebuild is synchronous, so every
+        // read here is bounded by the interactive budget rather than the ten-minute
+        // analysis one.
         match Ctx::build(
             &self.bn_bin,
             &self.herdr,
             &self.agent_pane,
             instance,
             target,
+            crate::bnsock::Pace::Interactive,
         ) {
             Ok(ctx) => {
                 self.ctx = ctx;
@@ -323,7 +327,16 @@ impl App {
         let target = (!self.ctx.target.is_empty()).then(|| self.ctx.target.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(Ctx::build(&bn_bin, &herdr, &agent_pane, instance, target));
+            // Worker thread behind the counting banner: a long analysis read is
+            // visible and the event loop keeps running, so it keeps the long budget.
+            let _ = tx.send(Ctx::build(
+                &bn_bin,
+                &herdr,
+                &agent_pane,
+                instance,
+                target,
+                crate::bnsock::Pace::Analysis,
+            ));
         });
         self.refreshing = Some(Refreshing {
             started: Instant::now(),

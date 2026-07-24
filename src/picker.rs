@@ -26,24 +26,32 @@ pub enum Action {
     None,
 }
 
-/// The error a list view must show instead of an empty table.
+/// The error a list view must show instead of — or alongside — its table.
 ///
-/// A backend read that fails renders as `0/0` otherwise, and on an
-/// attack-surface view that is a false all-clear — "this binary imports
-/// nothing" is a conclusion a reader will actually draw. Views whose backend
-/// read hands back a plain `Vec` (strings, types, marks: the error is swallowed
-/// inside `Bn`) recover it from the shared health cell (`Bn::last_error`).
+/// Two different failures, both of which otherwise render as a trustworthy count:
 ///
-/// Deliberately *not* keyed to one command: the health cell holds a single slot
-/// for the most recent state-read failure, so any failed state read means this
-/// view's emptiness is untrustworthy. Over-attributing an unrelated bridge
-/// failure is the safe direction; claiming a genuine zero is not. A list with
-/// rows never shows it — it has real content to stand on.
-pub fn empty_list_error(rows_empty: bool, health: Option<String>) -> Option<String> {
-    if rows_empty {
-        health
-    } else {
-        None
+/// - `read_error`: the reader itself failed or *partially* failed (a page after the
+///   first, a payload that would not decode, one half of the comments+tags merge).
+///   [`crate::bn::Listing`] carries it. It is surfaced **even when rows were
+///   recovered**, because a truncated inventory shown with a normal count is a
+///   silent truncation, and on an attack-surface view a reader draws conclusions
+///   from what is *absent*.
+/// - `health`: the shared most-recent-state-failure cell (`Bn::last_error`), for
+///   reads whose own error is not plumbed through. Trusted only when the list is
+///   empty: the cell holds a single slot and is deliberately *not* keyed to one
+///   command, so any failed state read means an empty view is untrustworthy.
+///   Over-attributing an unrelated bridge failure is the safe direction; claiming
+///   a genuine zero is not. A list with rows has real content to stand on.
+pub fn list_error(
+    rows_empty: bool,
+    read_error: Option<String>,
+    health: Option<String>,
+) -> Option<String> {
+    match read_error {
+        Some(error) if rows_empty => Some(error),
+        Some(error) => Some(format!("partial list — {error}")),
+        None if rows_empty => health,
+        None => None,
     }
 }
 
@@ -1239,15 +1247,31 @@ pub(crate) mod tests {
         let failure = || Some("bn imports: could not reach instance".to_string());
         // Empty + a recorded failure: the emptiness is the failure, not a finding.
         assert_eq!(
-            empty_list_error(true, failure()),
+            list_error(true, None, failure()),
             failure(),
             "an empty list under a failed state read must surface the error"
         );
         // Empty with a healthy backend is a genuine zero-row table.
-        assert_eq!(empty_list_error(true, None), None);
-        // Rows present: never claim a failure over real content.
-        assert_eq!(empty_list_error(false, failure()), None);
-        assert_eq!(empty_list_error(false, None), None);
+        assert_eq!(list_error(true, None, None), None);
+        // Rows present: an unrelated health failure must not shout over real content.
+        assert_eq!(list_error(false, None, failure()), None);
+        assert_eq!(list_error(false, None, None), None);
+    }
+
+    #[test]
+    fn a_partial_read_is_reported_even_though_rows_survived() {
+        // The failure that matters most: page 1 decoded, page 2 did not. Rows exist,
+        // so the health-cell rule alone would label a truncated inventory with a
+        // normal count — indistinguishable from a complete one.
+        let partial = || Some("bn types returned invalid JSON: expected value".to_string());
+        let shown = list_error(false, partial(), None).expect("a partial read must be reported");
+        assert!(shown.starts_with("partial list — "), "{shown:?}");
+        assert!(shown.contains("invalid JSON"), "{shown:?}");
+        // Nothing recovered at all: the reader's own error beats the shared cell.
+        assert_eq!(
+            list_error(true, partial(), Some("stale unrelated failure".into())),
+            partial()
+        );
     }
 
     #[test]
