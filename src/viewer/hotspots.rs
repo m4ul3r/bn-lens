@@ -439,9 +439,9 @@ pub(super) fn build_spans(
                         });
                     }
                 }
-                // 0x-address: Num in pseudo-C (tokenize_c), Type in the plain
-                // tokenizer used for mlil/disasm/xrefs — accept either.
-                Tok::Num | Tok::Type if segment.text.starts_with("0x") => {
+                // A `0x…` literal in any view. Whether it names something is
+                // decided here, against the section map.
+                Tok::Hex => {
                     if let Some((_, _, _, executable)) = crate::ctx::parse_hex(&segment.text)
                         .and_then(|address| ctx.section_of(address))
                     {
@@ -514,6 +514,61 @@ mod tests {
         );
         // Nothing known → not a hotspot.
         assert_eq!(classify_name(false, false, false), None);
+    }
+
+    /// End-to-end: a demangled C++ callee must survive lexing in one piece and
+    /// come out the other side as a `Func` hotspot, or `g`/`x`/`n` have nothing
+    /// to act on and `w`/`W` step straight past the call.
+    #[test]
+    fn a_qualified_callee_becomes_a_func_hotspot() {
+        let mut ctx = crate::ctx::Ctx::stub();
+        // What `Ctx::build` stores: BN's mangled name and its display name.
+        ctx.func_names.insert("_ZN3mtd3runEiPPc".into());
+        ctx.func_names.insert("mtd::run".into());
+
+        let lines = crate::syntax::tokenize_c("    return mtd::run(argc, argv);");
+        let spans = super::build_spans(&lines, &ctx, &HashMap::new());
+
+        let hit = spans
+            .iter()
+            .find(|s| s.kind == HotKind::Func)
+            .expect("the qualified callee should be a Func hotspot");
+        assert_eq!(hit.target, "mtd::run");
+        assert!(hit.code);
+        // Column must point at the `m`, not at the leading indent.
+        assert_eq!(hit.col, "    return ".chars().count());
+    }
+
+    /// The data map builds its own segments instead of going through the lexer, so
+    /// the `Tok::Hex` it tags a pointer with is the *only* thing making that pointer
+    /// navigable now that the hotspot pass keys on the kind alone. Nothing else in
+    /// the suite covers that coupling: retagging it `Tok::Num` leaves every other
+    /// test green while `g`/`p` on a data-map pointer silently stops working.
+    #[test]
+    fn a_data_map_pointer_stays_an_addr_hotspot() {
+        let mut ctx = crate::ctx::Ctx::stub();
+        ctx.section_ranges = vec![(0x400000, 0x410000, ".text".into(), true)];
+        let var = crate::bn::DataVar {
+            addr: "0x1000".into(),
+            name: "g_handler".into(),
+            type_name: "void*".into(),
+            width: 8,
+            section: ".data".into(),
+            value: None,
+            ptr: Some("0x401230".into()),
+            ptr_sym: None,
+            ptr_str: None,
+        };
+        let out = crate::datamap::linear(".data", 0x1000, 0x1040, &[var], &[], 0x1000);
+        let spans = super::build_spans(&out.lines, &ctx, &HashMap::new());
+
+        let hit = spans
+            .iter()
+            .find(|s| s.target == "0x401230")
+            .expect("the pointer target must be a hotspot");
+        assert_eq!(hit.kind, HotKind::Addr);
+        // 0x401230 is in .text, so `g` decompiles it rather than opening data.
+        assert!(hit.code);
     }
 
     fn spot(target: &str, kind: HotKind, code: bool, line: usize) -> Hotspot {

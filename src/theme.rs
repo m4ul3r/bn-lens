@@ -13,9 +13,9 @@ pub fn tok_style(tok: Tok) -> Style {
         Tok::Keyword => Color::Magenta,
         Tok::Type => Color::Cyan,
         Tok::Str => Color::Yellow,
-        Tok::Num => Color::Yellow,
+        Tok::Num | Tok::Hex => Color::Yellow,
         Tok::Name => Color::Blue,
-        Tok::Plain => Color::Reset,
+        Tok::Punct | Tok::Plain => Color::Reset,
     };
     Style::default().fg(c)
 }
@@ -25,7 +25,7 @@ pub fn tok_style(tok: Tok) -> Style {
 /// operators — stays plain; hotspots layer their own colour on top.
 pub fn asm_style(tok: Tok) -> Style {
     match tok {
-        Tok::Type => Style::default().fg(Color::Cyan), // 0x… addresses
+        Tok::Hex => Style::default().fg(Color::Cyan), // 0x… addresses
         Tok::Num => Style::default().add_modifier(Modifier::DIM), // bare hex: addr col, bytes, imms
         Tok::Str => Style::default().fg(Color::Yellow),
         Tok::Keyword => Style::default().fg(Color::Magenta), // return/noreturn/goto

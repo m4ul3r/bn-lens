@@ -718,13 +718,15 @@ impl Viewer {
             self.status = " ✗ nothing to peek on this line".into();
             return;
         };
+        // `Tok::Hex` covers every view. This fallback used to test `Tok::Num`, which
+        // the plain tokenizer never produced for a `0x…` (it tagged those `Tok::Type`
+        // for the cyan), so `p` on an unselected MLIL/disasm line ignored addresses
+        // the hotspot pass was already treating as navigable. One lexical kind makes
+        // the two agree.
         let tokens: Vec<String> = segments
             .iter()
             .filter(|segment| {
-                segment.kind == Tok::Name
-                    || (segment.kind == Tok::Num
-                        && segment.text.starts_with("0x")
-                        && segment.text.len() >= 6)
+                segment.kind == Tok::Name || (segment.kind == Tok::Hex && segment.text.len() >= 6)
             })
             .map(|segment| segment.text.clone())
             .collect();

@@ -1,6 +1,20 @@
 //! A small pseudo-C tokenizer for decompiler output (replaces pygments).
 //! Pure and testable: turns text into per-line runs of (text, kind). Colour
 //! mapping lives in the viewer so this stays UI-free.
+//!
+//! One scanner serves both flavours of BN output. The differences — comments,
+//! string literals, how a number is read, how a bare word is classified — are
+//! data on a [`Dialect`], not a second copy of the loop, so a lexing fix lands
+//! in decompile *and* MLIL/disasm/xrefs at once.
+//!
+//! Two invariants the consumers depend on:
+//!
+//! - **Round-trip.** Concatenating a line's segment texts reproduces the source
+//!   line exactly. `build_spans` derives hotspot columns by accumulating segment
+//!   widths, and rendering/mouse hit-testing follow from those columns.
+//! - **Kinds are lexical, not visual.** A `0x…` literal is [`Tok::Hex`] whether
+//!   or not it turns out to name a mapped address; deciding that is the section
+//!   map's job downstream. Colour is `theme.rs`'s job.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tok {
@@ -8,8 +22,16 @@ pub enum Tok {
     Keyword,
     Type,
     Str,
+    /// A bare numeric run: a decimal literal, or an unprefixed hex column in a
+    /// disassembly dump.
     Num,
+    /// A `0x…` literal. Whether it *is* an address is resolved against the
+    /// section map by the hotspot pass — the lexer only sees the prefix.
+    Hex,
     Name,
+    /// An operator or separator, longest-match (`::`, `->`, `==`, …).
+    Punct,
+    /// Whitespace, and anything the dialect does not recognise.
     Plain,
 }
 
@@ -38,11 +60,84 @@ const TYPES: &[&str] = &[
 /// registers stay unstyled.
 const PLAIN_KEYWORDS: &[&str] = &["return", "noreturn", "goto"];
 
+/// Multi-character operators, longest first so the scan is greedy. Single
+/// characters need no entry — they are the fallback.
+const OPERATORS: &[&str] = &[
+    "<<=", ">>=", "...", "::", "->", "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "++", "--",
+    "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+];
+
+/// How a dialect reads a numeric run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NumberStyle {
+    /// Pseudo-C: a digit opens a literal that may carry a `0x` prefix.
+    C,
+    /// Dump output: `0x…` is explicit, and a bare run is hex (an address
+    /// column or byte value), not decimal.
+    HexDump,
+}
+
+/// How a dialect classifies a bare word.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentStyle {
+    /// C keywords, C types, and the `_t` suffix convention.
+    C,
+    /// Assembly: hex-looking runs dim as numbers, a few control words read as
+    /// keywords, and everything else (mnemonics, registers) stays a plain name.
+    Asm,
+}
+
+#[derive(Clone, Copy)]
+struct Dialect {
+    comments: bool,
+    strings: bool,
+    numbers: NumberStyle,
+    idents: IdentStyle,
+}
+
+const C_DIALECT: Dialect = Dialect {
+    comments: true,
+    strings: true,
+    numbers: NumberStyle::C,
+    idents: IdentStyle::C,
+};
+
+const PLAIN_DIALECT: Dialect = Dialect {
+    comments: false,
+    strings: false,
+    numbers: NumberStyle::HexDump,
+    idents: IdentStyle::Asm,
+};
+
 fn classify_ident(id: &str) -> Tok {
+    // A qualified name is a *symbol reference*, never a bare C type keyword, so it
+    // skips the heuristics below. Both would misfire on one: the `_t` convention
+    // reads `mtd::handle_t` as a type, and `Tok::Type` never reaches the `Tok::Name`
+    // arm of `build_spans` — leaving the callee unnavigable, which is the exact
+    // failure joining qualified names exists to fix.
+    if id.contains("::") {
+        return Tok::Name;
+    }
     if KEYWORDS.contains(&id) {
         Tok::Keyword
     } else if TYPES.contains(&id) || id.ends_with("_t") {
         Tok::Type
+    } else {
+        Tok::Name
+    }
+}
+
+/// A 2-char (byte) or >=5-char (address) all-hex run that lexes as an
+/// identifier is really a hex value in a disasm dump — tag it `Num` so it dims
+/// uniformly. 3-4 chars stay a `Name` so mnemonics like `add`/`adc` aren't
+/// dimmed.
+fn classify_asm_ident(id: &str) -> Tok {
+    let len = id.chars().count();
+    let hexish = (len == 2 || len >= 5) && id.chars().all(|c| c.is_ascii_hexdigit());
+    if hexish {
+        Tok::Num
+    } else if PLAIN_KEYWORDS.contains(&id) {
+        Tok::Keyword
     } else {
         Tok::Name
     }
@@ -55,9 +150,94 @@ fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// Tokenize one C line given the incoming block-comment state; returns the
-/// segments and whether we are still inside a block comment.
-fn tokenize_line(line: &str, mut in_block: bool) -> (Line, bool) {
+fn consume_while(ch: &[char], i: &mut usize, pred: impl Fn(char) -> bool) {
+    while *i < ch.len() && pred(ch[*i]) {
+        *i += 1;
+    }
+}
+
+/// Scan one identifier, joining a C++ qualified name (`mtd::run`,
+/// `mtd::SessionBase::dispatch`) into a single segment.
+///
+/// This is what makes a demangled callee navigable: the hotspot pass matches a
+/// segment against `ctx.func_names`, which holds BN's `display_name` verbatim,
+/// so the name has to survive lexing in one piece. Only a **doubled** colon
+/// followed by an identifier joins, which leaves `a ? b : c` and `case 1:`
+/// alone.
+///
+/// Known limits, all of which cost a hotspot rather than mislabel one:
+///
+/// - A qualification that runs into a non-identifier — `operator=`, or a template
+///   argument list — joins only up to that point.
+/// - A *leading* global-scope qualifier is not part of the name: `::run` lexes as
+///   `Punct("::") + Name("run")`, because the join starts from an identifier. BN's
+///   `display_name` doesn't lead with `::`, so the bare tail is what matches.
+fn scan_ident(ch: &[char], i: &mut usize, dialect: Dialect) -> Seg {
+    let start = *i;
+    consume_while(ch, i, is_ident);
+
+    while *i + 2 < ch.len() && ch[*i] == ':' && ch[*i + 1] == ':' && is_ident_start(ch[*i + 2]) {
+        *i += 2;
+        consume_while(ch, i, is_ident);
+    }
+
+    let text: String = ch[start..*i].iter().collect();
+    let kind = match dialect.idents {
+        IdentStyle::C => classify_ident(&text),
+        IdentStyle::Asm => classify_asm_ident(&text),
+    };
+    Seg { text, kind }
+}
+
+fn scan_number(ch: &[char], i: &mut usize, dialect: Dialect) -> Seg {
+    let start = *i;
+    match dialect.numbers {
+        NumberStyle::C => {
+            // `0x9c4`, `16`, and BN's occasional `1000x` all read as one run.
+            consume_while(ch, i, |c| is_ident(c) || c == 'x');
+        }
+        NumberStyle::HexDump => {
+            if ch[*i] == '0' && *i + 1 < ch.len() && ch[*i + 1] == 'x' {
+                *i += 2;
+                consume_while(ch, i, |c| c.is_ascii_hexdigit());
+            } else {
+                // Addresses and byte columns are bare hex like `0043274c` —
+                // don't split at a-f.
+                consume_while(ch, i, |c| c.is_ascii_hexdigit());
+            }
+        }
+    }
+    let text: String = ch[start..*i].iter().collect();
+    let kind = if text.starts_with("0x") {
+        Tok::Hex
+    } else {
+        Tok::Num
+    };
+    Seg { text, kind }
+}
+
+fn scan_punct(ch: &[char], i: &mut usize) -> Seg {
+    for op in OPERATORS {
+        let len = op.chars().count();
+        if *i + len <= ch.len() && ch[*i..*i + len].iter().copied().eq(op.chars()) {
+            *i += len;
+            return Seg {
+                text: (*op).to_string(),
+                kind: Tok::Punct,
+            };
+        }
+    }
+    let text = ch[*i].to_string();
+    *i += 1;
+    Seg {
+        text,
+        kind: Tok::Punct,
+    }
+}
+
+/// Tokenize one line given the dialect and the incoming block-comment state;
+/// returns the segments and whether we are still inside a block comment.
+fn tokenize_line(line: &str, dialect: Dialect, mut in_block: bool) -> (Line, bool) {
     let mut segs: Line = Vec::new();
     let ch: Vec<char> = line.chars().collect();
     let n = ch.len();
@@ -77,16 +257,15 @@ fn tokenize_line(line: &str, mut in_block: bool) -> (Line, bool) {
 
     while i < n {
         let c = ch[i];
+
         if c.is_whitespace() {
             let start = i;
-            while i < n && ch[i].is_whitespace() {
-                i += 1;
-            }
+            consume_while(&ch, &mut i, char::is_whitespace);
             segs.push(seg(&ch[start..i], Tok::Plain));
-        } else if c == '/' && i + 1 < n && ch[i + 1] == '/' {
+        } else if dialect.comments && c == '/' && i + 1 < n && ch[i + 1] == '/' {
             segs.push(seg(&ch[i..n], Tok::Comment));
             i = n;
-        } else if c == '/' && i + 1 < n && ch[i + 1] == '*' {
+        } else if dialect.comments && c == '/' && i + 1 < n && ch[i + 1] == '*' {
             if let Some(end) = find_pair(&ch, i + 2, '*', '/') {
                 segs.push(seg(&ch[i..=end + 1], Tok::Comment));
                 i = end + 2;
@@ -94,7 +273,7 @@ fn tokenize_line(line: &str, mut in_block: bool) -> (Line, bool) {
                 segs.push(seg(&ch[i..n], Tok::Comment));
                 return (segs, true);
             }
-        } else if c == '"' || c == '\'' {
+        } else if dialect.strings && (c == '"' || c == '\'') {
             let start = i;
             let q = c;
             i += 1;
@@ -111,22 +290,11 @@ fn tokenize_line(line: &str, mut in_block: bool) -> (Line, bool) {
             }
             segs.push(seg(&ch[start..i.min(n)], Tok::Str));
         } else if c.is_ascii_digit() {
-            let start = i;
-            while i < n && (is_ident(ch[i]) || ch[i] == 'x') {
-                i += 1;
-            }
-            segs.push(seg(&ch[start..i], Tok::Num));
+            segs.push(scan_number(&ch, &mut i, dialect));
         } else if is_ident_start(c) {
-            let start = i;
-            while i < n && is_ident(ch[i]) {
-                i += 1;
-            }
-            let id: String = ch[start..i].iter().collect();
-            let kind = classify_ident(&id);
-            segs.push(Seg { text: id, kind });
+            segs.push(scan_ident(&ch, &mut i, dialect));
         } else {
-            segs.push(seg(&ch[i..i + 1], Tok::Plain));
-            i += 1;
+            segs.push(scan_punct(&ch, &mut i));
         }
     }
     (segs, in_block)
@@ -155,66 +323,18 @@ pub fn tokenize_c(text: &str) -> Vec<Line> {
     let mut out = Vec::new();
     let mut in_block = false;
     for line in text.split('\n') {
-        let (segs, nb) = tokenize_line(line, in_block);
+        let (segs, nb) = tokenize_line(line, C_DIALECT, in_block);
         in_block = nb;
         out.push(segs);
     }
     out
 }
 
-/// Tokenize plain output (xrefs, hex): addresses / numbers / identifiers.
+/// Tokenize plain output (xrefs, mlil, disasm): addresses / numbers /
+/// identifiers. No comment or string state — that output has neither.
 pub fn tokenize_plain(text: &str) -> Vec<Line> {
     text.split('\n')
-        .map(|line| {
-            let ch: Vec<char> = line.chars().collect();
-            let n = ch.len();
-            let mut segs: Line = Vec::new();
-            let mut i = 0;
-            while i < n {
-                let c = ch[i];
-                if c == '0' && i + 1 < n && ch[i + 1] == 'x' {
-                    let start = i;
-                    i += 2;
-                    while i < n && ch[i].is_ascii_hexdigit() {
-                        i += 1;
-                    }
-                    segs.push(seg(&ch[start..i], Tok::Type)); // address -> cyan
-                } else if c.is_ascii_digit() {
-                    // consume the whole hex run (disasm/mlil addresses & byte
-                    // columns are bare hex like `0043274c`) — don't split at a-f
-                    let start = i;
-                    while i < n && ch[i].is_ascii_hexdigit() {
-                        i += 1;
-                    }
-                    segs.push(seg(&ch[start..i], Tok::Num));
-                } else if is_ident_start(c) {
-                    let start = i;
-                    while i < n && is_ident(ch[i]) {
-                        i += 1;
-                    }
-                    // a 2-char (byte) or >=5-char (address) all-hex run that lexes
-                    // as an identifier is really a hex value in a disasm dump — tag
-                    // it Num so it dims uniformly. 3-4 char stays a Name so
-                    // mnemonics like `add`/`adc` aren't dimmed.
-                    let t: &[char] = &ch[start..i];
-                    let hexish =
-                        (t.len() == 2 || t.len() >= 5) && t.iter().all(|c| c.is_ascii_hexdigit());
-                    let word: String = t.iter().collect();
-                    let kind = if hexish {
-                        Tok::Num
-                    } else if PLAIN_KEYWORDS.contains(&word.as_str()) {
-                        Tok::Keyword
-                    } else {
-                        Tok::Name
-                    };
-                    segs.push(seg(t, kind));
-                } else {
-                    segs.push(seg(&ch[i..i + 1], Tok::Plain));
-                    i += 1;
-                }
-            }
-            segs
-        })
+        .map(|line| tokenize_line(line, PLAIN_DIALECT, false).0)
         .collect()
 }
 
@@ -224,6 +344,10 @@ mod tests {
 
     fn kinds(line: &Line) -> Vec<(&str, Tok)> {
         line.iter().map(|s| (s.text.as_str(), s.kind)).collect()
+    }
+
+    fn joined(line: &Line) -> String {
+        line.iter().map(|s| s.text.clone()).collect()
     }
 
     #[test]
@@ -242,9 +366,7 @@ mod tests {
         let segs = kinds(line);
         assert!(segs.iter().any(|(t, k)| *t == "goto" && *k == Tok::Keyword));
         assert!(segs.iter().any(|(t, k)| *t == "0040338c" && *k == Tok::Num));
-        assert!(segs
-            .iter()
-            .any(|(t, k)| *t == "0x40336c" && *k == Tok::Type));
+        assert!(segs.iter().any(|(t, k)| *t == "0x40336c" && *k == Tok::Hex));
 
         let ret = &tokenize_plain("00403404  noreturn")[0];
         assert!(kinds(ret)
@@ -266,9 +388,7 @@ mod tests {
         assert!(segs
             .iter()
             .any(|(t, k)| *t == "msg_alloc" && *k == Tok::Name));
-        // reassembling the segments round-trips the source text
-        let joined: String = lines[0].iter().map(|s| s.text.clone()).collect();
-        assert_eq!(joined, "int64_t x0 = msg_alloc();");
+        assert_eq!(joined(&lines[0]), "int64_t x0 = msg_alloc();");
     }
 
     #[test]
@@ -293,7 +413,10 @@ mod tests {
         let lines = tokenize_c("y = 0x9c4 + 16;");
         assert!(lines[0]
             .iter()
-            .any(|s| s.text == "0x9c4" && s.kind == Tok::Num));
+            .any(|s| s.text == "0x9c4" && s.kind == Tok::Hex));
+        assert!(lines[0]
+            .iter()
+            .any(|s| s.text == "16" && s.kind == Tok::Num));
     }
 
     #[test]
@@ -301,9 +424,133 @@ mod tests {
         let lines = tokenize_plain("  0x402620  build_and_send  (1 site: 0x402658)");
         assert!(lines[0]
             .iter()
-            .any(|s| s.text == "0x402620" && s.kind == Tok::Type));
+            .any(|s| s.text == "0x402620" && s.kind == Tok::Hex));
         assert!(lines[0]
             .iter()
             .any(|s| s.text == "build_and_send" && s.kind == Tok::Name));
+    }
+
+    // ---- qualified C++ names -------------------------------------------
+
+    #[test]
+    fn joins_a_qualified_call_into_one_name() {
+        // The whole point: `func_names` holds BN's demangled `display_name`, so
+        // the token has to arrive intact for the hotspot pass to match it.
+        let lines = tokenize_c("    return mtd::run(argc, argv);");
+        let segs = kinds(&lines[0]);
+        assert!(segs
+            .iter()
+            .any(|(t, k)| *t == "mtd::run" && *k == Tok::Name));
+        assert!(!segs.iter().any(|(t, _)| *t == "mtd"));
+        assert_eq!(joined(&lines[0]), "    return mtd::run(argc, argv);");
+    }
+
+    #[test]
+    fn joins_deeply_qualified_names_in_both_dialects() {
+        let c = &tokenize_c("mtd::SessionBase::dispatch(x);")[0];
+        assert!(kinds(c)
+            .iter()
+            .any(|(t, k)| *t == "mtd::SessionBase::dispatch" && *k == Tok::Name));
+
+        // MLIL/disasm/xrefs get the same treatment from the same scanner.
+        let plain = &tokenize_plain("  0x40761c  mtd::SessionBase::dispatch  (2 sites)")[0];
+        assert!(kinds(plain)
+            .iter()
+            .any(|(t, k)| *t == "mtd::SessionBase::dispatch" && *k == Tok::Name));
+    }
+
+    #[test]
+    fn a_qualified_name_is_never_classified_as_a_type() {
+        // `Tok::Type` never reaches the `Tok::Name` arm of `build_spans`, so a
+        // qualified callee classified by the `_t` convention would join correctly
+        // and *still* be unnavigable — the very failure this joining fixes.
+        assert_eq!(classify_ident("mtd::handle_t"), Tok::Name);
+        assert_eq!(classify_ident("mtd::run"), Tok::Name);
+        // Unqualified names keep the convention: a bare `_t` really is a type.
+        assert_eq!(classify_ident("handle_t"), Tok::Type);
+
+        let segs = &tokenize_c("mtd::handle_t(x);")[0];
+        assert!(kinds(segs)
+            .iter()
+            .any(|(t, k)| *t == "mtd::handle_t" && *k == Tok::Name));
+    }
+
+    #[test]
+    fn a_single_colon_never_joins() {
+        // Ternaries and case labels must keep their colon as punctuation, or
+        // `cond ? a : b` would lex as one bogus identifier.
+        let ternary = &tokenize_c("x = cond ? a : b;")[0];
+        let segs = kinds(ternary);
+        assert!(segs.iter().any(|(t, k)| *t == "a" && *k == Tok::Name));
+        assert!(segs.iter().any(|(t, k)| *t == "b" && *k == Tok::Name));
+        assert!(segs.iter().any(|(t, k)| *t == ":" && *k == Tok::Punct));
+        assert_eq!(joined(ternary), "x = cond ? a : b;");
+
+        let label = &tokenize_c("  case 1:")[0];
+        assert!(kinds(label)
+            .iter()
+            .any(|(t, k)| *t == ":" && *k == Tok::Punct));
+    }
+
+    #[test]
+    fn a_trailing_colon_pair_does_not_run_off_the_end() {
+        // `::` with nothing after it must not be swallowed into the name.
+        for line in ["foo::", "foo::;", "foo::1"] {
+            let segs = &tokenize_c(line)[0];
+            assert!(kinds(segs)
+                .iter()
+                .any(|(t, k)| *t == "foo" && *k == Tok::Name));
+            assert_eq!(joined(segs), line);
+        }
+    }
+
+    // ---- structural invariants ------------------------------------------
+
+    #[test]
+    fn multi_char_operators_are_single_punct_segments() {
+        let segs = &tokenize_c("a->b == c && d << 2;")[0];
+        let k = kinds(segs);
+        for op in ["->", "==", "&&", "<<"] {
+            assert!(
+                k.iter().any(|(t, kind)| *t == op && *kind == Tok::Punct),
+                "expected a single Punct segment for {op}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_line_round_trips_through_both_dialects() {
+        // Hotspot columns are accumulated segment widths, so a lexer that drops
+        // or duplicates a character silently misplaces every hotspot after it.
+        let samples = [
+            "int64_t x0 = msg_alloc();",
+            "    return mtd::run(argc, argv);",
+            "x = cond ? a : b;  // trailing",
+            "if (a->len >= 0x40 && b != 0) { return -1; }",
+            "  0x402620  build_and_send  (1 site: 0x402658)",
+            "0040338c  goto 16 @ 0x40336c",
+            "char* s = \"quoted :: not a name\";",
+            "",
+            "   ",
+        ];
+        for text in samples {
+            assert_eq!(joined(&tokenize_c(text)[0]), text, "tokenize_c: {text:?}");
+            assert_eq!(
+                joined(&tokenize_plain(text)[0]),
+                text,
+                "tokenize_plain: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_qualified_name_inside_a_string_stays_a_string() {
+        let segs = &tokenize_c("log(\"mtd::run failed\");")[0];
+        assert!(kinds(segs)
+            .iter()
+            .any(|(t, k)| t.contains("mtd::run") && *k == Tok::Str));
+        assert!(!kinds(segs)
+            .iter()
+            .any(|(t, k)| *t == "mtd::run" && *k == Tok::Name));
     }
 }

@@ -200,7 +200,7 @@ fn is_inline_string(var: &DataVar) -> bool {
 /// scalar `= N (0xNN)`. Empty for aggregates.
 fn value_segs(var: &DataVar) -> Vec<Seg> {
     if let Some(ptr) = &var.ptr {
-        let mut segs = vec![seg("= ", Tok::Plain), seg(ptr.clone(), Tok::Num)];
+        let mut segs = vec![seg("= ", Tok::Plain), seg(ptr.clone(), Tok::Hex)];
         if let Some(sym) = &var.ptr_sym {
             segs.push(seg(" → ", Tok::Plain));
             segs.push(seg(sym.clone(), Tok::Name));
