@@ -539,6 +539,38 @@ mod tests {
         assert_eq!(hit.col, "    return ".chars().count());
     }
 
+    /// The data map builds its own segments instead of going through the lexer, so
+    /// the `Tok::Hex` it tags a pointer with is the *only* thing making that pointer
+    /// navigable now that the hotspot pass keys on the kind alone. Nothing else in
+    /// the suite covers that coupling: retagging it `Tok::Num` leaves every other
+    /// test green while `g`/`p` on a data-map pointer silently stops working.
+    #[test]
+    fn a_data_map_pointer_stays_an_addr_hotspot() {
+        let mut ctx = crate::ctx::Ctx::stub();
+        ctx.section_ranges = vec![(0x400000, 0x410000, ".text".into(), true)];
+        let var = crate::bn::DataVar {
+            addr: "0x1000".into(),
+            name: "g_handler".into(),
+            type_name: "void*".into(),
+            width: 8,
+            section: ".data".into(),
+            value: None,
+            ptr: Some("0x401230".into()),
+            ptr_sym: None,
+            ptr_str: None,
+        };
+        let out = crate::datamap::linear(".data", 0x1000, 0x1040, &[var], &[], 0x1000);
+        let spans = super::build_spans(&out.lines, &ctx, &HashMap::new());
+
+        let hit = spans
+            .iter()
+            .find(|s| s.target == "0x401230")
+            .expect("the pointer target must be a hotspot");
+        assert_eq!(hit.kind, HotKind::Addr);
+        // 0x401230 is in .text, so `g` decompiles it rather than opening data.
+        assert!(hit.code);
+    }
+
     fn spot(target: &str, kind: HotKind, code: bool, line: usize) -> Hotspot {
         Hotspot {
             line,

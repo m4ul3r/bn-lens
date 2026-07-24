@@ -110,6 +110,14 @@ const PLAIN_DIALECT: Dialect = Dialect {
 };
 
 fn classify_ident(id: &str) -> Tok {
+    // A qualified name is a *symbol reference*, never a bare C type keyword, so it
+    // skips the heuristics below. Both would misfire on one: the `_t` convention
+    // reads `mtd::handle_t` as a type, and `Tok::Type` never reaches the `Tok::Name`
+    // arm of `build_spans` — leaving the callee unnavigable, which is the exact
+    // failure joining qualified names exists to fix.
+    if id.contains("::") {
+        return Tok::Name;
+    }
     if KEYWORDS.contains(&id) {
         Tok::Keyword
     } else if TYPES.contains(&id) || id.ends_with("_t") {
@@ -157,8 +165,13 @@ fn consume_while(ch: &[char], i: &mut usize, pred: impl Fn(char) -> bool) {
 /// followed by an identifier joins, which leaves `a ? b : c` and `case 1:`
 /// alone.
 ///
-/// Known limit: a qualification that runs into a non-identifier — `operator=`,
-/// or a template argument list — joins only up to that point.
+/// Known limits, all of which cost a hotspot rather than mislabel one:
+///
+/// - A qualification that runs into a non-identifier — `operator=`, or a template
+///   argument list — joins only up to that point.
+/// - A *leading* global-scope qualifier is not part of the name: `::run` lexes as
+///   `Punct("::") + Name("run")`, because the join starts from an identifier. BN's
+///   `display_name` doesn't lead with `::`, so the bare tail is what matches.
 fn scan_ident(ch: &[char], i: &mut usize, dialect: Dialect) -> Seg {
     let start = *i;
     consume_while(ch, i, is_ident);
@@ -444,6 +457,22 @@ mod tests {
         assert!(kinds(plain)
             .iter()
             .any(|(t, k)| *t == "mtd::SessionBase::dispatch" && *k == Tok::Name));
+    }
+
+    #[test]
+    fn a_qualified_name_is_never_classified_as_a_type() {
+        // `Tok::Type` never reaches the `Tok::Name` arm of `build_spans`, so a
+        // qualified callee classified by the `_t` convention would join correctly
+        // and *still* be unnavigable — the very failure this joining fixes.
+        assert_eq!(classify_ident("mtd::handle_t"), Tok::Name);
+        assert_eq!(classify_ident("mtd::run"), Tok::Name);
+        // Unqualified names keep the convention: a bare `_t` really is a type.
+        assert_eq!(classify_ident("handle_t"), Tok::Type);
+
+        let segs = &tokenize_c("mtd::handle_t(x);")[0];
+        assert!(kinds(segs)
+            .iter()
+            .any(|(t, k)| *t == "mtd::handle_t" && *k == Tok::Name));
     }
 
     #[test]
