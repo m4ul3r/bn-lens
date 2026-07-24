@@ -238,11 +238,15 @@ impl Switcher {
         if self.targets_of != id {
             self.preview.clear();
             self.preview_of.clear();
-            match self.tcache.get(&id) {
+            match self.tcache.get(&id).cloned() {
                 Some(list) => {
-                    self.targets = list.clone();
+                    self.targets = list;
                     self.targets_of = id.clone();
-                    self.tgt_sel = 0;
+                    // Land on the first row the filter actually shows: row 0 can
+                    // be hidden (a filter typed while this list was still empty
+                    // narrowed nothing), and a hidden cursor means Enter opens a
+                    // target the user cannot see.
+                    self.tgt_sel = self.visible_tgts().first().copied().unwrap_or(0);
                 }
                 None => {
                     self.targets.clear();
@@ -315,6 +319,13 @@ impl Switcher {
                     .unwrap_or(0);
                 self.instances = list;
                 self.fetch = None;
+                // The modal accepts `/` input while this read is outstanding, and
+                // `snap_focused` was a no-op against the empty list. The cursor
+                // (here, `cur_instance`) can therefore sit on a row the filter
+                // hides — reconcile before `pump` starts reading targets for it,
+                // or the visible rows show no selection and Enter switches to an
+                // off-screen instance.
+                self.snap_focused();
             }
             Some(Done::Targets(id, list)) => {
                 self.tcache.insert(id, list);
@@ -819,6 +830,81 @@ mod tests {
         // A non-empty column narrowed to nothing by the filter is a no-match, not
         // a pending read.
         assert_eq!(s.empty_row(false, "(no live instances)"), "(no match)");
+    }
+
+    fn target(selector: &str) -> TargetItem {
+        TargetItem {
+            selector: selector.into(),
+            active: true,
+            analysis_state: "full".into(),
+        }
+    }
+
+    #[test]
+    fn a_filter_typed_before_sessions_land_snaps_the_instance_cursor() {
+        // `/`-filtering is accepted while the initial session read is in flight,
+        // and it narrows an empty list, so nothing snaps at type time. When the
+        // list arrives the focused instance (`cur_instance`) may not match the
+        // filter: leaving the cursor there shows no selection in the visible
+        // rows and lets Enter switch to a hidden instance.
+        let mut s = switcher();
+        s.instances.clear();
+        s.targets.clear();
+        s.targets_of = String::new();
+        s.preview_of = String::new();
+        s.focus = Focus::Instances;
+        s.filter = "inst-b".into();
+        s.searching = true;
+        // Cached so `pump` never spawns a `bn` read from the test.
+        s.tcache.insert("inst-b".into(), vec![target("sample-updater")]);
+        s.icache
+            .insert("inst-b\0sample-updater".into(), vec!["arch: aarch64".into()]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![
+            Instance {
+                instance_id: "inst-a".into(),
+                binaries: Vec::new(),
+                started_at: "2026-01-01T00:00:00Z".into(),
+            },
+            Instance {
+                instance_id: "inst-b".into(),
+                binaries: Vec::new(),
+                started_at: "2026-01-01T00:00:00Z".into(),
+            },
+        ])
+        .unwrap();
+        s.fetch = Some(super::Fetch::Sessions(rx));
+        s.poll();
+
+        // cur_instance is inst-a (row 0), which the filter hides.
+        assert_eq!(s.cur_inst_id().as_deref(), Some("inst-b"));
+        assert!(s.visible_insts().contains(&s.inst_sel));
+        // ...and the targets pumped are the visible instance's, not the hidden one's.
+        assert_eq!(s.targets_of, "inst-b");
+    }
+
+    #[test]
+    fn adopting_a_cached_target_list_lands_on_a_visible_row() {
+        // Same hazard one column over: a filter typed while the target column was
+        // empty leaves row 0 hidden, so the cursor must not default to it.
+        let mut s = switcher();
+        s.focus = Focus::Targets;
+        s.filter = "updater".into();
+        s.searching = true;
+        s.targets_of = String::new();
+        s.preview_of = String::new();
+        s.tcache.insert(
+            "inst-a".into(),
+            vec![target("sample-daemon"), target("sample-updater")],
+        );
+        s.icache
+            .insert("inst-a\0sample-updater".into(), vec!["arch: aarch64".into()]);
+
+        s.pump();
+
+        assert_eq!(s.tgt_sel, 1);
+        assert!(s.visible_tgts().contains(&s.tgt_sel));
     }
 
     #[test]
