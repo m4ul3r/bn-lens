@@ -20,6 +20,13 @@ struct TyItem {
     kind: String,
 }
 
+/// The type list read for a pending refresh but not yet installed — see
+/// [`crate::strings::StringsData`] for why the halves are split.
+pub struct TypesData {
+    items: Vec<TyItem>,
+    read_error: Option<String>,
+}
+
 enum Mode {
     Normal,
     Search,
@@ -359,20 +366,22 @@ impl TypeEditor {
 }
 
 impl TypesList {
+    /// Synchronous construction — **tests only**. The app never reads a list on
+    /// the event thread: `App::start_list_load` reads on a worker and builds
+    /// through [`Self::from_data`].
+    #[cfg(test)]
     pub fn new(ctx: &Ctx) -> Self {
-        let (items, read_error) = Self::build(ctx);
-        let error = crate::picker::list_error(items.is_empty(), read_error, ctx.bn.last_error());
-        let kwidth = items
-            .iter()
-            .map(|it| it.kind.chars().count())
-            .max()
-            .unwrap_or(6)
-            .clamp(6, 16);
-        TypesList {
-            items,
-            error,
+        Self::from_data(Self::fetch(ctx), ctx)
+    }
+
+    /// Build the list from an already-read payload: the list-load worker reads,
+    /// the event thread constructs.
+    pub fn from_data(data: TypesData, ctx: &Ctx) -> Self {
+        let mut list = TypesList {
+            items: Vec::new(),
+            error: None,
             status: String::new(),
-            kwidth,
+            kwidth: 6,
             filter: String::new(),
             prev_filter: String::new(),
             mode: Mode::Normal,
@@ -381,11 +390,20 @@ impl TypesList {
             pending_g: false,
             show: None,
             editor: None,
-        }
+        };
+        list.apply(data, ctx);
+        list
     }
 
-    pub fn refresh(&mut self, ctx: &Ctx) {
+    /// The backend half of a refresh. It runs on the ctx-rebuild worker, never
+    /// on the event thread; [`Self::apply`] is the pure half.
+    pub fn fetch(ctx: &Ctx) -> TypesData {
         let (items, read_error) = Self::build(ctx);
+        TypesData { items, read_error }
+    }
+
+    pub fn apply(&mut self, data: TypesData, ctx: &Ctx) {
+        let TypesData { items, read_error } = data;
         self.items = items;
         self.error =
             crate::picker::list_error(self.items.is_empty(), read_error, ctx.bn.last_error());
@@ -903,7 +921,7 @@ mod tests {
             off: 0,
         });
         assert!(list.popup_open());
-        list.refresh(&ctx);
+        list.apply(TypesList::fetch(&ctx), &ctx);
         assert!(
             !list.popup_open(),
             "a refresh moves the list; the peek would describe the old selection"

@@ -49,7 +49,94 @@ enum Rebuild {
 struct Refreshing {
     started: Instant,
     kind: Rebuild,
-    rx: Receiver<Result<Ctx, String>>,
+    rx: Receiver<Result<Rebuilt, String>>,
+}
+
+/// Which lazily-built lists exist right now. The rebuild worker re-reads exactly
+/// these, so a `^R` never pays for a view that was never opened.
+#[derive(Clone, Copy, Default)]
+struct ListsWanted {
+    strings: bool,
+    imports: bool,
+    exports: bool,
+    classes: bool,
+    types: bool,
+    marks: bool,
+}
+
+/// The list contents the worker read alongside the new `Ctx`. Applying these is
+/// pure, so the event thread installs a refresh without issuing a single backend
+/// call — they used to run there, freezing the UI *after* the banner had gone.
+#[derive(Default)]
+struct ListData {
+    strings: Option<crate::strings::StringsData>,
+    imports: Option<crate::imports::ImportsData>,
+    exports: Option<crate::exports::ExportsData>,
+    classes: Option<crate::classes::ClassesData>,
+    types: Option<crate::types::TypesData>,
+    marks: Option<crate::marks::MarksData>,
+}
+
+/// One finished rebuild: the new context plus the re-read lists that belong to it.
+struct Rebuilt {
+    ctx: Ctx,
+    lists: ListData,
+}
+
+/// Which lists the worker should re-read. A re-point lands on a different binary
+/// and `adopt_repointed` drops every cached list, so reading them for the old
+/// target is pure waste — and worse than waste, since each read holds the bridge's
+/// read lock against the paired agent. Pure so the rule is testable.
+fn lists_to_reread(kind: Rebuild, materialized: ListsWanted) -> ListsWanted {
+    match kind {
+        Rebuild::Repoint => ListsWanted::default(),
+        Rebuild::Refresh => materialized,
+    }
+}
+
+/// Re-read the materialized lists against the freshly built `ctx`, on the worker
+/// thread that built it.
+///
+/// The handle `Ctx::build` returns is paced [`Pace::Interactive`](crate::bnsock::Pace)
+/// because every *later* read through it is issued from the event thread. These
+/// reads are not: they are whole-database sweeps still running behind the counting
+/// banner, so they take the analysis budget and the handle is put back afterwards.
+/// The pace swap is on a clone, which shares the failure cell — so a partial read
+/// here still surfaces through `ctx.bn.last_error()` on delivery.
+fn rebuild_lists(mut ctx: Ctx, wanted: ListsWanted) -> Rebuilt {
+    ctx.bn = ctx.bn.clone().with_pace(crate::bnsock::Pace::Analysis);
+    let lists = fetch_lists(&ctx, wanted);
+    ctx.bn = ctx.bn.clone().with_pace(crate::bnsock::Pace::Interactive);
+    Rebuilt { ctx, lists }
+}
+
+/// Read exactly the lists `wanted` asks for. Always called on a worker thread —
+/// every one of these is a whole-database sweep.
+fn fetch_lists(ctx: &Ctx, wanted: ListsWanted) -> ListData {
+    ListData {
+        strings: wanted.strings.then(|| StringsList::fetch(ctx)),
+        imports: wanted.imports.then(|| ImportsList::fetch(ctx)),
+        exports: wanted.exports.then(|| ExportsList::fetch(ctx)),
+        classes: wanted.classes.then(|| ClassesList::fetch(ctx)),
+        types: wanted.types.then(|| TypesList::fetch(ctx)),
+        marks: wanted.marks.then(|| MarksList::fetch(ctx)),
+    }
+}
+
+/// An in-flight *first* build of a list view — the read `set_view` used to do
+/// inline on the keypress, with no banner and a frozen frame (strings 505 ms,
+/// classes 207 ms, marks 129 ms on an 11.5k-function target).
+///
+/// Input is paused while it runs, exactly as it is for a ctx rebuild. The
+/// alternative — keeping keys live and dropping a late result the way a peek
+/// does — was rejected: `v` is a *cycle*, so a held key would spawn one
+/// whole-database read per press and hold the bridge's read lock against the
+/// paired agent for views the user is scrolling straight past.
+struct ListLoad {
+    started: Instant,
+    /// The view this payload is for; installed and switched to on delivery.
+    view: AppView,
+    rx: Receiver<ListData>,
 }
 
 /// An in-flight partner-status poll. Both `herdr` reads it needs are untimed
@@ -125,8 +212,21 @@ struct Peeking {
     rx: Receiver<Vec<String>>,
 }
 
+/// The view's name as the banner and error bar spell it.
+fn view_label(view: AppView) -> &'static str {
+    match view {
+        AppView::Symbols => "symbols",
+        AppView::Strings => "strings",
+        AppView::Imports => "imports",
+        AppView::Exports => "exports",
+        AppView::Classes => "classes",
+        AppView::Types => "types",
+        AppView::Marks => "marks",
+    }
+}
+
 /// Which top-level list the picker pane is showing.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum AppView {
     Symbols,
     Strings,
@@ -138,7 +238,9 @@ enum AppView {
 }
 
 struct App {
-    ctx: Ctx,
+    /// Shared by reference with the list-load worker, so a first build runs off
+    /// the event thread without cloning the maps it reads.
+    ctx: std::sync::Arc<Ctx>,
     view: AppView,
     picker: Picker,
     strings: Option<StringsList>, // built lazily on first switch to Strings
@@ -162,6 +264,7 @@ struct App {
     last_poll: Option<Instant>,
     status_poll: Option<StatusPoll>,
     refreshing: Option<Refreshing>,
+    list_load: Option<ListLoad>,
     peeking: Option<Peeking>,
     /// Context-rebuild failures belong to the old ctx, so retain them here;
     /// cached-list/state failures are shared through `ctx.bn.last_error()`.
@@ -176,7 +279,7 @@ impl App {
         let herdr = ctx.herdr.clone();
         let bn_bin = ctx.bn.bin.clone();
         App {
-            ctx,
+            ctx: std::sync::Arc::new(ctx),
             view: AppView::Symbols,
             picker,
             strings: None,
@@ -198,6 +301,7 @@ impl App {
             last_poll: None,
             status_poll: None,
             refreshing: None,
+            list_load: None,
             peeking: None,
             refresh_error: None,
         }
@@ -252,41 +356,129 @@ impl App {
         }
     }
 
-    /// Switch to a top-level list view, building its (lazy) list on first use.
-    /// Marks rebuild every time — unlike the other lazy inventories,
-    /// annotations change as you add them with `;`/`t`.
+    /// Switch to a top-level list view. A view whose list still has to be read
+    /// switches only once the read lands ([`Self::poll_list_load`]); the read
+    /// itself runs on a worker behind a counting banner, because inline it froze
+    /// the frame for the whole sweep with nothing on screen to say why.
     fn set_view(&mut self, view: AppView) {
+        match self.list_to_read(view) {
+            Some(wanted) => self.start_list_load(view, wanted),
+            None => self.show_view(view),
+        }
+    }
+
+    /// The list a switch to `view` must read first, or `None` when it can switch
+    /// straight away. Marks always reads: unlike the other lazy inventories,
+    /// annotations change as you add them with `;`/`t`.
+    fn list_to_read(&self, view: AppView) -> Option<ListsWanted> {
+        let mut wanted = ListsWanted::default();
+        match view {
+            AppView::Symbols => return None,
+            AppView::Strings if self.strings.is_none() => wanted.strings = true,
+            AppView::Imports if self.imports.is_none() => wanted.imports = true,
+            AppView::Exports if self.exports.is_none() => wanted.exports = true,
+            AppView::Classes if self.classes.is_none() => wanted.classes = true,
+            AppView::Types if self.types.is_none() => wanted.types = true,
+            AppView::Marks => wanted.marks = true,
+            _ => return None, // already built, and not Marks
+        }
+        Some(wanted)
+    }
+
+    /// Show a view whose list is in hand.
+    fn show_view(&mut self, view: AppView) {
+        self.view = view;
+        self.viewer = None;
+    }
+
+    /// Read one list on a worker thread, then switch to its view.
+    ///
+    /// The worker shares the app's `Ctx` through the `Arc` rather than a cloned
+    /// snapshot — `Ctx` carries the name/address maps for the whole binary, and
+    /// copying those per view switch would trade one stall for another.
+    ///
+    /// The shared handle stays [`Pace::Interactive`](crate::bnsock::Pace) here,
+    /// unlike the rebuild worker's (which owns its `Ctx` and can re-pace it). On
+    /// a worker thread that budget is a *cap*, not a freeze: the event loop keeps
+    /// drawing, and 30 s is two orders of magnitude above the worst list read
+    /// measured (strings, 505 ms on an 11.5k-function target).
+    fn start_list_load(&mut self, view: AppView, wanted: ListsWanted) {
+        if self.refreshing.is_some() || self.list_load.is_some() {
+            return;
+        }
+        let ctx = std::sync::Arc::clone(&self.ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(fetch_lists(&ctx, wanted));
+        });
+        self.list_load = Some(ListLoad {
+            started: Instant::now(),
+            view,
+            rx,
+        });
+    }
+
+    /// Install a finished list read and switch to the view that asked for it. A
+    /// dead worker leaves the current view alone and reports through the shared
+    /// error bar rather than switching to a view with nothing in it.
+    fn poll_list_load(&mut self) {
+        let Some(load) = &self.list_load else {
+            return;
+        };
+        let view = load.view;
+        match load.rx.try_recv() {
+            Ok(data) => {
+                self.install_list(view, data);
+                self.list_load = None;
+                self.show_view(view);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.refresh_error = Some(format!("bn {} list worker died", view_label(view)));
+                self.list_load = None;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Construct the list `view` names from its freshly-read payload. A payload
+    /// for a different view than the one requested cannot happen (the worker is
+    /// handed exactly one `ListsWanted`), so a mismatch just leaves the list be —
+    /// `poll_list_load` then switches to a view whose list is `None`, which
+    /// renders as the empty pane it already handles.
+    fn install_list(&mut self, view: AppView, data: ListData) {
         match view {
             AppView::Symbols => {}
             AppView::Strings => {
-                if self.strings.is_none() {
-                    self.strings = Some(StringsList::new(&self.ctx));
+                if let Some(d) = data.strings {
+                    self.strings = Some(StringsList::from_data(d, &self.ctx));
                 }
             }
             AppView::Imports => {
-                if self.imports.is_none() {
-                    self.imports = Some(ImportsList::new(&self.ctx));
+                if let Some(d) = data.imports {
+                    self.imports = Some(ImportsList::from_data(d));
                 }
             }
             AppView::Exports => {
-                if self.exports.is_none() {
-                    self.exports = Some(ExportsList::new(&self.ctx));
+                if let Some(d) = data.exports {
+                    self.exports = Some(ExportsList::from_data(d));
                 }
             }
             AppView::Classes => {
-                if self.classes.is_none() {
-                    self.classes = Some(ClassesList::new(&self.ctx));
+                if let Some(d) = data.classes {
+                    self.classes = Some(ClassesList::from_data(d));
                 }
             }
             AppView::Types => {
-                if self.types.is_none() {
-                    self.types = Some(TypesList::new(&self.ctx));
+                if let Some(d) = data.types {
+                    self.types = Some(TypesList::from_data(d, &self.ctx));
                 }
             }
-            AppView::Marks => self.marks = Some(MarksList::new(&self.ctx)),
+            AppView::Marks => {
+                if let Some(d) = data.marks {
+                    self.marks = Some(MarksList::from_data(d, &self.ctx));
+                }
+            }
         }
-        self.view = view;
-        self.viewer = None;
     }
 
     /// `v` from a list: cycle through the top-level views in order (the keyboard
@@ -369,10 +561,17 @@ impl App {
         self.start_rebuild(instance, target, Rebuild::Refresh);
     }
 
-    /// Build a ctx on a worker thread. Both the `^R` refresh and a switcher /
-    /// `-t` re-point come through here: `Ctx::build` is ~1s of sequential `bn`
-    /// calls, and running the re-point inline froze the TUI on a stale frame with
-    /// no indication it was working (`^R` had already been moved off-thread).
+    /// Build a ctx — and re-read the lists that belong to it — on a worker thread.
+    /// Both the `^R` refresh and a switcher / `-t` re-point come through here:
+    /// `Ctx::build` is ~0.7 s of sequential `bn` calls, and running the re-point
+    /// inline froze the TUI on a stale frame with no indication it was working
+    /// (`^R` had already been moved off-thread).
+    ///
+    /// The list reads are here rather than in [`Self::poll_refresh`] because that
+    /// is where they used to be: ~1 s of backend calls (strings 505 ms, classes
+    /// 207 ms, marks 129 ms, exports 110 ms, imports 46 ms, types 13 ms on an
+    /// 11.5k-function target) issued on the event thread *after* the banner had
+    /// already gone, so the freeze read as a hang rather than as work.
     fn start_rebuild(&mut self, instance: Option<String>, target: Option<String>, kind: Rebuild) {
         if self.refreshing.is_some() {
             return;
@@ -380,18 +579,23 @@ impl App {
         let bn_bin = self.bn_bin.clone();
         let herdr = self.herdr.clone();
         let agent_pane = self.agent_pane.clone();
+        // Input is blocked while a rebuild is in flight, so the materialized set
+        // cannot change under the worker.
+        let wanted = lists_to_reread(kind, self.materialized_lists());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             // Worker thread behind the counting banner: a long analysis read is
             // visible and the event loop keeps running, so it keeps the long budget.
-            let _ = tx.send(Ctx::build(
+            let built = Ctx::build(
                 &bn_bin,
                 &herdr,
                 &agent_pane,
                 instance,
                 target,
                 crate::bnsock::Pace::Analysis,
-            ));
+            )
+            .map(|ctx| rebuild_lists(ctx, wanted));
+            let _ = tx.send(built);
         });
         self.refreshing = Some(Refreshing {
             started: Instant::now(),
@@ -400,11 +604,23 @@ impl App {
         });
     }
 
+    /// The lazily-built lists that currently exist, for the worker to re-read.
+    fn materialized_lists(&self) -> ListsWanted {
+        ListsWanted {
+            strings: self.strings.is_some(),
+            imports: self.imports.is_some(),
+            exports: self.exports.is_some(),
+            classes: self.classes.is_some(),
+            types: self.types.is_some(),
+            marks: self.marks.is_some(),
+        }
+    }
+
     /// Adopt a rebuilt ctx that points somewhere new: every cached list and the
     /// open viewer describe the old target, so they go rather than being
     /// refreshed in place.
     fn adopt_repointed(&mut self, ctx: Ctx) {
-        self.ctx = ctx;
+        self.ctx = std::sync::Arc::new(ctx);
         self.picker = Picker::new(&self.ctx);
         self.strings = None;
         self.imports = None;
@@ -425,31 +641,36 @@ impl App {
         };
         let kind = refreshing.kind;
         match refreshing.rx.try_recv() {
-            Ok(Ok(ctx)) if kind == Rebuild::Repoint => {
-                self.adopt_repointed(ctx);
+            Ok(Ok(rebuilt)) if kind == Rebuild::Repoint => {
+                self.adopt_repointed(rebuilt.ctx);
                 self.refresh_error = None;
                 self.refreshing = None;
             }
-            Ok(Ok(ctx)) => {
-                self.ctx = ctx;
+            Ok(Ok(rebuilt)) => {
+                let Rebuilt { ctx, lists } = rebuilt;
+                self.ctx = std::sync::Arc::new(ctx);
+                // Everything below is pure: the picker projects `Ctx`, and each
+                // list installs the payload the worker already read for it. Only
+                // the viewer still reads here (one function's worth — a few ms
+                // over the socket — and its self-heal needs the new ctx in place).
                 self.picker.refresh(&self.ctx);
-                if let Some(strings) = &mut self.strings {
-                    strings.refresh(&self.ctx);
+                if let (Some(strings), Some(data)) = (&mut self.strings, lists.strings) {
+                    strings.apply(data, &self.ctx);
                 }
-                if let Some(imports) = &mut self.imports {
-                    imports.refresh(&self.ctx);
+                if let (Some(imports), Some(data)) = (&mut self.imports, lists.imports) {
+                    imports.apply(data);
                 }
-                if let Some(exports) = &mut self.exports {
-                    exports.refresh(&self.ctx);
+                if let (Some(exports), Some(data)) = (&mut self.exports, lists.exports) {
+                    exports.apply(data);
                 }
-                if let Some(classes) = &mut self.classes {
-                    classes.refresh(&self.ctx);
+                if let (Some(classes), Some(data)) = (&mut self.classes, lists.classes) {
+                    classes.apply(data);
                 }
-                if let Some(types) = &mut self.types {
-                    types.refresh(&self.ctx);
+                if let (Some(types), Some(data)) = (&mut self.types, lists.types) {
+                    types.apply(data, &self.ctx);
                 }
-                if let Some(marks) = &mut self.marks {
-                    marks.refresh(&self.ctx);
+                if let (Some(marks), Some(data)) = (&mut self.marks, lists.marks) {
+                    marks.apply(data, &self.ctx);
                 }
                 if let Some(viewer) = &mut self.viewer {
                     viewer.reload(&self.ctx);
@@ -540,17 +761,21 @@ impl App {
         }
     }
 
-    /// While a refresh is in flight, a centered bottom banner shows elapsed time
-    /// and that input is paused.
+    /// While a refresh or a first list read is in flight, a centered bottom
+    /// banner shows elapsed time and that input is paused.
     fn draw_refresh(&self, buf: &mut Buffer, area: Rect) {
-        let Some(refreshing) = &self.refreshing else {
+        let (what, started) = if let Some(refreshing) = &self.refreshing {
+            let what = match refreshing.kind {
+                Rebuild::Refresh => "refreshing bn context".to_string(),
+                Rebuild::Repoint => "switching bn target".to_string(),
+            };
+            (what, refreshing.started)
+        } else if let Some(load) = &self.list_load {
+            (format!("reading {}", view_label(load.view)), load.started)
+        } else {
             return;
         };
-        let secs = refreshing.started.elapsed().as_secs_f32();
-        let what = match refreshing.kind {
-            Rebuild::Refresh => "refreshing bn context",
-            Rebuild::Repoint => "switching bn target",
-        };
+        let secs = started.elapsed().as_secs_f32();
         let label = format!("⟳ {what}…  {secs:.1}s   · Esc to cancel");
         let width = area.width as usize;
         let y = area.y + area.height.saturating_sub(1);
@@ -594,7 +819,7 @@ impl App {
         if !poll_due(
             self.last_poll.map(|t| t.elapsed()),
             self.status_poll.is_some(),
-            self.refreshing.is_some(),
+            self.refreshing.is_some() || self.list_load.is_some(),
         ) {
             return;
         }
@@ -744,13 +969,17 @@ impl App {
         let ctrl = k
             .modifiers
             .contains(crossterm::event::KeyModifiers::CONTROL);
-        // A refresh blocks input by design, but keep an escape hatch (Esc /
-        // Ctrl-C) so a hung `bn` can't wedge the TUI unrecoverably.
-        if self.refreshing.is_some() {
+        // A refresh or a first list read blocks input by design, but keep an
+        // escape hatch (Esc / Ctrl-C) so a hung `bn` can't wedge the TUI
+        // unrecoverably. Abandoning a list load leaves the current view up,
+        // which is what the user was looking at anyway.
+        if self.refreshing.is_some() || self.list_load.is_some() {
             if k.code == crossterm::event::KeyCode::Esc
                 || (ctrl && k.code == crossterm::event::KeyCode::Char('c'))
             {
-                self.refreshing = None; // abandon; the worker's result is ignored
+                // Abandon; the worker's result is ignored (its send then fails).
+                self.refreshing = None;
+                self.list_load = None;
             }
             return false;
         }
@@ -880,7 +1109,7 @@ impl App {
 
     /// Returns true to quit (a menu click can pick Quit).
     fn on_mouse(&mut self, m: crossterm::event::MouseEvent) -> bool {
-        if self.refreshing.is_some() {
+        if self.refreshing.is_some() || self.list_load.is_some() {
             return false;
         }
         if self.help.is_open() {
@@ -1047,6 +1276,7 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
     let mut app = App::new(ctx);
     let res = loop {
         app.poll_refresh();
+        app.poll_list_load();
         app.poll_peek();
         app.poll_status();
         app.poll_switcher();
@@ -1107,6 +1337,7 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
         // counters stay smooth and a delivered column appears promptly; otherwise
         // wake ~1/s to refresh the partner status.
         let busy = app.refreshing.is_some()
+            || app.list_load.is_some()
             || app.peeking.is_some()
             || app.switcher.as_ref().is_some_and(Switcher::pending);
         let timeout = if busy {
@@ -1136,9 +1367,113 @@ fn event_loop(ctx: Ctx) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{poll_due, OnDrop, POLL_INTERVAL};
+    use super::{
+        lists_to_reread, poll_due, App, AppView, ListData, ListsWanted, OnDrop, Rebuild,
+        POLL_INTERVAL,
+    };
+    use crate::ctx::Ctx;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn a_refresh_rereads_exactly_the_lists_that_exist() {
+        // The worker re-reads a list only if it is materialized: opening Strings
+        // once must not make every later `^R` pay for Imports/Types/Classes too.
+        let mut app = App::new(Ctx::stub());
+        assert!(
+            !app.materialized_lists().strings,
+            "nothing is built before a view is first opened"
+        );
+
+        app.strings = Some(crate::strings::StringsList::new(&app.ctx));
+        app.marks = Some(crate::marks::MarksList::new(&app.ctx));
+        let wanted = lists_to_reread(Rebuild::Refresh, app.materialized_lists());
+        assert!(wanted.strings && wanted.marks);
+        assert!(!wanted.imports && !wanted.exports && !wanted.classes && !wanted.types);
+    }
+
+    #[test]
+    fn only_an_unread_list_and_marks_need_a_worker() {
+        let mut app = App::new(Ctx::stub());
+        // Symbols is always in hand — it projects the ctx the app already has.
+        assert!(app.list_to_read(AppView::Symbols).is_none());
+        // A view whose list has never been built has to read first.
+        assert!(app.list_to_read(AppView::Strings).is_some_and(|w| w.strings));
+        // Once built, the same view switches with no backend call at all.
+        app.strings = Some(crate::strings::StringsList::new(&app.ctx));
+        assert!(app.list_to_read(AppView::Strings).is_none());
+        // Marks is the exception: annotations change as you add them with `;`/`t`,
+        // so a revisit always re-reads even though the list already exists.
+        app.marks = Some(crate::marks::MarksList::new(&app.ctx));
+        assert!(app.list_to_read(AppView::Marks).is_some_and(|w| w.marks));
+    }
+
+    #[test]
+    fn a_deferred_list_switches_only_once_its_read_lands() {
+        // The whole point of the change: the keypress must not carry the read, so
+        // the view stays put — under a banner — until the worker delivers.
+        let mut app = App::new(Ctx::stub());
+        let payload = ListData {
+            strings: Some(crate::strings::StringsList::fetch(&app.ctx)),
+            ..ListData::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.list_load = Some(super::ListLoad {
+            started: std::time::Instant::now(),
+            view: AppView::Strings,
+            rx,
+        });
+
+        app.poll_list_load();
+        assert_eq!(app.view, AppView::Symbols, "no payload yet, so no switch");
+        assert!(app.strings.is_none());
+
+        tx.send(payload).expect("deliver");
+        app.poll_list_load();
+        assert_eq!(app.view, AppView::Strings, "delivery performs the switch");
+        assert!(app.strings.is_some(), "and installs the list it read");
+        assert!(app.list_load.is_none());
+    }
+
+    #[test]
+    fn esc_abandons_a_list_read_and_leaves_the_view_alone() {
+        // The escape hatch a wedged `bn` needs: the pending read is dropped and
+        // you stay on the view you were already looking at.
+        let mut app = App::new(Ctx::stub());
+        let (_tx, rx) = std::sync::mpsc::channel::<ListData>();
+        app.list_load = Some(super::ListLoad {
+            started: std::time::Instant::now(),
+            view: AppView::Classes,
+            rx,
+        });
+
+        let esc = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Esc);
+        assert!(!app.on_key(esc), "Esc during a read must not quit the app");
+        assert!(app.list_load.is_none(), "the read is abandoned");
+        assert_eq!(app.view, AppView::Symbols);
+        assert!(app.classes.is_none());
+    }
+
+    #[test]
+    fn a_repoint_reads_no_lists_at_all() {
+        // `adopt_repointed` drops every cached list, so reading them for the old
+        // target would burn the bridge's read lock producing rows nobody sees.
+        let materialized = ListsWanted {
+            strings: true,
+            imports: true,
+            exports: true,
+            classes: true,
+            types: true,
+            marks: true,
+        };
+        let wanted = lists_to_reread(Rebuild::Repoint, materialized);
+        assert!(!wanted.strings);
+        assert!(!wanted.imports);
+        assert!(!wanted.exports);
+        assert!(!wanted.classes);
+        assert!(!wanted.types);
+        assert!(!wanted.marks);
+    }
 
     #[test]
     fn the_terminal_guard_runs_on_return_and_while_unwinding() {

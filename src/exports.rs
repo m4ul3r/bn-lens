@@ -21,6 +21,13 @@ struct ExpItem {
     is_data: bool,
 }
 
+/// Exports read for a pending refresh but not yet installed — see
+/// [`crate::strings::StringsData`] for why the halves are split.
+pub struct ExportsData {
+    items: Vec<ExpItem>,
+    error: Option<String>,
+}
+
 /// `bn exports --format json` can repeat the same item verbatim across result
 /// pages (upstream bn bridge issue), which doubled rows, header counts, and
 /// filter hits. Collapse exact full-row duplicates; the first occurrence wins
@@ -74,18 +81,21 @@ fn parse_hex(s: &str) -> Option<u64> {
 }
 
 impl ExportsList {
+    /// Synchronous construction — **tests only**. The app never reads a list on
+    /// the event thread: `App::start_list_load` reads on a worker and builds
+    /// through [`Self::from_data`].
+    #[cfg(test)]
     pub fn new(ctx: &Ctx) -> Self {
-        let (items, error) = Self::build(ctx);
-        let awidth = items
-            .iter()
-            .map(|it| it.addr.len())
-            .max()
-            .unwrap_or(10)
-            .max(10);
-        ExportsList {
-            items,
-            error,
-            awidth,
+        Self::from_data(Self::fetch(ctx))
+    }
+
+    /// Build the list from an already-read payload: the list-load worker reads,
+    /// the event thread constructs.
+    pub fn from_data(data: ExportsData) -> Self {
+        let mut list = ExportsList {
+            items: Vec::new(),
+            error: None,
+            awidth: 10,
             filter: String::new(),
             prev_filter: String::new(),
             mode: Mode::Normal,
@@ -93,11 +103,20 @@ impl ExportsList {
             top: 0,
             pending_g: false,
             usage: None,
-        }
+        };
+        list.apply(data);
+        list
     }
 
-    pub fn refresh(&mut self, ctx: &Ctx) {
+    /// The backend half of a refresh. It runs on the ctx-rebuild worker, never
+    /// on the event thread; [`Self::apply`] is the pure half.
+    pub fn fetch(ctx: &Ctx) -> ExportsData {
         let (items, error) = Self::build(ctx);
+        ExportsData { items, error }
+    }
+
+    pub fn apply(&mut self, data: ExportsData) {
+        let ExportsData { items, error } = data;
         self.items = items;
         self.error = error;
         self.awidth = self
@@ -561,7 +580,7 @@ mod tests {
             off: 0,
         });
         assert!(list.popup_open());
-        list.refresh(&ctx);
+        list.apply(ExportsList::fetch(&ctx));
         assert!(
             !list.popup_open(),
             "a refresh moves the list; the popup would describe the old selection"

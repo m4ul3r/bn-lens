@@ -26,6 +26,13 @@ enum Mode {
     Search,
 }
 
+/// Annotations read for a pending refresh but not yet installed — see
+/// [`crate::strings::StringsData`] for why the halves are split.
+pub struct MarksData {
+    items: Vec<Mark>,
+    read_error: Option<String>,
+}
+
 pub struct MarksList {
     items: Vec<Mark>,
     /// Backend read failure, including a *partial* read (comments decoded, tags
@@ -82,37 +89,47 @@ fn normalize(
 }
 
 impl MarksList {
+    /// Synchronous construction — **tests only**. The app never reads a list on
+    /// the event thread: `App::start_list_load` reads on a worker and builds
+    /// through [`Self::from_data`].
+    #[cfg(test)]
     pub fn new(ctx: &Ctx) -> Self {
-        let (items, read_error) = Self::build(ctx);
-        let error = crate::picker::list_error(items.is_empty(), read_error, ctx.bn.last_error());
-        let awidth = items
-            .iter()
-            .map(|it| it.addr.len())
-            .max()
-            .unwrap_or(10)
-            .max(10);
-        let kwidth = items
-            .iter()
-            .map(|it| it.kind.chars().count())
-            .max()
-            .unwrap_or(7)
-            .clamp(7, 24);
-        MarksList {
-            items,
-            error,
-            awidth,
-            kwidth,
+        Self::from_data(Self::fetch(ctx), ctx)
+    }
+
+    /// Build the list from an already-read payload: the list-load worker reads,
+    /// the event thread constructs.
+    pub fn from_data(data: MarksData, ctx: &Ctx) -> Self {
+        let mut list = MarksList {
+            items: Vec::new(),
+            error: None,
+            awidth: 10,
+            kwidth: 7,
             filter: String::new(),
             prev_filter: String::new(),
             mode: Mode::Normal,
             sel: 0,
             top: 0,
             pending_g: false,
-        }
+        };
+        list.apply(data, ctx);
+        list
     }
 
     pub fn refresh(&mut self, ctx: &Ctx) {
+        let data = Self::fetch(ctx);
+        self.apply(data, ctx);
+    }
+
+    /// The backend half of a refresh, so the rebuild worker can pay for it off
+    /// the event thread.
+    pub fn fetch(ctx: &Ctx) -> MarksData {
         let (items, read_error) = Self::build(ctx);
+        MarksData { items, read_error }
+    }
+
+    pub fn apply(&mut self, data: MarksData, ctx: &Ctx) {
+        let MarksData { items, read_error } = data;
         self.items = items;
         self.error =
             crate::picker::list_error(self.items.is_empty(), read_error, ctx.bn.last_error());

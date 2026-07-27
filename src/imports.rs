@@ -17,6 +17,13 @@ struct ImpItem {
     raw_name: String,
 }
 
+/// Imports read for a pending refresh but not yet installed — see
+/// [`crate::strings::StringsData`] for why the halves are split.
+pub struct ImportsData {
+    items: Vec<ImpItem>,
+    error: Option<String>,
+}
+
 enum Mode {
     Normal,
     Search,
@@ -50,18 +57,21 @@ fn parse_hex(s: &str) -> Option<u64> {
 }
 
 impl ImportsList {
+    /// Synchronous construction — **tests only**. The app never reads a list on
+    /// the event thread: `App::start_list_load` reads on a worker and builds
+    /// through [`Self::from_data`].
+    #[cfg(test)]
     pub fn new(ctx: &Ctx) -> Self {
-        let (items, error) = Self::build(ctx);
-        let awidth = items
-            .iter()
-            .map(|it| it.addr.len())
-            .max()
-            .unwrap_or(10)
-            .max(10);
-        ImportsList {
-            items,
-            error,
-            awidth,
+        Self::from_data(Self::fetch(ctx))
+    }
+
+    /// Build the list from an already-read payload: the list-load worker reads,
+    /// the event thread constructs.
+    pub fn from_data(data: ImportsData) -> Self {
+        let mut list = ImportsList {
+            items: Vec::new(),
+            error: None,
+            awidth: 10,
             filter: String::new(),
             prev_filter: String::new(),
             mode: Mode::Normal,
@@ -69,11 +79,20 @@ impl ImportsList {
             top: 0,
             pending_g: false,
             usage: None,
-        }
+        };
+        list.apply(data);
+        list
     }
 
-    pub fn refresh(&mut self, ctx: &Ctx) {
+    /// The backend half of a refresh. It runs on the ctx-rebuild worker, never
+    /// on the event thread; [`Self::apply`] is the pure half.
+    pub fn fetch(ctx: &Ctx) -> ImportsData {
         let (items, error) = Self::build(ctx);
+        ImportsData { items, error }
+    }
+
+    pub fn apply(&mut self, data: ImportsData) {
+        let ImportsData { items, error } = data;
         self.items = items;
         self.error = error;
         self.awidth = self
@@ -515,7 +534,7 @@ mod tests {
             off: 0,
         });
         assert!(list.popup_open());
-        list.refresh(&ctx);
+        list.apply(ImportsList::fetch(&ctx));
         assert!(
             !list.popup_open(),
             "a refresh moves the list; the popup would describe the old selection"

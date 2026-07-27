@@ -222,7 +222,35 @@ Enter raw mode + alt screen first, paint `bn lens · resolving instance…`, thr
 *Note:* price this standalone — it is **not** free-if-bundled with a parallel `Ctx::build`, because that
 is refuted (§5.1).
 
-**X2. Dirty-flag lists instead of refetching on refresh.** — *half a day*
+**X2. Dirty-flag lists instead of refetching on refresh.** — *half a day* — **the post-refresh freeze
+half is DONE (2026-07-26); the `set_view`/`ReloadView` half is not.**
+What landed: the six list reads moved **into the rebuild worker**. `start_rebuild` records which lists
+are materialized (`lists_to_reread` — a re-point reads none, since `adopt_repointed` drops them all),
+the worker calls each list's new `fetch(&ctx)` after `Ctx::build` and re-paces the handle to
+`Pace::Analysis` for exactly that stretch, and `poll_refresh` installs the payloads through
+`apply(...)`, which issues no backend call. Only `viewer.reload()` still reads on the event thread —
+deliberately, per the scope-down note below, and it is now ~4 ms over the socket.
+**Win (measured 2026-07-26, socket transport, 11,524-function ELF):** the reads that used to run on the
+event thread *after* the banner had gone total **~1.01 s** with all six lists open — strings 505 ms,
+classes 207 ms, marks 129 ms, exports 110 ms, imports 46 ms, types 13 ms. That second is now behind the
+counting banner instead of frozen on a stale frame.
+**Second half landed 2026-07-27 — the *first open* of a list no longer blocks either.** `set_view` used
+to run the whole sweep inline on the keypress, with no banner and a frozen frame: that was the largest
+remaining freeze in the app once the post-refresh one was gone (strings 505 ms, classes 207 ms, marks
+129 ms). It now goes through `start_list_load` → worker → `poll_list_load`, reusing the same
+`fetch`/`from_data` split, under the same counting banner (`reading strings… 0.4s · Esc to cancel`)
+and the same input pause as a `^R`. `App::ctx` became an `Arc<Ctx>` so the worker can share it without
+copying the whole binary's name/address maps (`Ctx`'s lazy strings map moved `OnceCell` → `OnceLock`
+to make `Ctx` `Sync`).
+Keys stay paused rather than live-with-late-delivery on purpose: `v` is a *cycle*, so a held key under
+the peek's model would fire one whole-database read per press and hold the bridge's read lock against
+the paired agent for views being scrolled straight past.
+
+**Still open:** `set_view` still *re-reads* `MarksList` on every visit (it just does it off-thread now),
+and the `Exit::ReloadView` arm eagerly calls `marks.refresh(&self.ctx)` on every comment/tag commit —
+129 ms on the event thread, the last inline list read in the app. That is what the dirty-flag half is
+for — and note that deleting the eager call without the flag just moves the cost to the next visit.
+*Original item, for the record:*
 `poll_refresh` (`app.rs:285-328`) installs the new `Ctx` then, still on the UI thread with
 `self.refreshing` still `Some` (so the banner cannot tick), synchronously calls `refresh()` on six lists
 plus `viewer.reload()`. Measured: strings 295 + imports 302 + exports 129 + classes 167 + types 136 +
@@ -428,6 +456,14 @@ client-side CPython startup parallelizes; the bridge serializes on the GIL / BN 
 **Actively harmful for pairing:** a writer must wait for all in-flight readers to drain, so 6-way
 inflates the read-lock hold to ~1.6 s and delays the agent's rename/comment **longer** than the serial
 build it replaces.
+
+**Re-measured on the socket transport (2026-07-26) — worse than refuted, and the standing 4-way
+fan-out in `ctx.rs` was removed as a result.** 11,524-function ELF, medians of 5 alternating runs:
+3 read-locked reads went **164 ms serial → 227 ms 3-way (0.72×)**; the same four reads the lens
+actually issues (data-symbols still on write-locked `py_exec`) 171 → 172 ms (0.99×). Per-op under
+contention: `sections` 1.1 → 3.6 ms, `imports` 53 → 200 ms, `exports` 110 → 227 ms. The 1.14× the
+original measurement did show was the four CPython startups overlapping — and L1 deleted those, so
+there is no longer any client-side work to hide. See TODO.md → "the `Ctx::build` fan-out".
 
 ### 5.2 Fanning out `usage::report`'s decompiles — REFUTED
 Serial **1.325 s** vs 6-way **1.941 s**. Individual calls inflate 0.21 → 1.90 s. Same root cause as 5.1.
