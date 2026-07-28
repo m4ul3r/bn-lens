@@ -939,7 +939,12 @@ impl Viewer {
                 .filter(|&index| self.spans[index].line == self.cline)
                 .collect();
         let Some(last) = stops.len().checked_sub(1) else {
-            return; // no hotspots on this line: nothing to step onto
+            // No hotspots on this line: nothing to step onto, and silently so.
+            // Unlike `W`/`B` — which report an empty ring because a *view* with
+            // no calls is worth saying out loud — a line with no hotspots is the
+            // common case (braces, blank separators, plain returns), so a status
+            // line here would fire constantly while reading.
+            return;
         };
         // `spans` is built line-by-line, left to right, so `stops` is already in
         // column order and stepping its positions steps across the line.
