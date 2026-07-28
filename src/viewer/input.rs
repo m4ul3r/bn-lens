@@ -1295,6 +1295,76 @@ mod tests {
             .collect()
     }
 
+    /// A viewer over mock pseudo-C carrying a `goto`/label pair, the shape BN
+    /// emits for irreducible control flow. Line 3 gotos, line 5 defines.
+    fn viewer_with_labels(ctx: &Ctx) -> Viewer {
+        let mut v = Viewer::test_blank("parse_frame".into(), super::super::View::Decomp);
+        v.lines = crate::syntax::tokenize_c(
+            "int32_t parse_frame(void* buf)\n\
+             {\n\
+             \x20   if (!buf)\n\
+             \x20       goto label_401230;\n\
+             \x20   return 0;\n\
+             label_401230:\n\
+             \x20   return -1;\n\
+             }",
+        );
+        v.spans = super::super::hotspots::build_spans(&v.lines, ctx, &v.locals);
+        v
+    }
+
+    #[test]
+    fn enter_on_a_goto_jumps_to_its_label_and_from_the_label_back_to_the_goto() {
+        let ctx = Ctx::stub();
+        let mut v = viewer_with_labels(&ctx);
+        let enter = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter);
+
+        // The `goto label_401230;` line. Selecting it with `l` proves the label
+        // is a stop as well as a target.
+        v.cline = 3;
+        v.on_key(plain('l'), &ctx);
+        assert_eq!(
+            v.spans[v.active.expect("the label is a stop")].target,
+            "label_401230"
+        );
+
+        v.on_key(enter, &ctx);
+        assert_eq!(v.cline, 5, "Enter lands on the `label_401230:` row");
+        assert_eq!(
+            v.stack.len(),
+            1,
+            "and pushes history, so ^O returns to the goto"
+        );
+
+        // From the definition, the useful jump is back to the use.
+        v.on_key(plain('l'), &ctx);
+        v.on_key(enter, &ctx);
+        assert_eq!(v.cline, 3, "Enter on the definition returns to the goto");
+    }
+
+    #[test]
+    fn a_label_with_no_second_site_reports_instead_of_moving() {
+        let ctx = Ctx::stub();
+        let mut v = Viewer::test_blank("parse_frame".into(), super::super::View::Decomp);
+        // A goto whose landing row this rendering doesn't carry.
+        v.lines = crate::syntax::tokenize_c("    goto label_401230;");
+        v.spans = super::super::hotspots::build_spans(&v.lines, &ctx, &v.locals);
+        v.cline = 0;
+
+        v.on_key(plain('l'), &ctx);
+        v.on_key(
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter),
+            &ctx,
+        );
+        assert_eq!(v.cline, 0, "nowhere to go, so the cursor stays put");
+        assert!(v.stack.is_empty(), "and no history entry is burned");
+        assert!(
+            v.status.contains("label_401230"),
+            "the status names what it couldn't reach: {:?}",
+            v.status
+        );
+    }
+
     #[test]
     fn l_and_h_walk_the_hotspots_on_the_cursor_line_and_stop_at_its_ends() {
         let ctx = Ctx::stub();

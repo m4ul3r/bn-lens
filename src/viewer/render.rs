@@ -1297,7 +1297,8 @@ fn render_cfg_expand(
 }
 
 /// The colour a hotspot token renders in — a call blue, a data ref cyan, an
-/// address yellow, a string magenta, a local grey (all but locals underlined).
+/// address yellow, a branch label yellow but un-bold (it moves the cursor rather
+/// than navigating), a string magenta, a local grey (all but locals underlined).
 /// Shared by the linear renderer and the CFG block inspector so the two can't
 /// drift apart. Callers add a background if they draw on a filled panel.
 fn hotspot_style(kind: HotKind) -> Style {
@@ -1313,6 +1314,9 @@ fn hotspot_style(kind: HotKind) -> Style {
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         HotKind::Str => Style::default()
             .fg(Color::Magenta)
+            .add_modifier(Modifier::UNDERLINED),
+        HotKind::Label => Style::default()
+            .fg(Color::Yellow)
             .add_modifier(Modifier::UNDERLINED),
         HotKind::Local => Style::default().fg(Color::Gray),
     }
