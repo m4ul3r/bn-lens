@@ -15,6 +15,14 @@ struct StrItem {
     content: String,
 }
 
+/// Strings read for a pending refresh but not yet installed. The read is the
+/// expensive half and happens on the ctx-rebuild worker; the list applies it on
+/// the event thread with no backend call of its own.
+pub struct StringsData {
+    items: Vec<StrItem>,
+    read_error: Option<String>,
+}
+
 enum Mode {
     Normal,
     Search,
@@ -58,19 +66,22 @@ fn parse_hex(s: &str) -> Option<u64> {
 }
 
 impl StringsList {
+    /// Synchronous construction — **tests only**. The app never reads a list on
+    /// the event thread: `App::start_list_load` reads on a worker and builds
+    /// through [`Self::from_data`].
+    #[cfg(test)]
     pub fn new(ctx: &Ctx) -> Self {
-        let (items, read_error) = Self::build(ctx);
-        let error = crate::picker::list_error(items.is_empty(), read_error, ctx.bn.last_error());
-        let awidth = items
-            .iter()
-            .map(|it| it.addr.len())
-            .max()
-            .unwrap_or(10)
-            .max(10);
-        StringsList {
-            items,
-            error,
-            awidth,
+        Self::from_data(Self::fetch(ctx), ctx)
+    }
+
+    /// Build the list from an already-read payload: the list-load worker reads,
+    /// the event thread constructs. The empty shell it starts from is never
+    /// rendered — [`Self::apply`] fills it before this returns.
+    pub fn from_data(data: StringsData, ctx: &Ctx) -> Self {
+        let mut list = StringsList {
+            items: Vec::new(),
+            error: None,
+            awidth: 10,
             filter: String::new(),
             prev_filter: String::new(),
             mode: Mode::Normal,
@@ -78,12 +89,21 @@ impl StringsList {
             top: 0,
             pending_g: false,
             usage: None,
-        }
+        };
+        list.apply(data, ctx);
+        list
     }
 
-    /// Re-pull strings from a rebuilt ctx (keeps the filter, snaps the cursor).
-    pub fn refresh(&mut self, ctx: &Ctx) {
+    /// The backend half of a refresh. It runs on the ctx-rebuild worker, never
+    /// on the event thread; [`Self::apply`] is the pure half.
+    pub fn fetch(ctx: &Ctx) -> StringsData {
         let (items, read_error) = Self::build(ctx);
+        StringsData { items, read_error }
+    }
+
+    /// Install fetched strings, keeping the filter and snapping the cursor.
+    pub fn apply(&mut self, data: StringsData, ctx: &Ctx) {
+        let StringsData { items, read_error } = data;
         self.items = items;
         self.error =
             crate::picker::list_error(self.items.is_empty(), read_error, ctx.bn.last_error());
@@ -504,7 +524,7 @@ mod tests {
             off: 0,
         });
         assert!(list.popup_open());
-        list.refresh(&ctx);
+        list.apply(StringsList::fetch(&ctx), &ctx);
         assert!(
             !list.popup_open(),
             "a refresh moves the list; the popup would describe the old selection"

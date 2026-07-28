@@ -24,22 +24,58 @@ cache, e.g. `~/.cache/bn/bndb/<name>.bndb`. A `bn save <path>` can redirect.
 and leave `bn save` to the launching agent? (Revisit — tied to the "bn-as-CLI vs. persistent-bridge"
 transport discussion.)
 
-## Startup latency on large binaries (done)
+## Startup latency on large binaries — the `Ctx::build` fan-out, and why it was removed (2026-07-26)
 
-**Status:** implemented. `Ctx::build` keeps the two prerequisite reads sequential — `target_info` (the
-session-liveness gate) then `functions` (must be non-empty) — and fans out the remaining four
-independent reads (symbols, data-symbols, imports, sections) concurrently via `std::thread::scope`.
-Measured on a 2906-function target: serial sum ≈ 0.9 s → ≈ 0.6 s. `Bn` is `Sync` (its shared failure
-state is an `Arc<Mutex>`), so scoped threads share `&bn`; the four `Result`s apply via `?` in order.
+**Status:** `Ctx::build` is sequential again. The `std::thread::scope` fan-out of its four bulk reads
+(symbols, data-symbols, imports, sections) landed 2026-07-18 and was **removed 2026-07-26**. Do not
+put it back without new measurements.
 
-Keeping the prerequisites ahead of the fan-out (per an adversarial review) preserves the sequential
-**fail-fast**: a dead/dying session errors at `target_info` immediately rather than blocking on a
-concurrently-hung bulk read (`Command::output()` has no timeout). The four fanned-out reads are only
-reached once the session is known live — the sequential path would have called all four there anyway,
-so concurrency changes their latency, not liveness.
+It was never really parallelizing bn — it was parallelizing four ~127 ms **CPython startups**, which
+the socket transport (2026-07-23) deleted outright. The bridge itself serializes on the GIL / BN core,
+so once the client-side startup was gone there was nothing left to overlap.
 
-**Possible follow-ups:** subprocess-level timeouts on `bn` calls would harden the remaining edge (a bulk
-read hanging after another errored); lazy-load exports/imports on first view use to trim further.
+**Measured 2026-07-26** — 11,524-function ELF, raw-socket probe, medians of 5 alternating runs:
+
+| arm | serial | concurrent | speedup |
+|---|---|---|---|
+| 3 read-locked reads (sections/imports/exports) | 164 ms | 227 ms | **0.72×** |
+| 4 reads as the lens issues them today (data-symbols still via write-locked `py_exec`) | 171 ms | 172 ms | 0.99× |
+
+Per-op inflation under contention is the tell: `sections` 1.1 → 3.6 ms, `imports` 53 → 200 ms,
+`exports` 110 → 227 ms. This reproduces DESIGN_BN_INTERFACE.md §5.1 on the post-socket transport.
+
+**The pairing cost is the real argument.** N concurrent reads hold the bridge's read lock N-wide and
+`_ReadWriteLock` is writer-preferring, so a fan-out here delays the paired agent's rename/comment
+*longer* than the serial build it replaces — for a measured negative speedup.
+
+**Still true and still worth keeping:** the prerequisites (`target_info`, then `functions`) lead, so a
+dead/dying session errors immediately rather than after a bulk read.
+
+## List views build off-thread (done 2026-07-26/27)
+
+**Status:** implemented, both halves. No list read runs on the event thread any more, except the one
+noted below.
+
+- **After a `^R`** (2026-07-26): `poll_refresh` used to call `refresh()` on six lists *after* the
+  counting banner had gone — ~1.01 s of frozen UI on an 11.5k-function target (strings 505 ms,
+  classes 207, marks 129, exports 110, imports 46, types 13). Each list gained a `fetch(&ctx)` /
+  `apply(...)` split; the rebuild worker does the reading, the event thread only installs. A re-point
+  reads nothing (`lists_to_reread`), since `adopt_repointed` drops every list anyway.
+- **On first open** (2026-07-27): `set_view` did the same sweep inline on the keypress with no banner —
+  the largest remaining freeze once the above was fixed. Now `start_list_load` spawns a worker,
+  `poll_list_load` installs the payload and *then* switches view, and the existing banner shows
+  `⟳ reading strings…  0.4s   · Esc to cancel`. `App::ctx` is an `Arc<Ctx>` so the worker shares it
+  instead of copying the binary's name/address maps; `Ctx`'s lazy strings map is a `OnceLock` (not a
+  `OnceCell`) so `Ctx` is `Sync`.
+
+**Deliberate:** input stays paused during the read, as it is for `^R`, rather than live with
+late-delivery like the `p` peek. `v` cycles views, so a held key under the peek model would fire one
+whole-database read per press and hold the bridge's read lock against the paired agent for views the
+user is scrolling straight past. `Esc`/`^C` abandons.
+
+**Not done — the last inline list read:** `Exit::ReloadView` still calls `marks.refresh(&self.ctx)` on
+every comment/tag commit (129 ms, event thread), and Marks still re-reads on every visit (off-thread,
+but a read all the same). Both want the dirty-flag treatment — see DESIGN_BN_INTERFACE.md → X2.
 
 ## Navigation / session persistence (side-parked)
 

@@ -23,6 +23,12 @@ struct Evidence {
     hoff: usize,
 }
 
+/// The class list read for a pending refresh but not yet installed — see
+/// [`crate::strings::StringsData`] for why the halves are split.
+pub struct ClassesData {
+    result: Result<Vec<ClassItem>, String>,
+}
+
 pub struct ClassesList {
     items: Vec<ClassItem>,
     error: Option<String>,
@@ -36,14 +42,20 @@ pub struct ClassesList {
 }
 
 impl ClassesList {
+    /// Synchronous construction — **tests only**. The app never reads a list on
+    /// the event thread: `App::start_list_load` reads on a worker and builds
+    /// through [`Self::from_data`].
+    #[cfg(test)]
     pub fn new(ctx: &Ctx) -> Self {
-        let (items, error) = match ctx.bn.classes_list() {
-            Ok(items) => (items, None),
-            Err(error) => (Vec::new(), Some(error)),
-        };
-        Self {
-            items,
-            error,
+        Self::from_data(Self::fetch(ctx))
+    }
+
+    /// Build the list from an already-read payload: the list-load worker reads,
+    /// the event thread constructs.
+    pub fn from_data(data: ClassesData) -> Self {
+        let mut list = Self {
+            items: Vec::new(),
+            error: None,
             filter: String::new(),
             prev_filter: String::new(),
             mode: Mode::Normal,
@@ -51,11 +63,24 @@ impl ClassesList {
             top: 0,
             pending_g: false,
             evidence: None,
+        };
+        list.apply(data);
+        list
+    }
+
+    /// The backend half of a refresh. It runs on the ctx-rebuild worker, never
+    /// on the event thread; [`Self::apply`] is the pure half.
+    pub fn fetch(ctx: &Ctx) -> ClassesData {
+        ClassesData {
+            result: ctx.bn.classes_list(),
         }
     }
 
-    pub fn refresh(&mut self, ctx: &Ctx) {
-        match ctx.bn.classes_list() {
+    /// A failed read keeps the rows it already had — unlike the other lists,
+    /// whose emptiness is a security claim, a stale class list is better than
+    /// none and the error still renders.
+    pub fn apply(&mut self, data: ClassesData) {
+        match data.result {
             Ok(items) => {
                 self.items = items;
                 self.error = None;

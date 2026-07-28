@@ -40,7 +40,20 @@ pub struct Ctx {
     pub section_ranges: Vec<(u64, u64, String, bool)>,
     /// Lazily-built string-literal map: content -> address (preferring the real
     /// `.rodata` copy over `.dynstr`/`.symtab` duplicates).
-    strings_map: std::cell::OnceCell<HashMap<String, String>>,
+    ///
+    /// A `OnceLock` rather than a `OnceCell` so that `Ctx` is `Sync`: the app
+    /// holds it in an `Arc` and hands clones to worker threads, which is what
+    /// lets a list build off the event thread (`App::start_list_load`).
+    ///
+    /// `get_or_init` *blocks* a second caller while the first initializes, and
+    /// initializing means a `bn strings` read (505 ms on an 11.5k-function
+    /// target). That is not a freeze today because no worker path touches it —
+    /// the list builds read `bn.strings()` and the ctx maps directly, never
+    /// `Ctx::strings`, whose only callers are the viewer's string peek and xref
+    /// (`viewer/actions.rs`), both on the event thread. A worker that started
+    /// calling it would put the event thread behind that read, silently, so
+    /// check this before adding one.
+    strings_map: std::sync::OnceLock<HashMap<String, String>>,
 }
 
 /// Rank a section for string resolution: real read-only data beats other data
@@ -268,39 +281,39 @@ impl Ctx {
             }
         };
 
-        // Prerequisites run first and sequentially. `target_info` is the session
-        // -liveness gate and `functions` must be non-empty; checking them before
-        // the fan-out preserves the sequential *fail-fast* — a dead/dying session
-        // errors here immediately instead of blocking on a concurrently-hung read
-        // (`Command::output()` has no timeout). This is the realistic failure
-        // mode; guarding it is worth a little latency.
+        // `target_info` is the session-liveness gate and `functions` must be
+        // non-empty, so they lead: a dead/dying session errors here immediately
+        // rather than after a bulk read (`Command::output()` has no timeout).
         let target_info = bn.target_info()?;
         let funcs = bn.functions_checked()?;
         if funcs.is_empty() {
             return Err(format!("{instance:?} / {target_sel} has no functions"));
         }
 
-        // The remaining four reads are independent and only reached once the
-        // session is known live (the sequential path would call all four here
-        // too), so run them concurrently to shed the serial ~130 ms/call CLI
-        // startup — the bulk of `Ctx::build` latency on large binaries. `Bn` is
-        // `Sync` (its shared failure state is an `Arc<Mutex>`), so scoped threads
-        // share `&bn`; `?` below applies their `Result`s in the original order.
-        // `data_symbols` is best-effort and cannot error.
-        let (symbols, data_syms, import_names, sections_text) = std::thread::scope(|s| {
-            let sy = s.spawn(|| bn.symbols_checked());
-            let ds = s.spawn(|| bn.data_symbols());
-            let im = s.spawn(|| bn.imports_checked());
-            let se = s.spawn(|| bn.sections_checked());
-            (
-                sy.join().unwrap(),
-                ds.join().unwrap(),
-                im.join().unwrap(),
-                se.join().unwrap(),
-            )
-        });
-
-        let (mut addr_by_name, mut data_names) = symbols?;
+        // The remaining reads are independent, and until 2026-07-26 they ran
+        // concurrently under `std::thread::scope`. **Do not put that back.** The
+        // fan-out predated the socket transport, and what it actually
+        // parallelized was four ~127 ms CPython startups — client-side work that
+        // no longer exists. The bridge itself serializes on the GIL / BN core, so
+        // over the socket the concurrency is pure loss.
+        //
+        // Measured 2026-07-26, 11,524-function ELF, medians of 5 alternating runs
+        // (`sections`/`imports`/`exports` over the raw socket):
+        //   serial 164 ms · 3-way concurrent 227 ms — **0.72×**
+        //   per-op under contention: sections 1.1 → 3.6 ms, imports 53 → 200 ms,
+        //   exports 110 → 227 ms.
+        // With today's write-locked `py_exec` data-symbols read in the mix it is
+        // 0.99× — no win either. This reproduces DESIGN_BN_INTERFACE.md §5.1 on
+        // the post-socket transport.
+        //
+        // The second reason is the pairing invariant: N concurrent reads hold the
+        // bridge's read lock N-wide, and `_ReadWriteLock` is writer-preferring, so
+        // a fan-out here delays the agent's rename/comment longer than the serial
+        // build it would replace.
+        let (mut addr_by_name, mut data_names) = bn.symbols_checked()?;
+        let data_syms = bn.data_symbols(); // best-effort; cannot error
+        let import_names = bn.imports_checked()?;
+        let sections_text = bn.sections_checked()?;
         let mut func_names = HashSet::new();
         let mut name_by_addr = HashMap::new();
         let mut display_by_name = HashMap::new();
@@ -335,8 +348,6 @@ impl Ctx {
                 .entry(addr.clone())
                 .or_insert_with(|| name.clone());
         }
-        let import_names = import_names?;
-        let sections_text = sections_text?;
         let section_ranges = parse_section_ranges(&sections_text);
 
         Ok(Ctx {
@@ -359,7 +370,7 @@ impl Ctx {
             display_by_name,
             sections_text,
             section_ranges,
-            strings_map: std::cell::OnceCell::new(),
+            strings_map: std::sync::OnceLock::new(),
         })
     }
 }
@@ -524,7 +535,7 @@ impl Ctx {
             display_by_name: HashMap::new(),
             sections_text: Vec::new(),
             section_ranges: Vec::new(),
-            strings_map: std::cell::OnceCell::new(),
+            strings_map: std::sync::OnceLock::new(),
         }
     }
 }
