@@ -549,6 +549,9 @@ impl Viewer {
             // and every local (including v0_2-style temps — those get renamed).
             KeyCode::Char('w') | KeyCode::Tab => self.next_symbol(ctx, 1),
             KeyCode::Char('b') | KeyCode::BackTab => self.next_symbol(ctx, -1),
+            // `h`/`l`: the same hotspots, but along the cursor line only.
+            KeyCode::Char('l') | KeyCode::Right => self.step_line_hotspot(ctx, 1),
+            KeyCode::Char('h') | KeyCode::Left => self.step_line_hotspot(ctx, -1),
             // `W`/`B`: step only call/jump targets, skipping locals and data —
             // for following control flow without stopping on every temp.
             KeyCode::Char('W') => self.next_call(ctx, 1),
@@ -917,6 +920,45 @@ impl Viewer {
         self.step_stops(stops, direction);
     }
 
+    /// `h`/`l`: step to the previous/next hotspot **on the cursor line**, and
+    /// stop at the ends rather than wrapping.
+    ///
+    /// Deliberately horizontal-only: `w`/`b` are the keys that cross lines, so
+    /// with `j`/`k` for lines, `hjkl` reads as a 2D cursor over the hotspot grid
+    /// and which key can move you off the line you are reading is never in doubt.
+    ///
+    /// Stops are [`tab_stops`](super::hotspots::tab_stops) — the same set `w`/`b`
+    /// walk, so the two motions never disagree about what counts as a token.
+    /// Arriving with no selection on this line (after `j`/`k`, a search, or a
+    /// click elsewhere) lands on the end the key points away from, so the first
+    /// press moves *into* the line rather than being swallowed.
+    fn step_line_hotspot(&mut self, ctx: &Ctx, direction: i32) {
+        let stops: Vec<usize> =
+            super::hotspots::tab_stops(&self.spans, ctx.display_name(&self.name))
+                .into_iter()
+                .filter(|&index| self.spans[index].line == self.cline)
+                .collect();
+        let Some(last) = stops.len().checked_sub(1) else {
+            // No hotspots on this line: nothing to step onto, and silently so.
+            // Unlike `W`/`B` — which report an empty ring because a *view* with
+            // no calls is worth saying out loud — a line with no hotspots is the
+            // common case (braces, blank separators, plain returns), so a status
+            // line here would fire constantly while reading.
+            return;
+        };
+        // `spans` is built line-by-line, left to right, so `stops` is already in
+        // column order and stepping its positions steps across the line.
+        let position = match self
+            .active
+            .and_then(|active| stops.iter().position(|&stop| stop == active))
+        {
+            Some(current) => (current as i32 + direction).clamp(0, last as i32) as usize,
+            None if direction > 0 => 0,
+            None => last,
+        };
+        self.active = Some(stops[position]);
+    }
+
     /// Shared stepping for `next_symbol`/`next_call`: ring-step from a
     /// *deliberate* selection (Tab/click, or a `/find` that selected a token) on
     /// the cursor line, else land on the nearest stop — preferring one on the
@@ -1228,6 +1270,123 @@ mod tests {
             v.on_key(ctrl(ch), ctx);
         }
         v
+    }
+
+    /// A viewer over two mock decompile lines whose locals are hotspots: line 0
+    /// carries three, line 1 none. Enough to pin every edge of `h`/`l`.
+    fn viewer_with_hotspots(ctx: &Ctx) -> Viewer {
+        let mut locals = std::collections::HashMap::new();
+        for (name, ty) in [("buf", "void*"), ("len", "size_t"), ("hdr", "frame_hdr")] {
+            locals.insert(name.to_string(), ty.to_string());
+        }
+        let mut v = Viewer::test_blank("parse_frame".into(), super::super::View::Decomp);
+        v.lines = crate::syntax::tokenize_c("    memcpy(hdr, buf, len);\n    return 0;");
+        v.locals = locals;
+        v.spans = super::super::hotspots::build_spans(&v.lines, ctx, &v.locals);
+        v
+    }
+
+    /// The hotspot targets `h`/`l` land on, in order, for the cursor line.
+    fn targets_on_line(v: &Viewer) -> Vec<String> {
+        v.spans
+            .iter()
+            .filter(|s| s.line == v.cline)
+            .map(|s| s.target.clone())
+            .collect()
+    }
+
+    #[test]
+    fn l_and_h_walk_the_hotspots_on_the_cursor_line_and_stop_at_its_ends() {
+        let ctx = Ctx::stub();
+        let mut v = viewer_with_hotspots(&ctx);
+        assert_eq!(
+            targets_on_line(&v),
+            vec!["hdr", "buf", "len"],
+            "fixture: three hotspots, left to right, on line 0"
+        );
+
+        // Arriving with nothing selected, `l` moves *into* the line rather than
+        // being swallowed — it lands on the first hotspot.
+        v.on_key(plain('l'), &ctx);
+        assert_eq!(v.spans[v.active.expect("l selects")].target, "hdr");
+
+        v.on_key(plain('l'), &ctx);
+        assert_eq!(v.spans[v.active.unwrap()].target, "buf");
+        v.on_key(plain('l'), &ctx);
+        assert_eq!(v.spans[v.active.unwrap()].target, "len");
+
+        // At the last hotspot `l` stops rather than wrapping or falling through
+        // to the next line — crossing lines is `w`/`b`'s job.
+        v.on_key(plain('l'), &ctx);
+        assert_eq!(v.spans[v.active.unwrap()].target, "len");
+        assert_eq!(v.cline, 0, "h/l must never move the line cursor");
+
+        // And back, stopping at the first.
+        v.on_key(plain('h'), &ctx);
+        assert_eq!(v.spans[v.active.unwrap()].target, "buf");
+        v.on_key(plain('h'), &ctx);
+        assert_eq!(v.spans[v.active.unwrap()].target, "hdr");
+        v.on_key(plain('h'), &ctx);
+        assert_eq!(v.spans[v.active.unwrap()].target, "hdr");
+        assert_eq!(v.cline, 0);
+    }
+
+    #[test]
+    fn h_enters_the_line_from_its_right_end() {
+        // The mirror of `l`'s entry rule: with no selection, `h` points left, so
+        // it lands on the rightmost hotspot and walks back from there.
+        let ctx = Ctx::stub();
+        let mut v = viewer_with_hotspots(&ctx);
+        v.on_key(plain('h'), &ctx);
+        assert_eq!(v.spans[v.active.expect("h selects")].target, "len");
+    }
+
+    #[test]
+    fn h_and_l_are_a_no_op_on_a_line_with_no_hotspots() {
+        let ctx = Ctx::stub();
+        let mut v = viewer_with_hotspots(&ctx);
+        v.cline = 1; // `    return 0;` — nothing navigable
+        assert!(targets_on_line(&v).is_empty(), "fixture: bare line");
+
+        v.on_key(plain('l'), &ctx);
+        assert!(v.active.is_none(), "nothing to select, so nothing selected");
+        v.on_key(plain('h'), &ctx);
+        assert!(v.active.is_none());
+        assert_eq!(v.cline, 1, "and the line cursor stays put");
+    }
+
+    #[test]
+    fn a_stale_selection_from_another_line_does_not_steer_h_or_l() {
+        // `j`/`k` leave `active` pointing at the line you came from — inert,
+        // because every reader of it filters on the cursor line, but retained so
+        // that stepping back restores the selection. A no-op `l` must leave that
+        // alone rather than clearing it, and must not resume the old line's walk
+        // at a matching index.
+        let ctx = Ctx::stub();
+        let mut v = viewer_with_hotspots(&ctx);
+        v.on_key(plain('l'), &ctx);
+        v.on_key(plain('l'), &ctx);
+        assert_eq!(v.spans[v.active.unwrap()].target, "buf");
+
+        v.cline = 1; // as `j` would leave it, with `active` still on line 0
+        v.on_key(plain('l'), &ctx);
+        assert!(
+            v.cur_span().is_none(),
+            "nothing on the cursor line is selected"
+        );
+        assert_eq!(
+            v.spans[v.active.unwrap()].target,
+            "buf",
+            "the off-line selection survives, so stepping back restores it"
+        );
+
+        v.cline = 0;
+        v.on_key(plain('l'), &ctx);
+        assert_eq!(
+            v.spans[v.active.unwrap()].target,
+            "len",
+            "and the walk resumes from where it left off, not from the line end"
+        );
     }
 
     #[test]

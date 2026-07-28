@@ -416,8 +416,13 @@ const LINES: &[HelpLine] = &[
     HelpLine::Section("VIEWER"),
     HelpLine::Entry {
         scope: "VIEWER",
-        key: "j/k  arrows",
+        key: "j/k  ↓/↑",
         action: "move line cursor",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
+        key: "h/l  ←/→",
+        action: "previous / next hotspot on this line (stops at the ends — w/b is what crosses lines)",
     },
     HelpLine::Entry {
         scope: "VIEWER",
