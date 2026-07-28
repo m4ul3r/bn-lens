@@ -266,9 +266,10 @@ struct App {
     refreshing: Option<Refreshing>,
     list_load: Option<ListLoad>,
     peeking: Option<Peeking>,
-    /// Context-rebuild failures belong to the old ctx, so retain them here;
-    /// cached-list/state failures are shared through `ctx.bn.last_error()`.
-    /// Per-item viewer reads render their errors locally instead.
+    /// Failures with no list to render them: a context rebuild (whose error
+    /// belongs to the *old* ctx) and a dead list-load worker. Cached-list/state
+    /// read failures are shared through `ctx.bn.last_error()` instead, and
+    /// per-item viewer reads render their errors locally.
     refresh_error: Option<String>,
 }
 
@@ -440,11 +441,14 @@ impl App {
         }
     }
 
-    /// Construct the list `view` names from its freshly-read payload. A payload
-    /// for a different view than the one requested cannot happen (the worker is
-    /// handed exactly one `ListsWanted`), so a mismatch just leaves the list be —
-    /// `poll_list_load` then switches to a view whose list is `None`, which
-    /// renders as the empty pane it already handles.
+    /// Construct the list `view` names from its freshly-read payload.
+    ///
+    /// A payload for a different view than the one requested cannot happen: the
+    /// worker is handed the single-field `ListsWanted` that `list_to_read` built
+    /// from this same `view`. If it ever did, the arm below would leave the list
+    /// `None` and the view would draw an empty body until the next switch — the
+    /// run loop only renders a list it has. Nothing crashes, but do not treat
+    /// that as a designed fallback.
     fn install_list(&mut self, view: AppView, data: ListData) {
         match view {
             AppView::Symbols => {}
@@ -579,6 +583,15 @@ impl App {
         let bn_bin = self.bn_bin.clone();
         let herdr = self.herdr.clone();
         let agent_pane = self.agent_pane.clone();
+        // Any in-flight list read was issued against the *pre-rebuild* `Ctx`, so
+        // its payload must not survive into the new one — on a re-point that
+        // would install the previous binary's rows under the new target's
+        // header, which is exactly the cross-target mix-up the ask path is
+        // fail-closed about. Today no path reaches here with one in flight
+        // (`on_key`/`on_mouse` return early while a load is up, and every caller
+        // is a key or mouse handler), so this is holding the invariant locally
+        // rather than relying on that staying true.
+        self.list_load = None;
         // Input is blocked while a rebuild is in flight, so the materialized set
         // cannot change under the worker.
         let wanted = lists_to_reread(kind, self.materialized_lists());

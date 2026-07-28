@@ -44,6 +44,15 @@ pub struct Ctx {
     /// A `OnceLock` rather than a `OnceCell` so that `Ctx` is `Sync`: the app
     /// holds it in an `Arc` and hands clones to worker threads, which is what
     /// lets a list build off the event thread (`App::start_list_load`).
+    ///
+    /// `get_or_init` *blocks* a second caller while the first initializes, and
+    /// initializing means a `bn strings` read (505 ms on an 11.5k-function
+    /// target). That is not a freeze today because no worker path touches it —
+    /// the list builds read `bn.strings()` and the ctx maps directly, never
+    /// `Ctx::strings`, whose only callers are the viewer's string peek and xref
+    /// (`viewer/actions.rs`), both on the event thread. A worker that started
+    /// calling it would put the event thread behind that read, silently, so
+    /// check this before adding one.
     strings_map: std::sync::OnceLock<HashMap<String, String>>,
 }
 
