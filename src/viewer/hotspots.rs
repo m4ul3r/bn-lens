@@ -201,7 +201,7 @@ pub(super) fn tab_stops(spans: &[Hotspot], viewed: &str) -> Vec<usize> {
         .enumerate()
         .filter(|(_, span)| match span.kind {
             HotKind::Func => span.target != viewed,
-            HotKind::Data | HotKind::Str | HotKind::Local | HotKind::Addr => true,
+            HotKind::Data | HotKind::Str | HotKind::Local | HotKind::Addr | HotKind::Label => true,
         })
         .map(|(index, _)| index)
         .collect();
@@ -256,7 +256,11 @@ pub(super) fn call_stops(spans: &[Hotspot], viewed: &str) -> Vec<usize> {
         .filter(|(_, span)| match span.kind {
             HotKind::Func => span.target != viewed,
             HotKind::Addr => span.code,
-            HotKind::Data | HotKind::Str | HotKind::Local => false,
+            // A label is a jump target, but an *intra*-function one: `W`/`B`
+            // exist to follow control flow out of the function, and stopping on
+            // every `goto` of a loop body would defeat that. `w`/`b`/`h`/`l`
+            // still land on them.
+            HotKind::Data | HotKind::Str | HotKind::Local | HotKind::Label => false,
         })
         .map(|(index, _)| index)
         .collect()
@@ -401,6 +405,21 @@ fn is_data_symbol(ctx: &Ctx, token: &str) -> bool {
 /// own locals map — a local must beat a same-named *global* data symbol, or `n`
 /// on the token falls through to renaming the whole function and `g` jumps to an
 /// unrelated global; then a data symbol; else it's not a hotspot.
+/// The address a `label_<hex>` branch target names, or `None` for any other
+/// identifier.
+///
+/// BN's pseudo-C renders irreducible control flow as `goto label_41f380;` with a
+/// matching `label_41f380:`, and that suffix *is* the destination address — so a
+/// jump needs no backend read. Strict on purpose: the suffix must be non-empty
+/// and entirely hex, so a real symbol called `label_handler` or `label_` stays a
+/// plain name and keeps whatever meaning the symbol maps give it.
+pub(super) fn label_addr(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("label_")?;
+    (!hex.is_empty() && hex.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .then(|| u64::from_str_radix(hex, 16).ok())
+        .flatten()
+}
+
 fn classify_name(is_func: bool, is_local: bool, is_data: bool) -> Option<(HotKind, bool)> {
     if is_func {
         Some((HotKind::Func, true))
@@ -436,6 +455,18 @@ pub(super) fn build_spans(
                             target: segment.text.clone(),
                             kind,
                             code,
+                        });
+                    } else if label_addr(&segment.text).is_some() {
+                        // Checked *after* the symbol maps, so a real symbol that
+                        // happens to be named `label_<hex>` keeps its own kind
+                        // (and its rename/xref actions) instead of being demoted
+                        // to a synthetic jump target.
+                        hotspots.push(Hotspot {
+                            line,
+                            col,
+                            target: segment.text.clone(),
+                            kind: HotKind::Label,
+                            code: true,
                         });
                     }
                 }
@@ -579,6 +610,53 @@ mod tests {
             kind,
             code,
         }
+    }
+
+    #[test]
+    fn label_addr_takes_only_a_wholly_hex_suffix() {
+        // BN's branch-target form: the suffix *is* the destination address.
+        assert_eq!(super::label_addr("label_401230"), Some(0x401230));
+        assert_eq!(super::label_addr("label_ffffffffdeadbeef"), Some(0xffffffffdeadbeef));
+        // A real symbol that merely starts `label_` must stay a plain name, or a
+        // recovered function called `label_handler` loses its goto/xref/rename.
+        assert_eq!(super::label_addr("label_handler"), None);
+        assert_eq!(super::label_addr("label_401230_retry"), None);
+        assert_eq!(super::label_addr("label_"), None);
+        assert_eq!(super::label_addr("labelled"), None);
+        assert_eq!(super::label_addr("parse_frame"), None);
+    }
+
+    #[test]
+    fn a_goto_label_becomes_a_label_hotspot_but_a_real_symbol_wins() {
+        let ctx = crate::ctx::Ctx::stub();
+        let lines = crate::syntax::tokenize_c("        goto label_401230;");
+        let spans = super::build_spans(&lines, &ctx, &HashMap::new());
+        let hit = spans.first().expect("the branch target is a hotspot");
+        assert_eq!(hit.kind, HotKind::Label);
+        assert_eq!(hit.target, "label_401230");
+        assert!(hit.code);
+        assert_eq!(hit.col, "        goto ".chars().count());
+
+        // Precedence: if the binary really has a function by that name, it keeps
+        // its own kind — the label check runs only after the symbol maps miss.
+        let mut named = crate::ctx::Ctx::stub();
+        named.func_names.insert("label_401230".into());
+        let spans = super::build_spans(&lines, &named, &HashMap::new());
+        assert_eq!(spans[0].kind, HotKind::Func);
+    }
+
+    #[test]
+    fn labels_are_ordinary_tab_stops_but_not_call_stops() {
+        let spans = vec![
+            spot("parse_frame", HotKind::Func, true, 0),
+            spot("label_401230", HotKind::Label, true, 1),
+            spot("memcpy", HotKind::Func, true, 2),
+        ];
+        // `w`/`b`/`h`/`l` land on a label…
+        assert_eq!(tab_stops(&spans, "parse_frame"), vec![1, 2]);
+        // …but `W`/`B` exist to follow control flow *out* of the function, and a
+        // loop body's gotos would swamp that.
+        assert_eq!(call_stops(&spans, "parse_frame"), vec![2]);
     }
 
     #[test]

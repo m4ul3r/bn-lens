@@ -22,6 +22,15 @@ enum HotKind {
     Addr,  // a raw 0x... inside a mapped section -> peek (or goto if code)
     Local, // a function-local variable/param -> highlight uses / type / rename
     Str,   // a string literal -> peek backing bytes / xref (resolved via bn strings)
+    /// A `label_<hex>` branch target in BN's pseudo-C (`goto label_41f380;` and
+    /// the `label_41f380:` it lands on) -> jump within this buffer.
+    ///
+    /// Its own kind rather than an `Addr`, for two reasons. The token is a name,
+    /// not a `0x…` literal, so the `Tok::Hex` arm never sees it; and the
+    /// destination is always inside the function already on screen, so acting on
+    /// it must move the cursor rather than re-decompile — an `Addr` would route
+    /// through `goto_to` and pay a backend read to land back in the same text.
+    Label,
 }
 
 /// An interactive token in the decompile: one syntax segment promoted to a
@@ -29,7 +38,10 @@ enum HotKind {
 struct Hotspot {
     line: usize,
     col: usize,
-    target: String, // fn/data name, or the 0x-address for Addr
+    /// fn/data name, the 0x-address for `Addr`, or the `label_<hex>` token for
+    /// `Label` (whose address is parsed back out of the name when it is acted on,
+    /// so the hint can show what the reader sees).
+    target: String,
     kind: HotKind,
     code: bool, // Addr: inside an executable section (goto vs peek)
 }

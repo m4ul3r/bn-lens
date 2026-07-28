@@ -75,7 +75,71 @@ impl Viewer {
             }
             HotKind::Local => self.show_local(index),
             HotKind::Str => self.peek_string(ctx, index),
+            HotKind::Label => {
+                let target = span.target.clone();
+                self.jump_to_label(&target);
+            }
         }
+    }
+
+    /// `Enter`/`g` on a `label_<hex>`: move the cursor to the other end of the
+    /// branch, within the buffer already on screen.
+    ///
+    /// From a `goto` that means the `label_…:` it lands on; from the definition
+    /// it means the first `goto` that reaches it, so the pair is walkable in both
+    /// directions from either end. `push_nav` first, so `^O` returns to where the
+    /// jump started — the destination can be hundreds of lines away, which is
+    /// exactly when losing your place hurts.
+    ///
+    /// No backend read: the address is in the name and the destination is inside
+    /// this function by construction.
+    fn jump_to_label(&mut self, target: &str) {
+        let definition = self.label_definition_line(target);
+        let destination = match definition {
+            // Standing on the definition: the useful jump is back to a use.
+            Some(line) if line == self.cline => self.label_use_line(target),
+            Some(line) => Some(line),
+            // No definition in this rendering (BN emitted the `goto` but the
+            // landing site is folded into a construct that carries no label row):
+            // fall back to any other mention.
+            None => self.label_use_line(target),
+        };
+        match destination {
+            Some(line) => {
+                self.push_nav(); // ^O returns to the pre-jump position
+                self.cline = line;
+                self.top = line.saturating_sub(3);
+                self.active = None;
+            }
+            None => self.status = format!(" ✗ {target} has no other site in this view"),
+        }
+    }
+
+    /// The row defining `label_<hex>`, by the view's address column first (exact,
+    /// and the decompile view strips the column out of the rendered text) and by
+    /// the `label_…:` row otherwise.
+    fn label_definition_line(&self, target: &str) -> Option<usize> {
+        let address = super::hotspots::label_addr(target)?;
+        let by_column = self
+            .code_addrs
+            .iter()
+            .position(|carried| *carried == Some(address));
+        by_column.or_else(|| {
+            let definition = format!("{target}:");
+            (0..self.lines.len())
+                .find(|&line| self.line_text(line).trim_start().starts_with(&definition))
+        })
+    }
+
+    /// The first row mentioning `label_<hex>` that isn't the cursor's own — the
+    /// `goto` side of the pair.
+    fn label_use_line(&self, target: &str) -> Option<usize> {
+        self.spans
+            .iter()
+            .find(|span| {
+                span.kind == HotKind::Label && span.target == target && span.line != self.cline
+            })
+            .map(|span| span.line)
     }
 
     /// A one-line preview of the deliberately-selected hotspot (Tab/`w`/`W`/
@@ -103,6 +167,7 @@ impl Viewer {
                 ctx.display_name(&span.target)
             ),
             HotKind::Func => format!(" → {}   ·  g goto · x xrefs · n rename", span.target),
+            HotKind::Label => format!(" {}   ·  ⏎ jump to the other end", span.target),
             HotKind::Addr if span.code => format!(" {}   ·  g goto · x xrefs", span.target),
             HotKind::Addr => format!(" {}   ·  g open data · p peek · x xrefs", span.target),
             HotKind::Data => format!(" {}   ·  g open data · p peek · x xrefs", span.target),
@@ -705,6 +770,11 @@ impl Viewer {
                     let focus = crate::ctx::parse_hex(&target);
                     self.peek_code(ctx, &target, focus, &format!("decomp @ {target}"));
                 }
+                // A label names a row of this same function, which `p` would
+                // just re-render into a popup. Say what does work instead.
+                HotKind::Label => {
+                    self.status = format!(" {target} is a branch target — ⏎ jumps to it")
+                }
                 HotKind::Addr | HotKind::Data => self.peek(ctx, &target),
             }
             return;
@@ -836,6 +906,26 @@ impl Viewer {
                         Some(address) => address.clone(),
                         None => {
                             self.status = " ✗ couldn't resolve string".into();
+                            return;
+                        }
+                    }
+                }
+                // `label_41f380` is not a symbol bn can resolve, so xref the
+                // address its name encodes instead — same trick as the synthetic
+                // `data_<hex>` name below.
+                //
+                // Measured caveat: for a plain intra-function branch this comes
+                // back empty (bn reports 0 code / 0 data — the `goto`s reaching
+                // it are not cross-references). It is still the right target,
+                // because a label that is *also* reached from a jump table or a
+                // data pointer has real refs to show, and an empty answer about
+                // the right address beats an error about a name bn never had.
+                HotKind::Label => {
+                    let raw = self.spans[index].target.clone();
+                    match super::hotspots::label_addr(&raw) {
+                        Some(address) => format!("0x{address:x}"),
+                        None => {
+                            self.status = format!(" ✗ {raw} encodes no address");
                             return;
                         }
                     }

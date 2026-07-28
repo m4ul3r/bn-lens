@@ -451,6 +451,11 @@ const LINES: &[HelpLine] = &[
     },
     HelpLine::Entry {
         scope: "VIEWER",
+        key: "Enter on label_…",
+        action: "jump to the other end of the branch (goto ⇄ label), in place — ^O returns",
+    },
+    HelpLine::Entry {
+        scope: "VIEWER",
         key: "p",
         action: "peek popup — code→decompile, data→quick typed field map",
     },
