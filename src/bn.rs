@@ -3803,12 +3803,40 @@ mod tests {
         (bn, recorded)
     }
 
-    fn recorded_argv(at: &Path) -> Vec<String> {
-        std::fs::read_to_string(at)
-            .expect("the recorder script ran")
-            .lines()
-            .map(str::to_string)
-            .collect()
+    /// Run `call`, then hand back the argv the recorder captured.
+    ///
+    /// Retries when the capture is missing, because exec'ing a *freshly written*
+    /// script loses a race the rest of this suite creates. `argv_recorder` writes
+    /// the script, and while that write fd is open any other thread that forks —
+    /// several tests here spawn — inherits it; the kernel then refuses our exec
+    /// of that same file with `ETXTBSY`. Measured at **43 failures in 400 execs**
+    /// with four threads forking concurrently, which is why this surfaced as a
+    /// rare, load-dependent failure rather than never.
+    ///
+    /// `Bn` swallows the spawn error (its callers only want the output), so the
+    /// only symptom here is a capture file that never appears — previously an
+    /// `expect("the recorder script ran")` that named neither the cause nor the
+    /// path. Retrying re-runs the command; it cannot hide an argv defect, since a
+    /// wrong argv still lands in the file and still fails the assertion below.
+    fn recorded_argv(at: &Path, mut call: impl FnMut()) -> Vec<String> {
+        for attempt in 0..4 {
+            // Clear first, so a read can only ever return *this* call's argv. The
+            // capture file outlives each step within a test, so without this a
+            // step whose exec failed would quietly assert against the previous
+            // step's recording and pass — which the old harness could do, since
+            // it read the file without ever invalidating it.
+            let _ = std::fs::remove_file(at);
+            call();
+            if let Ok(text) = std::fs::read_to_string(at) {
+                return text.lines().map(str::to_string).collect();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+        }
+        panic!(
+            "the recorder script never ran: no capture at {} after 4 attempts \
+             (exec of a just-written script losing to ETXTBSY?)",
+            at.display()
+        )
     }
 
     #[test]
@@ -3818,18 +3846,20 @@ mod tests {
         let dir = scratch_dir("argv");
         let (bn, recorded) = argv_recorder(&dir);
 
-        bn.comment_set_addr("0x401000", "-- checked, bounds fine");
-        assert_guarded(
-            &recorded_argv(&recorded),
-            &["0x401000", "-- checked, bounds fine"],
-        );
+        let argv = recorded_argv(&recorded, || {
+            bn.comment_set_addr("0x401000", "-- checked, bounds fine");
+        });
+        assert_guarded(&argv, &["0x401000", "-- checked, bounds fine"]);
 
-        bn.symbol_rename("-t", "parse_header");
-        assert_guarded(&recorded_argv(&recorded), &["-t", "parse_header"]);
+        let argv = recorded_argv(&recorded, || {
+            bn.symbol_rename("-t", "parse_header");
+        });
+        assert_guarded(&argv, &["-t", "parse_header"]);
 
         // A dash-leading tag note rides as `--data=<note>`, never as a bare value.
-        bn.tag_add_addr("0x401000", "Bookmarks", "-> see parse_hdr");
-        let argv = recorded_argv(&recorded);
+        let argv = recorded_argv(&recorded, || {
+            bn.tag_add_addr("0x401000", "Bookmarks", "-> see parse_hdr");
+        });
         assert!(
             argv.contains(&"--data=-> see parse_hdr".to_string()),
             "tag note must use the `=` form: {argv:?}"
@@ -3838,8 +3868,9 @@ mod tests {
 
         // A function-scoped comment has NO untrusted positional but two untrusted
         // values, so it must carry both in `=` form.
-        bn.comment_set_func("--weird", "-wip");
-        let argv = recorded_argv(&recorded);
+        let argv = recorded_argv(&recorded, || {
+            bn.comment_set_func("--weird", "-wip");
+        });
         assert!(argv.contains(&"--function=--weird".to_string()), "{argv:?}");
         assert_guarded(&argv, &["-wip"]);
 
@@ -3854,17 +3885,22 @@ mod tests {
         // A function named `--out` collides with bn's own capture flag, which
         // `with_capture` splices in ahead of the separator: the name must still
         // arrive as an operand, and the real flag must survive.
-        let _ = bn.decompile_read("--out");
-        let argv = recorded_argv(&recorded);
+        let argv = recorded_argv(&recorded, || {
+            let _ = bn.decompile_read("--out");
+        });
         assert!(argv.contains(&"--out".to_string()));
         let at = argv.iter().position(|arg| arg == "--").expect("separator");
         assert_eq!(argv[at + 1], "--out", "the function name is an operand");
 
-        bn.type_show("-2");
-        assert_guarded(&recorded_argv(&recorded), &["-2"]);
+        let argv = recorded_argv(&recorded, || {
+            bn.type_show("-2");
+        });
+        assert_guarded(&argv, &["-2"]);
 
-        bn.read("-1", 16);
-        assert_guarded(&recorded_argv(&recorded), &["-1"]);
+        let argv = recorded_argv(&recorded, || {
+            bn.read("-1", 16);
+        });
+        assert_guarded(&argv, &["-1"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
