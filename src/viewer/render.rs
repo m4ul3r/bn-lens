@@ -350,7 +350,12 @@ impl Viewer {
             ])
         } else {
             crate::ui::hint_bar(&[
-                &[("j/k", ""), ("gg/G", "ends"), ("w/b", "hotspot"), ("W/B", "calls")],
+                &[
+                    ("j/k", ""),
+                    ("gg/G", "ends"),
+                    ("w/b·h/l", "hotspot"),
+                    ("W/B", "calls"),
+                ],
                 &[("⏎", "act"), ("n/;/t", "edit"), ("a", "ask")],
                 &[("/", "find"), (":", "goto")],
                 &[("i", "il"), ("v", "cfg")],
