@@ -9,8 +9,10 @@
 //! ## Protocol (verified against `/opt/bn/src/bn_agent_bridge/bridge.py`)
 //!
 //! - AF_UNIX SOCK_STREAM at `<cache>/bn/instances/<id>.sock`, mode 0600, SO_PEERCRED
-//!   same-uid only. No handshake, no auth token, no version negotiation on the wire.
-//! - Request: **one** JSON object plus `\n` — `{"id", "op", "params", "target"?}`.
+//!   same-uid only. Current bridges also bind each request to the registry's
+//!   instance id, pid and token; older tokenless bridges keep their old wire.
+//! - Request: **one** JSON object plus `\n` — `{"id", "op", "params", "target"?,
+//!   "_bridge_identity"?}`.
 //!   `bridge.py:714` reads it with a single `readline(MAX_REQUEST_BYTES)` (32 MiB).
 //! - Response: one JSON object with **no trailing newline and no length prefix**
 //!   (`_json_response`, `_shared.py:32`), so the reply is delimited by EOF only —
@@ -31,7 +33,7 @@
 //!    `limit` is absent, while newer bridges return one page. `Bn::data_symbols`
 //!    checks the response and asks for one complete snapshot only when needed.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -101,7 +103,7 @@ const CONNECT_RETRIES: u32 = 4;
 /// The bridge name used for the legacy fixed (GUI-mode) registry pair.
 const PLUGIN_NAME: &str = "bn_agent_bridge";
 
-/// `{"ok", "result", "error"}` — the only response shape the bridge emits.
+/// Current bridges echo their identity on every response, including failures.
 #[derive(Deserialize)]
 struct Envelope {
     #[serde(default)]
@@ -110,6 +112,15 @@ struct Envelope {
     result: Value,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    bridge_identity: Option<BridgeIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct BridgeIdentity {
+    instance_id: Option<String>,
+    pid: i64,
+    token: String,
 }
 
 /// One instance registry file (`<cache>/bn/instances/<id>.json`).
@@ -121,6 +132,8 @@ struct RegistryJson {
     socket_path: String,
     #[serde(default)]
     instance_id: Option<String>,
+    #[serde(default)]
+    instance_token: Option<String>,
     #[serde(default)]
     plugin_version: String,
     #[serde(default)]
@@ -140,6 +153,8 @@ pub struct Client {
     /// Binaries the instance has open. Empty means it is idle — the lens skips
     /// those when auto-resolving, matching the previous `session list` behavior.
     pub binaries: Vec<String>,
+    /// Present for bridges that publish an identity token in the registry.
+    pub(crate) identity: Option<BridgeIdentity>,
 }
 
 /// `<cache>/bn`, mirroring `bn/paths.py:105-121` exactly (including `BN_CACHE_DIR`
@@ -212,6 +227,15 @@ fn load_instance(registry: &Path, fallback_id: &str) -> Option<Client> {
     if !socket_path.exists() || !socket_is_live(&socket_path) {
         return None;
     }
+    let identity = parsed
+        .instance_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .map(|token| BridgeIdentity {
+            instance_id: parsed.instance_id.clone(),
+            pid: parsed.pid,
+            token: token.to_string(),
+        });
     Some(Client {
         instance_id: parsed
             .instance_id
@@ -221,6 +245,7 @@ fn load_instance(registry: &Path, fallback_id: &str) -> Option<Client> {
         plugin_version: parsed.plugin_version,
         started_at: parsed.started_at,
         binaries: parsed.binaries,
+        identity,
     })
 }
 
@@ -307,6 +332,9 @@ impl Client {
         if let Some(target) = target {
             payload.insert("target".into(), Value::String(target.to_string()));
         }
+        if let Some(identity) = &self.identity {
+            payload.insert("_bridge_identity".into(), serde_json::json!(identity));
+        }
         let mut encoded = serde_json::to_vec(&Value::Object(payload))
             .map_err(|error| format!("could not encode {op} request: {error}"))?;
         encoded.push(b'\n');
@@ -350,6 +378,14 @@ impl Client {
                 self.instance_id
             )
         })?;
+        if let Some(expected) = &self.identity {
+            if envelope.bridge_identity.as_ref() != Some(expected) {
+                return Err(format!(
+                    "bn instance {} replied with a different bridge identity; refusing stale socket data",
+                    self.instance_id
+                ));
+            }
+        }
         if envelope.ok {
             Ok(envelope.result)
         } else {
@@ -391,11 +427,14 @@ impl Client {
     /// purpose: we are already reporting a timeout, and a second error would only
     /// obscure the first.
     fn cancel(&self, request_id: &str) {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "id": next_request_id(),
             "op": "cancel_request",
             "params": {"request_id": request_id},
         });
+        if let Some(identity) = &self.identity {
+            payload["_bridge_identity"] = serde_json::json!(identity);
+        }
         let Ok(mut encoded) = serde_json::to_vec(&payload) else {
             return;
         };
@@ -485,6 +524,81 @@ mod tests {
         assert_eq!(parsed.instance_id.as_deref(), Some("lens"));
         assert_eq!(parsed.plugin_version, "0.20.0");
         assert_eq!(parsed.binaries.len(), 1);
+        assert!(
+            parsed.instance_token.is_none(),
+            "older registries remain usable"
+        );
+    }
+
+    #[test]
+    fn tokened_registry_binds_requests_responses_and_cancellation() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!(
+            "bn-lens-identity-{}-{}",
+            std::process::id(),
+            next_request_id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let socket = dir.join("bridge.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let registry = dir.join("bridge.json");
+        let identity = serde_json::json!({
+            "instance_id": "sample-instance", "pid": 4242, "token": "synthetic-token"
+        });
+        std::fs::write(
+            &registry,
+            serde_json::json!({
+                "pid": 4242, "socket_path": socket, "instance_id": "sample-instance",
+                "instance_token": "synthetic-token", "plugin_version": "test"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let server = std::thread::spawn(move || {
+            // load_instance's liveness probe connects before the request.
+            drop(listener.accept().unwrap().0);
+            for response_token in ["synthetic-token", "wrong-token"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["op"], "cfg");
+                assert_eq!(request["_bridge_identity"], identity);
+                let response = serde_json::json!({
+                    "ok": true, "result": {"blocks": []},
+                    "bridge_identity": {
+                        "instance_id": "sample-instance", "pid": 4242,
+                        "token": response_token
+                    }
+                });
+                stream.write_all(response.to_string().as_bytes()).unwrap();
+            }
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut line)
+                .unwrap();
+            let cancel: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(cancel["op"], "cancel_request");
+            assert_eq!(cancel["params"]["request_id"], "synthetic-request");
+            assert_eq!(cancel["_bridge_identity"], identity);
+        });
+
+        let client = load_instance(&registry, "fallback").unwrap();
+        assert_eq!(client.identity.as_ref().unwrap().pid, 4242);
+        assert!(client.request("cfg", serde_json::json!({}), None).is_ok());
+        let error = client
+            .request("cfg", serde_json::json!({}), None)
+            .unwrap_err();
+        assert!(error.contains("different bridge identity"));
+        client.cancel("synthetic-request");
+        server.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

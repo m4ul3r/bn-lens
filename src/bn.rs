@@ -3754,6 +3754,7 @@ mod tests {
                 plugin_version: "0.20.0-test".into(),
                 started_at: String::new(),
                 binaries: vec!["sample".into()],
+                identity: None,
             })),
             pace: crate::bnsock::Pace::Interactive,
             health: Arc::new(Mutex::new(None)),
