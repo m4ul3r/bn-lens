@@ -302,16 +302,15 @@ impl Ctx {
         //   serial 164 ms · 3-way concurrent 227 ms — **0.72×**
         //   per-op under contention: sections 1.1 → 3.6 ms, imports 53 → 200 ms,
         //   exports 110 → 227 ms.
-        // With today's write-locked `py_exec` data-symbols read in the mix it is
-        // 0.99× — no win either. This reproduces DESIGN_BN_INTERFACE.md §5.1 on
-        // the post-socket transport.
+        // An older bridge may still need write-locked `py_exec` for data
+        // symbols; that does not make concurrent context reads a win either.
         //
         // The second reason is the pairing invariant: N concurrent reads hold the
         // bridge's read lock N-wide, and `_ReadWriteLock` is writer-preferring, so
         // a fan-out here delays the agent's rename/comment longer than the serial
         // build it would replace.
         let (mut addr_by_name, mut data_names) = bn.symbols_checked()?;
-        let data_syms = bn.data_symbols(); // best-effort; cannot error
+        let data_syms = bn.data_symbols()?;
         let import_names = bn.imports_checked()?;
         let sections_text = bn.sections_checked()?;
         let mut func_names = HashSet::new();
@@ -333,8 +332,8 @@ impl Ctx {
         // Named *internal* data symbols the exports list omits — e.g. a global
         // you renamed from `data_<hex>` to something meaningful. Without these,
         // renaming a data global makes it stop being a hotspot (w/b skip it, p/x
-        // can't target it). Best-effort:
-        // an empty result just falls back to exports + `data_<hex>` recognition.
+        // can't target it). A genuinely empty map is fine; a decode failure
+        // above aborts the context build instead of mimicking that case.
         // Inserted before the name_by_addr fill below so it picks them up too.
         for (addr, name) in data_syms {
             if name.is_empty() || func_names.contains(&name) {

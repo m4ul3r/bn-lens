@@ -193,18 +193,23 @@ fn edge_lines(
 ) -> Vec<String> {
     let edges = &block.inner.edges;
     if edges.is_empty() {
-        return vec![format!("{indent}└─ (returns)")];
+        let outcome = if block.inner.undetermined_edges {
+            "successor unresolved"
+        } else {
+            "returns"
+        };
+        return vec![format!("{indent}└─ ({outcome})")];
     }
     let word_w = edges
         .iter()
         .map(|e| edge_word(&e.k).chars().count())
         .max()
         .unwrap_or(0);
-    edges
+    let mut lines: Vec<_> = edges
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            let connector = if i + 1 == edges.len() {
+            let connector = if i + 1 == edges.len() && !block.inner.undetermined_edges {
                 "└─"
             } else {
                 "├─"
@@ -221,7 +226,11 @@ fn edge_lines(
                 format!("{indent}{connector} {word:word_w$} ─▶ {target}{loop_note}")
             }
         })
-        .collect()
+        .collect();
+    if block.inner.undetermined_edges {
+        lines.push(format!("{indent}└─ (other successors unresolved)"));
+    }
+    lines
 }
 
 fn list_header(labels: &HashMap<u64, String>, block: &Block, entry: Option<u64>) -> String {
@@ -593,10 +602,9 @@ fn barycenter_down(layers: &mut [Vec<usize>], nodes: &[LNode], adj_up: &[Vec<usi
     }
 }
 
-/// Build the compact 3-line content of a block's box. Successor edges that
-/// leave the function (a tail call, an unresolved target) can't be drawn as
-/// arrows, so they surface here as a `⇢ … ext` note on the summary line —
-/// control flow is annotated rather than silently dropped.
+/// Build the compact 3-line content of a block's box. Successors outside the
+/// function and successors BN could not resolve cannot be drawn as arrows, so
+/// the summary line names them instead of silently dropping them.
 fn box_content(labels: &HashMap<u64, String>, block: &Block, entry: Option<u64>) -> [String; 3] {
     let label = labels
         .get(&block.start)
@@ -615,10 +623,15 @@ fn box_content(labels: &HashMap<u64, String>, block: &Block, entry: Option<u64>)
         1 => format!(" · ⇢ {} ext", ext[0]),
         n => format!(" · ⇢ ext ×{n}"),
     };
-    let summary = if entry == Some(block.start) {
-        format!("entry · {n} insns{ext_note}")
+    let unresolved_note = if block.inner.undetermined_edges {
+        " · ⇢ ? unresolved"
     } else {
-        format!("{n} insns{ext_note}")
+        ""
+    };
+    let summary = if entry == Some(block.start) {
+        format!("entry · {n} insns{ext_note}{unresolved_note}")
+    } else {
+        format!("{n} insns{ext_note}{unresolved_note}")
     };
     [
         format!("{label}  {}", block.head_str()),
@@ -1075,7 +1088,7 @@ pub fn list(blocks: &[CfgBlock]) -> Rendered {
     let (parsed, entry) = prepare(blocks);
     if parsed.is_empty() {
         return Rendered {
-            lines: vec!["(no control-flow graph — function not found or has no blocks)".into()],
+            lines: vec!["(no control-flow graph returned)".into()],
             index: HashMap::new(),
             block_count: 0,
         };
@@ -1108,26 +1121,31 @@ mod tests {
     fn diamond() -> Vec<CfgBlock> {
         vec![
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x1000".into(),
                 insns: vec![insn("0x1000", "cbz x0, 0x1020")],
                 edges: vec![edge("0x1020", "TrueBranch"), edge("0x1010", "FalseBranch")],
             },
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x1010".into(),
                 insns: vec![insn("0x1010", "mov x1, #1")],
                 edges: vec![edge("0x1030", "UnconditionalBranch")],
             },
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x1020".into(),
                 insns: vec![insn("0x1020", "mov x1, #2")],
                 edges: vec![edge("0x1030", "UnconditionalBranch")],
             },
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x1030".into(),
                 insns: vec![insn("0x1030", "cbnz x2, 0x1000")],
                 edges: vec![edge("0x1000", "TrueBranch"), edge("0x1040", "FalseBranch")],
             },
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x1040".into(),
                 insns: vec![insn("0x1040", "ret")],
                 edges: vec![],
@@ -1147,6 +1165,7 @@ mod tests {
         // is an IL-index identity here; flat keys each line off `insn.a`.
         let blocks = vec![
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x21".into(),
                 insns: vec![
                     insn("0x40cbf0", "var_1 = x20"),
@@ -1155,6 +1174,7 @@ mod tests {
                 edges: vec![],
             },
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x1c".into(),
                 insns: vec![insn("0x40cbd4", "if (x0 != 0) then 0x40cc88 else 0x40cbec")],
                 edges: vec![],
@@ -1252,7 +1272,18 @@ mod tests {
         let r = list(&[]);
         assert_eq!(r.block_count, 0);
         assert!(r.lines[0].contains("no control-flow graph"));
+        assert!(!r.lines[0].contains("function not found"));
         assert!(graph(&[]).is_none());
+    }
+
+    #[test]
+    fn unresolved_successor_is_not_rendered_as_a_return() {
+        let mut blocks = diamond();
+        blocks[4].undetermined_edges = true;
+        let lines = list(&blocks).lines.join("\n");
+        assert!(lines.contains("successor unresolved"));
+        assert!(!lines.contains("(returns)"));
+        assert!(as_text(&graph(&blocks).unwrap()).contains("⇢ ? unresolved"));
     }
 
     /// An edge whose target is outside the function (a tail call) can't be drawn
@@ -1261,11 +1292,13 @@ mod tests {
     fn graph_annotates_external_edges() {
         let blocks = vec![
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x3000".into(),
                 insns: vec![insn("0x3000", "cbz x0, 0x3010")],
                 edges: vec![edge("0x3010", "TrueBranch"), edge("0x9000", "FalseBranch")],
             },
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x3010".into(),
                 insns: vec![insn("0x3010", "ret")],
                 edges: vec![],
@@ -1287,6 +1320,7 @@ mod tests {
     fn graph_counts_multiple_external_edges() {
         let blocks = vec![
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x4000".into(),
                 insns: vec![insn("0x4000", "br x8")],
                 edges: vec![
@@ -1295,6 +1329,7 @@ mod tests {
                 ],
             },
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x4010".into(),
                 insns: vec![insn("0x4010", "ret")],
                 edges: vec![],
@@ -1311,16 +1346,19 @@ mod tests {
     fn il_blocks_display_head_addresses_not_il_indexes() {
         let blocks = vec![
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x0".into(),
                 insns: vec![insn("0x401000", "if (x == 0)")],
                 edges: vec![edge("0x5", "TrueBranch"), edge("0x3", "FalseBranch")],
             },
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x3".into(),
                 insns: vec![insn("0x401010", "y = 1")],
                 edges: vec![edge("0x5", "UnconditionalBranch")],
             },
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x5".into(),
                 insns: vec![insn("0x401020", "return y")],
                 edges: vec![],
@@ -1352,16 +1390,19 @@ mod tests {
     fn long_edge_uses_a_dummy_column() {
         let blocks = vec![
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x2000".into(),
                 insns: vec![insn("0x2000", "b.eq 0x2020")],
                 edges: vec![edge("0x2010", "FalseBranch"), edge("0x2020", "TrueBranch")],
             },
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x2010".into(),
                 insns: vec![insn("0x2010", "b 0x2020")],
                 edges: vec![edge("0x2020", "UnconditionalBranch")],
             },
             CfgBlock {
+                undetermined_edges: false,
                 start: "0x2020".into(),
                 insns: vec![insn("0x2020", "ret")],
                 edges: vec![],

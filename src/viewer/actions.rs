@@ -710,7 +710,22 @@ impl Viewer {
         };
         let hi = addr + 0x200;
         let hint = section.map_or("", |(_, _, name, _)| name.as_str());
-        let vars = ctx.bn.data_vars(&format!("0x{lo:x}"), &format!("0x{hi:x}"));
+        let vars = match ctx.bn.data_vars(&format!("0x{lo:x}"), &format!("0x{hi:x}")) {
+            Ok(vars) => vars,
+            Err(error) => {
+                self.status = format!(" ✗ {error}");
+                self.popup = Popup::Peek {
+                    title: "data read failed".into(),
+                    lines: vec![format!("✗ {error}")],
+                    tokens: None,
+                    goto: None,
+                    off: 0,
+                    focus: None,
+                    hoff: 0,
+                };
+                return;
+            }
+        };
         if vars.is_empty() {
             self.show_peek(ctx, symbol, address);
             return;
