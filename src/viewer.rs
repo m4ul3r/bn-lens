@@ -546,10 +546,17 @@ impl Viewer {
         let text = match self.view {
             View::Mlil => self.linear_annotated(ctx, View::Mlil.il_level()),
             View::Disasm => self.linear_annotated(ctx, View::Disasm.il_level()),
-            View::Xrefs => ctx.bn.xrefs(&self.name),
+            View::Xrefs => Ok(ctx.bn.xrefs(&self.name)),
             // Decomp returns above, out of its single `--addresses` read; there is
             // deliberately no second text-mode decompile to fall back to.
             View::Decomp | View::Cfg | View::Data => unreachable!("handled above"),
+        };
+        let text = match text {
+            Ok(text) => text,
+            Err(error) => {
+                self.show_note(ctx, format!("✗ {error}"));
+                return;
+            }
         };
         self.lines = syntax::tokenize_plain(&text);
         self.code_addrs = self.line_addr_column(&text);
@@ -616,20 +623,20 @@ impl Viewer {
     /// call renders as a `Func` hotspot, distinct from a local branch label. The
     /// CFG block cache is shared: when it already holds this function at `il`,
     /// the fetch is skipped (a linear↔CFG toggle at the same level is free).
-    fn linear_annotated(&mut self, ctx: &Ctx, il: &'static str) -> String {
+    fn linear_annotated(&mut self, ctx: &Ctx, il: &'static str) -> Result<String, String> {
         let blocks = match self.cfg_cache.take() {
             Some((name, cached_il, blocks)) if name == self.name && cached_il == il => blocks,
-            _ => ctx.bn.cfg(&self.name, il),
+            _ => ctx.bn.cfg(&self.name, il)?,
         };
         let text = crate::cfg::flat(&blocks);
         self.cfg_cache = Some((self.name.clone(), il, blocks));
         if text.trim().is_empty() {
-            match il {
+            Ok(match il {
                 "mlil" => "(no IL)".into(),
                 _ => "(no disassembly)".into(),
-            }
+            })
         } else {
-            text
+            Ok(text)
         }
     }
 
@@ -718,7 +725,17 @@ impl Viewer {
         let il = self.code_view.il_level();
         let blocks = match self.cfg_cache.take() {
             Some((name, cached_il, blocks)) if name == self.name && cached_il == il => blocks,
-            _ => ctx.bn.cfg(&self.name, il),
+            _ => match ctx.bn.cfg(&self.name, il) {
+                Ok(blocks) => blocks,
+                Err(error) => {
+                    self.cfg_graph_view = None;
+                    self.cfg_cache = None;
+                    self.cfg_index.clear();
+                    self.status = format!(" ✗ {error}");
+                    self.show_note(ctx, format!("✗ {error}"));
+                    return;
+                }
+            },
         };
         // Try the 2D graph first (when requested); fall back to the block list
         // only when there are too many blocks to lay out.
@@ -827,7 +844,14 @@ impl Viewer {
         };
         let lo_str = format!("0x{lo:x}");
         let hi_str = format!("0x{hi:x}");
-        let vars = ctx.bn.data_vars(&lo_str, &hi_str);
+        let vars = match ctx.bn.data_vars(&lo_str, &hi_str) {
+            Ok(vars) => vars,
+            Err(error) => {
+                self.status = format!(" ✗ {error}");
+                self.show_note(ctx, format!("✗ {error}"));
+                return;
+            }
+        };
         // A failed read must not be laid out as a window of unknown bytes — that
         // reads as "this region is empty", which is a conclusion about the target.
         let dump = match ctx.bn.read_dump(&lo_str, (hi - lo) as usize) {

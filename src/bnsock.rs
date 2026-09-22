@@ -26,10 +26,10 @@
 //! 1. **Cancellation.** On timeout the bridge is still working. `bn`'s own client
 //!    fires a `cancel_request` op on a *separate* connection (`transport.py:433-451`);
 //!    skipping it orphans in-flight bridge work. [`Client::request`] does the same.
-//! 2. **Paging.** There is no `_effective_limit` layer here — that lives in the CLI
-//!    (`cli.py:1286-1296`). On the wire, an absent `limit` means *no limit*
-//!    (`bridge.py:3153`), which is what we want, but it must be a deliberate choice
-//!    per call rather than an accident.
+//! 2. **Paging.** There is no CLI `_effective_limit` layer here. The bridge's
+//!    default is op-specific: older `data_symbols` returns everything when
+//!    `limit` is absent, while newer bridges return one page. `Bn::data_symbols`
+//!    checks the response and asks for one complete snapshot only when needed.
 
 use serde::Deserialize;
 use serde_json::{Map, Value};

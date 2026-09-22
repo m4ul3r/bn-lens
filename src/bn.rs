@@ -59,10 +59,9 @@ fn expand_home(p: &str) -> String {
 /// 3. the live bridge is older than the op we want (`read_op` / `mutation_op`
 ///    detect that and only then re-run over the CLI).
 ///
-/// Case 3 is not hypothetical: [`Bn::cfg`], [`Bn::data_vars`] and [`Bn::data_symbols`]
-/// name read-locked ops that the bridge does not register (checked against its
-/// `op_registry`), so in practice those three still run their legacy `py exec`
-/// program — which takes the bridge's *exclusive* lock (see [`Bn::py_json`]).
+/// Case 3 keeps older bridges usable: [`Bn::cfg`], [`Bn::data_vars`] and
+/// [`Bn::data_symbols`] have read-locked ops on current bridges, but fall back to
+/// their legacy `py exec` programs only when the op is unregistered.
 #[derive(Clone)]
 pub struct Bn {
     pub bin: String,
@@ -491,17 +490,19 @@ fn recovered_class(item: ClassItemJson) -> Option<ClassItem> {
 #[derive(Clone, Deserialize)]
 pub struct CfgBlock {
     pub start: String,
-    #[serde(default)]
     pub insns: Vec<CfgInsn>,
-    #[serde(default)]
     pub edges: Vec<CfgEdge>,
+    #[serde(default)]
+    pub undetermined_edges: bool,
 }
 
 #[derive(Clone, Deserialize)]
 pub struct CfgInsn {
     /// Instruction address.
+    #[serde(alias = "address")]
     pub a: String,
     /// Rendered disassembly text.
+    #[serde(alias = "text")]
     pub t: String,
 }
 
@@ -510,12 +511,12 @@ pub struct CfgEdge {
     /// Target block start address.
     pub to: String,
     /// Edge kind (`TrueBranch`/`FalseBranch`/`UnconditionalBranch`/…).
+    #[serde(alias = "branch_type")]
     pub k: String,
 }
 
 #[derive(Deserialize)]
 struct CfgJson {
-    #[serde(default)]
     blocks: Vec<CfgBlock>,
 }
 
@@ -523,7 +524,6 @@ struct CfgJson {
 /// we parse it, then parse the inner JSON the script emitted.
 #[derive(Deserialize)]
 struct PyEnvelope {
-    #[serde(default)]
     stdout: String,
 }
 
@@ -533,34 +533,34 @@ struct PyEnvelope {
 /// structured data-section view: a data address reads as a struct field.
 #[derive(Clone, Deserialize)]
 pub struct DataVar {
-    #[serde(rename = "a")]
+    #[serde(rename = "a", alias = "address")]
     pub addr: String,
-    #[serde(rename = "n", default)]
+    #[serde(rename = "n", alias = "name", default)]
     pub name: String,
-    #[serde(rename = "t", default)]
+    #[serde(rename = "t", alias = "type")]
     pub type_name: String,
-    #[serde(rename = "w", default)]
+    #[serde(rename = "w", alias = "width")]
     pub width: u64,
-    /// Decoded value for scalars ≤ 8 bytes (unsigned); `None` for aggregates.
-    #[serde(rename = "v", default)]
-    pub value: Option<i64>,
+    /// Decoded signed or unsigned scalar ≤ 8 bytes; `None` for aggregates.
+    #[serde(rename = "v", alias = "value", default)]
+    pub value: Option<i128>,
     /// Pointer target address (`0x…`), when the type is a pointer.
-    #[serde(rename = "p", default)]
+    #[serde(rename = "p", alias = "pointer", default)]
     pub ptr: Option<String>,
     /// Symbol at the pointer target, if any.
-    #[serde(rename = "ps", default)]
+    #[serde(rename = "ps", alias = "pointer_symbol", default)]
     pub ptr_sym: Option<String>,
     /// ASCII string at the pointer target, if any (preview, truncated).
-    #[serde(rename = "pstr", default)]
+    #[serde(rename = "pstr", alias = "pointer_string", default)]
     pub ptr_str: Option<String>,
     /// Section name the variable lives in (for boundary headers).
-    #[serde(rename = "sec", default)]
+    #[serde(rename = "sec", alias = "section", default)]
     pub section: String,
 }
 
 #[derive(Deserialize)]
 struct DataMapJson {
-    #[serde(default)]
+    #[serde(alias = "items")]
     vars: Vec<DataVar>,
 }
 
@@ -580,8 +580,16 @@ struct DataSym {
 
 #[derive(Deserialize)]
 struct DataSymsJson {
-    #[serde(default)]
+    #[serde(alias = "items")]
     syms: Vec<DataSym>,
+    #[serde(default)]
+    has_more: Option<bool>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    returned: Option<usize>,
+    #[serde(default)]
+    total: Option<usize>,
 }
 
 /// The `bn py exec` program that walks a function's basic blocks and prints the
@@ -955,15 +963,62 @@ fn parse_local_list_json(text: &str) -> Vec<LocalVariable> {
         .unwrap_or_default()
 }
 
-/// `(address, name)` pairs from one `data_symbols` payload, dropping any element
-/// missing either half — see the note on [`DataSym`].
-fn recovered_data_syms(payload: DataSymsJson) -> Vec<(String, String)> {
-    payload
+/// `(address, name)` pairs from one `data_symbols` payload. A single incomplete
+/// row is skipped; an entirely unusable nonempty page is a schema failure.
+fn recovered_data_syms(payload: DataSymsJson) -> Result<Vec<(String, String)>, String> {
+    let row_count = payload.syms.len();
+    let recovered: Vec<_> = payload
         .syms
         .into_iter()
         .filter(|sym| !sym.a.is_empty() && !sym.n.is_empty())
         .map(|sym| (sym.a, sym.n))
-        .collect()
+        .collect();
+    if row_count > 0 && recovered.is_empty() {
+        Err("bn data_symbols returned rows without usable address/name fields".into())
+    } else {
+        Ok(recovered)
+    }
+}
+
+/// The first-class op always reports pagination metadata. Check it before
+/// claiming a map is complete; the legacy `py exec` payload has no such fields
+/// and is decoded separately.
+fn validate_data_syms_page(page: &DataSymsJson) -> Result<bool, String> {
+    let more = page
+        .has_more
+        .ok_or("bn data_symbols omitted has_more; completeness is unknown")?;
+    if page.offset != Some(0) || page.returned != Some(page.syms.len()) {
+        return Err("bn data_symbols returned inconsistent first-page metadata".into());
+    }
+    let total = page
+        .total
+        .ok_or("bn data_symbols omitted total; completeness is unknown")?;
+    if total < page.syms.len() || (!more && total != page.syms.len()) {
+        return Err("bn data_symbols returned inconsistent total".into());
+    }
+    Ok(more)
+}
+
+/// On an older bridge the omitted-limit response already contains every symbol,
+/// so no new wire token is sent. A paged bridge is asked for `limit: "all"` in
+/// one read-locked request: its result is one coherent snapshot, not a stitched
+/// series of pages that may straddle a live rename. If that request fails or
+/// remains paged, fail visibly instead of accepting a prefix as the whole map.
+fn complete_data_syms<F>(
+    initial: DataSymsJson,
+    fetch_all: F,
+) -> Result<Vec<(String, String)>, String>
+where
+    F: FnOnce(serde_json::Value) -> Result<DataSymsJson, String>,
+{
+    if !validate_data_syms_page(&initial)? {
+        return recovered_data_syms(initial);
+    }
+    let full = fetch_all(serde_json::json!({"limit": "all"}))?;
+    if validate_data_syms_page(&full)? {
+        return Err("bn data_symbols ignored limit: all; the map is incomplete".into());
+    }
+    recovered_data_syms(full)
 }
 
 /// Build a `bn` subcommand argv with an explicit `--` end-of-options separator.
@@ -2000,22 +2055,19 @@ impl Bn {
         Ok(all)
     }
 
-    /// Basic blocks + typed edges of `ident`'s control-flow graph at rendering
-    /// level `il` (`asm`/`mlil`/`hlil`), via `bn py exec` (there is no
-    /// first-class CFG command). Empty on any failure (unknown function, no
-    /// blocks, IL unavailable, malformed output) — the caller shows a note.
-    pub fn cfg(&self, ident: &str, il: &str) -> Vec<CfgBlock> {
+    /// Basic blocks + typed edges of `ident`'s control-flow graph. An actual
+    /// empty graph stays distinct from an op, transport, or decode failure.
+    pub fn cfg(&self, ident: &str, il: &str) -> Result<Vec<CfgBlock>, String> {
         if let Some(blocks) = self.read_op::<CfgJson>(
             "cfg",
             serde_json::json!({"identifier": ident, "view": il}),
         ) {
-            return blocks.map(|cfg| cfg.blocks).unwrap_or_default();
+            return blocks.map(|cfg| cfg.blocks);
         }
         let escaped = ident.replace('\\', "\\\\").replace('\'', "\\'");
         let program = CFG_PROGRAM.replace("{IDENT}", &escaped).replace("{IL}", il);
-        self.py_json::<CfgJson>(&program)
+        self.py_json::<CfgJson>(&program, "cfg")
             .map(|cfg| cfg.blocks)
-            .unwrap_or_default()
     }
 
     /// Call a first-class read-locked op, distinguishing "this bridge is too old to
@@ -2093,45 +2145,54 @@ impl Bn {
     /// agent's (measured: a 0.7 ms read becomes 401 ms under load). This path now
     /// exists only for bridges predating the read-locked `cfg` / `data_vars` /
     /// `data_symbols` ops; it can be deleted once those have shipped everywhere.
-    fn py_json<T: serde::de::DeserializeOwned>(&self, program: &str) -> Option<T> {
-        if let Some(result) = self.call_local("py_exec", serde_json::json!({"script": program})) {
-            let envelope: PyEnvelope = serde_json::from_value(result.ok()?).ok()?;
-            return serde_json::from_str::<T>(&envelope.stdout).ok();
-        }
-        let out = self.run_out(&["py", "exec", "--format", "json", "--code", program]);
-        serde_json::from_str::<PyEnvelope>(&out)
-            .ok()
-            .and_then(|envelope| serde_json::from_str::<T>(&envelope.stdout).ok())
+    fn py_json<T: serde::de::DeserializeOwned>(
+        &self,
+        program: &str,
+        what: &str,
+    ) -> Result<T, String> {
+        let envelope: PyEnvelope = if let Some(result) =
+            self.call_local("py_exec", serde_json::json!({"script": program}))
+        {
+            serde_json::from_value(result?).map_err(|error| {
+                format!("bn {what} legacy py_exec returned an unexpected envelope: {error}")
+            })?
+        } else {
+            let out = self.run_out_checked(&["py", "exec", "--format", "json", "--code", program])?;
+            serde_json::from_str(&out).map_err(|error| {
+                format!("bn {what} legacy py_exec returned an unexpected envelope: {error}")
+            })?
+        };
+        serde_json::from_str(&envelope.stdout)
+            .map_err(|error| format!("bn {what} legacy py_exec returned unexpected JSON: {error}"))
     }
 
     /// BN's typed data variables in the half-open address window `[lo, hi)`
     /// (`0x…` strings), ascending — the backing for the structured data-section
-    /// view. Empty on any failure (bad window, py unavailable, malformed output),
-    /// so the caller can fall back to a raw byte dump.
-    pub fn data_vars(&self, lo: &str, hi: &str) -> Vec<DataVar> {
+    /// view. A failed read is reported to the caller; an empty successful read
+    /// may still fall back to a raw byte dump.
+    pub fn data_vars(&self, lo: &str, hi: &str) -> Result<Vec<DataVar>, String> {
         if let Some(vars) = self.read_op::<DataMapJson>(
             "data_vars",
             serde_json::json!({"start": lo, "end": hi}),
         ) {
-            return vars.map(|d| d.vars).unwrap_or_default();
+            return vars.map(|d| d.vars);
         }
         let program = DATA_MAP_PROGRAM.replace("{LO}", lo).replace("{HI}", hi);
-        self.py_json::<DataMapJson>(&program)
+        self.py_json::<DataMapJson>(&program, "data_vars")
             .map(|d| d.vars)
-            .unwrap_or_default()
     }
 
-    /// `(address, name)` for every named data symbol — including internal ones
-    /// the exports list omits — so a renamed data global stays interactive
-    /// (hotspots, peek, xref). Via `bn py exec`; empty on failure, in which case
-    /// the lens degrades to exports + `data_<hex>` recognition.
-    pub fn data_symbols(&self) -> Vec<(String, String)> {
-        if let Some(syms) = self.read_op::<DataSymsJson>("data_symbols", serde_json::json!({})) {
-            return syms.map(recovered_data_syms).unwrap_or_default();
+    /// `(address, name)` for every named data symbol, including internal ones.
+    /// A paged first-class op is followed by one explicit whole-set read, while
+    /// older bridges keep their existing omitted-limit and `py exec` behavior.
+    pub fn data_symbols(&self) -> Result<Vec<(String, String)>, String> {
+        if let Some(initial) = self.read_op::<DataSymsJson>("data_symbols", serde_json::json!({})) {
+            return complete_data_syms(initial?, |params| {
+                self.read_op::<DataSymsJson>("data_symbols", params)
+                    .ok_or("bn data_symbols disappeared between reads".to_string())?
+            });
         }
-        self.py_json::<DataSymsJson>(DATA_SYMBOLS_PROGRAM)
-            .map(recovered_data_syms)
-            .unwrap_or_default()
+        recovered_data_syms(self.py_json::<DataSymsJson>(DATA_SYMBOLS_PROGRAM, "data_symbols")?)
     }
 
     /// Export aliases -> address, plus every data-symbol alias.
@@ -3630,15 +3691,81 @@ pub fn newest_live(bin: &str, exclude: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_dir, cli_argv, flag_eq, is_unknown_op, json_escape_ascii, mutation_outcome,
-        parse_local_list_json, parse_types_page, push_mark, recovered_class, recovered_data_syms,
+        capture_dir, cli_argv, complete_data_syms, flag_eq, is_unknown_op, json_escape_ascii,
+        mutation_outcome, parse_local_list_json, parse_types_page, push_mark, recovered_class,
+        recovered_data_syms,
         render_class_show, render_disasm_linear, render_read, render_sections, render_type_info,
         render_xrefs, resolution_note, text_field, warning_lines, with_capture, AnalysisState, Bn,
-        ClassItemJson, CommentListJson, DataSymsJson, Listing, StringsJson, TagListJson,
-        TargetInfoJson,
+        CfgJson, ClassItemJson, CommentListJson, DataMapJson, DataSymsJson, Listing, StringsJson,
+        TagListJson, TargetInfoJson,
     };
     use std::path::{Path, PathBuf};
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixListener;
     use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    /// A tiny synthetic bridge that verifies requests on the real socket path.
+    /// Its fixtures contain invented symbols only; no BN install is needed.
+    fn wire_bn(
+        replies: Vec<(&'static str, Option<serde_json::Value>, serde_json::Value)>,
+    ) -> (Bn, JoinHandle<()>, PathBuf) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = PathBuf::from("/tmp").join(format!("bl-{}-{nonce}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            for (op, params, result) in replies {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "missing {op} request");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept failed: {error}"),
+                    }
+                };
+                let mut request = String::new();
+                std::io::BufReader::new(&stream)
+                    .read_line(&mut request)
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                assert_eq!(request["op"], op);
+                if let Some(params) = params {
+                    assert_eq!(request["params"], params);
+                }
+                let reply = serde_json::json!({"ok":true,"result":result});
+                stream.write_all(reply.to_string().as_bytes()).unwrap();
+            }
+        });
+        let bn = Bn {
+            bin: "unused".into(),
+            instance: Some("synthetic".into()),
+            target: Some("sample".into()),
+            client: Some(Arc::new(crate::bnsock::Client {
+                instance_id: "synthetic".into(),
+                socket_path: path.clone(),
+                plugin_version: "0.20.0-test".into(),
+                started_at: String::new(),
+                binaries: vec!["sample".into()],
+            })),
+            pace: crate::bnsock::Pace::Interactive,
+            health: Arc::new(Mutex::new(None)),
+        };
+        (bn, server, path)
+    }
+
+    fn finish_wire(server: JoinHandle<()>, path: PathBuf) {
+        let joined = server.join();
+        std::fs::remove_file(path).unwrap();
+        joined.unwrap();
+    }
 
     // ---- #26: one malformed element must not drop the whole list ----
 
@@ -3684,13 +3811,148 @@ mod tests {
         )
         .expect("a short element must not abort the list");
         assert_eq!(
-            recovered_data_syms(payload),
+            recovered_data_syms(payload).unwrap(),
             [
                 ("0x415200".to_string(), "g_config".to_string()),
                 ("0x4152c0".to_string(), "g_session_table".to_string()),
             ],
             "elements missing either half are dropped; the rest survive"
         );
+    }
+
+    #[test]
+    fn cfg_accepts_current_and_legacy_keys_but_rejects_missing_or_null_edges() {
+        let current: CfgJson = serde_json::from_str(
+            r#"{"blocks":[{"start":"0x401000","insns":[{"address":"0x401000","text":"b.eq 0x401020"}],"edges":[{"to":"0x401020","branch_type":"TrueBranch"}],"undetermined_edges":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(current.blocks[0].insns[0].a, "0x401000");
+        assert_eq!(current.blocks[0].insns[0].t, "b.eq 0x401020");
+        assert_eq!(current.blocks[0].edges[0].k, "TrueBranch");
+        assert!(current.blocks[0].undetermined_edges);
+
+        let legacy: CfgJson = serde_json::from_str(
+            r#"{"blocks":[{"start":"0x401000","insns":[{"a":"0x401000","t":"ret"}],"edges":[{"to":"0x401020","k":"UnconditionalBranch"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.blocks[0].insns[0].t, "ret");
+        assert!(!legacy.blocks[0].undetermined_edges);
+        assert!(serde_json::from_str::<CfgJson>(r#"{"items":[]}"#).is_err());
+        assert!(serde_json::from_str::<CfgJson>(
+            r#"{"blocks":[{"start":"0x401000","insns":[],"edges":[{"to":null,"branch_type":"IndirectBranch"}]}]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn data_vars_accept_current_and_legacy_containers_and_full_width_values() {
+        let current: DataMapJson = serde_json::from_str(
+            r#"{"kind":"data_vars","items":[{"address":"0x415200","name":"g_counter","type":"uint64_t","width":8,"value":18446744073709551615,"section":".data"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(current.vars[0].addr, "0x415200");
+        assert_eq!(current.vars[0].name, "g_counter");
+        assert_eq!(current.vars[0].value, Some(u64::MAX as i128));
+        assert_eq!(current.vars[0].section, ".data");
+
+        let legacy: DataMapJson = serde_json::from_str(
+            r#"{"vars":[{"a":"0x415208","n":"g_next","t":"char*","w":8,"p":"0x416000","ps":"label","sec":".data"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.vars[0].ptr.as_deref(), Some("0x416000"));
+        assert_eq!(legacy.vars[0].ptr_sym.as_deref(), Some("label"));
+        assert!(serde_json::from_str::<DataMapJson>(r#"{"items_renamed":[]}"#).is_err());
+    }
+
+    #[test]
+    fn data_symbols_request_all_only_after_a_paged_probe() {
+        let paged: DataSymsJson = serde_json::from_str(
+            r#"{"items":[{"a":"0x415200","n":"g_config"}],"offset":0,"returned":1,"total":2,"has_more":true}"#,
+        )
+        .unwrap();
+        let recovered = complete_data_syms(paged, |params| {
+            assert_eq!(params, serde_json::json!({"limit":"all"}));
+            serde_json::from_str(
+                r#"{"items":[{"a":"0x415200","n":"g_config"},{"a":"0x415280","n":"g_table"}],"offset":0,"returned":2,"total":2,"has_more":false}"#,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert_eq!(recovered.len(), 2);
+
+        let old_full: DataSymsJson = serde_json::from_str(
+            r#"{"syms":[{"a":"0x415200","n":"g_config"}],"offset":0,"returned":1,"total":1,"has_more":false}"#,
+        )
+        .unwrap();
+        assert_eq!(complete_data_syms(old_full, |_| panic!("old bridge must not get limit: all")).unwrap().len(), 1);
+
+        let legacy_py: DataSymsJson =
+            serde_json::from_str(r#"{"syms":[{"a":"0x415200","n":"g_config"}]}"#)
+                .unwrap();
+        assert_eq!(recovered_data_syms(legacy_py).unwrap().len(), 1);
+        assert!(serde_json::from_str::<DataSymsJson>(r#"{"kind":"data_symbols","rows":[]}"#).is_err());
+    }
+
+    #[test]
+    fn data_symbols_reject_incomplete_or_unusable_op_pages() {
+        let missing_metadata: DataSymsJson = serde_json::from_str(r#"{"items":[]}"#).unwrap();
+        assert!(complete_data_syms(missing_metadata, |_| panic!("must not fetch"))
+            .unwrap_err()
+            .contains("has_more"));
+
+        let paged: DataSymsJson = serde_json::from_str(
+            r#"{"items":[{"a":"0x415200","n":"g_config"}],"offset":0,"returned":1,"total":2,"has_more":true}"#,
+        )
+        .unwrap();
+        let error = complete_data_syms(paged, |_| {
+            serde_json::from_str(
+                r#"{"items":[{"a":"0x415200","n":"g_config"}],"offset":0,"returned":1,"total":2,"has_more":true}"#,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .unwrap_err();
+        assert!(error.contains("ignored limit: all"));
+
+        let bad_rows: DataSymsJson = serde_json::from_str(r#"{"syms":[{"n":"g_missing_address"}]}"#).unwrap();
+        assert!(recovered_data_syms(bad_rows).is_err());
+    }
+
+    #[test]
+    fn live_socket_decode_failures_reach_the_caller() {
+        let (bn, server, path) = wire_bn(vec![
+            (
+                "cfg",
+                None,
+                serde_json::json!({"blocks":[{"start":"0x401000","insns":[],"edges":[{"to":null,"branch_type":"IndirectBranch"}]}]}),
+            ),
+            ("data_vars", None, serde_json::json!({"rows":[]})),
+            ("data_symbols", None, serde_json::json!({"rows":[]})),
+        ]);
+        let cfg_error = bn.cfg("parse_header", "asm").err().unwrap();
+        assert!(cfg_error.contains("bn cfg returned unexpected JSON (bridge 0.20.0-test)"));
+        let vars_error = bn.data_vars("0x415000", "0x416000").err().unwrap();
+        assert!(vars_error.contains("bn data_vars returned unexpected JSON"));
+        let symbols_error = bn.data_symbols().err().unwrap();
+        assert!(symbols_error.contains("bn data_symbols returned unexpected JSON"));
+        finish_wire(server, path);
+    }
+
+    #[test]
+    fn live_socket_data_symbols_fetch_one_complete_snapshot_after_paged_probe() {
+        let (bn, server, path) = wire_bn(vec![
+            (
+                "data_symbols",
+                Some(serde_json::json!({})),
+                serde_json::json!({"items":[{"a":"0x415200","n":"g_config"}],"offset":0,"returned":1,"total":2,"has_more":true}),
+            ),
+            (
+                "data_symbols",
+                Some(serde_json::json!({"limit":"all"})),
+                serde_json::json!({"items":[{"a":"0x415200","n":"g_config"},{"a":"0x415280","n":"g_table"}],"offset":0,"returned":2,"total":2,"has_more":false}),
+            ),
+        ]);
+        assert_eq!(bn.data_symbols().unwrap().len(), 2);
+        finish_wire(server, path);
     }
 
     // ---- #13: `--` before the first untrusted positional ----
